@@ -1,0 +1,28 @@
+# Local Python environments (huge, and hold a conflicting torch/CUDA build)
+.venv/
+venv/
+env/
+
+# Version control / IDE
+.git/
+.gitignore
+.idea/
+.vscode/
+
+# Python caches / build artifacts
+**/__pycache__/
+**/*.pyc
+**/*.egg-info/
+build/
+dist/
+
+# Datasets, checkpoints and outputs — mount these at runtime instead of baking them in
+data/
+ckpts/
+work_dirs/
+*.pth
+*.pkl
+
+# Docs / misc not needed for the build
+figs/
+assets/
