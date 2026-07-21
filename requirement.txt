@@ -1,2 +1,5 @@
 shapely==1.8.5.post1
-av2
+# Unpinned av2 pulls the latest release, which uses np.ndarray[...] generic
+# subscripting only valid on Python>=3.9; 0.2.1 is the last release built
+# against numpy.typing.NDArray instead, which works on Python 3.8.
+av2==0.2.1
