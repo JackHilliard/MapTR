@@ -70,3 +70,14 @@ RUN pip install --no-cache-dir nuscenes-devkit
 # 1.20) at module load time. Pin below 1.24 to keep the np.float/np.int
 # aliases mmdet 2.14.0/mmcv-full 1.4.0 still use (removed in numpy 1.24).
 RUN pip install --no-cache-dir "numpy==1.23.5"
+
+# mmcv-full/mmdet/nuscenes-devkit/av2 all transitively pull in non-headless
+# opencv-python, which links its GUI backend against libGL.so.1. On
+# Singularity/Apptainer clusters with --nv, the host's newer libGL.so.1 gets
+# bind-mounted over the container's own and fails to load against this
+# image's older glibc (GLIBC_ABI_DT_RELR, added in glibc 2.36, missing here).
+# Swap to the headless build — same OpenCV, no GL/X11 linkage at all — so
+# cv2 never touches libGL.so.1 regardless of what the host injects.
+RUN OPENCV_VERSION=$(pip show opencv-python | sed -n 's/^Version: //p') \
+    && pip uninstall -y opencv-python opencv-python-headless \
+    && pip install --no-cache-dir "opencv-python-headless==${OPENCV_VERSION}"
