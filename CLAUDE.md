@@ -8,15 +8,27 @@ section, since those bugs are easy to reintroduce by accident (e.g. editing
 
 ## Current branch / image state (as of 2026-07-28)
 
-- Branch: `maptrv2`, pushed to `origin/maptrv2` at commit `f184518`.
+- Branch: `maptrv2`, pushed to `origin/maptrv2` at commit `94029ab`.
 - Docker image: `jhd0ck3r/maptrv2:latest` on Docker Hub, digest
-  `sha256:359f831f403350cfb90d91d1231784111a6ffaafc55c97e17bf15408a4862246`.
+  `sha256:300a93364ccf6ae0f0533d3f3ee364b29beada49d0aa02038d4ca9bc1fbff06d`.
   Built from `docker/Dockerfile` — CUDA 11.8 / torch 2.1.0 / Python 3.10,
   targets both Ampere (sm_86, e.g. local RTX 3070) and Hopper (sm_90, H100)
   via `TORCH_CUDA_ARCH_LIST="8.6 9.0+PTX"`.
 - Local dev/test GPU: this environment has an RTX 3070 (sm_86). The actual
   cluster target is H100 (Hopper). User's personal machine has an RTX 5060
   (Blackwell) — different from both.
+- **mmcv-full is now built from source** (`MMCV_WITH_OPS=1 pip install
+  --no-binary mmcv-full`), not installed from OpenMMLab's prebuilt wheel
+  index — see gotcha #12 below. This was needed because the prebuilt wheel
+  had zero `sm_90` cubins and no PTX fallback at all, crashing every mmcv
+  CUDA op (`ms_deform_attn`, `sigmoid_focal_loss`, etc.) on H100 with
+  `RuntimeError: CUDA error: no kernel image is available for execution on
+  the device` — invisible locally since `sm_86` was covered. Verified via
+  `cuobjdump --list-elf`/`--list-ptx` on the installed `mmcv/_ext.*.so`:
+  before the fix, 0 `sm_90` entries; after, 55/55 matching `sm_86`/`sm_90`
+  cubins plus PTX. GKT and mmdetection3d's own ops were already correctly
+  multi-arch (built locally by this same Dockerfile, so they picked up
+  `TORCH_CUDA_ARCH_LIST` automatically) — this was an mmcv-only gap.
 
 ## What works right now
 
@@ -183,6 +195,41 @@ so don't assume "it built fine" means "it actually works."
     also behind `pv_seg` specifically — fixed to only run when
     `pv_seg=True`.
 
+12. **OpenMMLab's prebuilt `mmcv-full` wheel has no Hopper (sm_90) support
+    and no PTX fallback**, unlike every other CUDA extension in this image
+    (GKT, mmdetection3d's ops), which are compiled locally by this
+    Dockerfile and correctly pick up `TORCH_CUDA_ARCH_LIST`. The wheel from
+    `https://download.openmmlab.com/mmcv/dist/cu118/torch2.1.0/index.html`
+    was built by OpenMMLab's own CI with an arch list that stops at
+    `sm_86` — works fine locally on Ampere, but on an actual H100 crashes
+    the first time *any* mmcv CUDA op runs (`ms_deform_attn`,
+    `sigmoid_focal_loss`, etc.) with `RuntimeError: CUDA error: no kernel
+    image is available for execution on the device`. **Fix**: install
+    mmcv-full from source instead (`MMCV_WITH_OPS=1 pip install
+    --no-cache-dir --no-binary mmcv-full "mmcv-full==1.7.2"`), which makes
+    its `setup.py` read the Dockerfile's own `TORCH_CUDA_ARCH_LIST` like
+    every other op does. Costs ~4-5 extra minutes of build time. Verify
+    with `cuobjdump --list-elf`/`--list-ptx` on the installed
+    `mmcv/_ext.*.so` if this ever needs re-checking after an mmcv version
+    bump.
+
+13. **`extract_lidar_feat` crashes with a bare `IndexError: index -1 is out
+    of bounds for dimension 0 with size 0` on `coords[-1, 0]`** if
+    voxelization produces zero total voxels for a batch — i.e. a tile's raw
+    point cloud was empty, or every point in it fell outside
+    `lidar_point_cloud_range`/`z_max=15.0`. First hit on the cluster's full
+    4103-tile/5-town dataset (never reproduced against the local 259-tile
+    single-town subset, which was hand-picked to have real GT/points).
+    **Fix applied**: `extract_lidar_feat` (`maptrv2.py`) now takes an
+    `img_metas` kwarg (threaded through from both `forward_train` and
+    `simple_test`) and raises a clear `RuntimeError` naming the offending
+    `sample_idx`(es) and each sample's raw point count before it would
+    otherwise hit the opaque `IndexError` — makes it possible to identify
+    the bad tile(s) from a single log line instead of just a crash. This
+    does **not** fix the underlying data issue — see "full-dataset empty
+    tiles" in Open items below for how to hunt down the actual culprit
+    tile(s).
+
 ## Open items / next steps
 
 - **`carlasim_map.py`'s `ann_file_train` is currently stale/inconsistent.**
@@ -205,6 +252,23 @@ so don't assume "it built fine" means "it actually works."
   stride-based, before a real training run). Re-running the converter
   against the full dataset needs no code changes, just `--data-root`
   pointed at the right path and new `ann_file` names in the config.
+- **Full-dataset run hit an empty-tile crash (see gotcha #13) not
+  reproducible locally.** Before re-running training on the cluster, scan
+  the full dataset's `manifest.json` for suspect tiles directly (much
+  faster than waiting to hit them during training) — for each tile, check
+  `n_points` for zero/very-low counts, and cross-check any survivors
+  against the raw `.npz` block's actual `features` xyz range vs
+  `lidar_point_cloud_range`/`z_max=15.0` in
+  `maptrv2_carla_r50_24ep_lidar.py`. On the local subset, raw block
+  `features` xyz is already tile-relative (verified: roughly matches
+  `tile_radius=12.5` for x/y, and lands within `[-8, 15]` for z after
+  each tile's own baked-in offset) — so this is not a world-vs-tile
+  coordinate bug, but some tiles in the full/multi-town dataset may
+  genuinely have near-zero LiDAR returns (e.g. sparse-geometry areas) or
+  an unusually tall/deep local feature pushing all points outside the
+  z-bounds tuned against the single local test town. If real, either
+  filter such tiles out at converter time or widen
+  `lidar_point_cloud_range`/`z_max` to a per-tile-safe margin.
 - **Class taxonomy is divider-only, including *all* CARLA lane types**
   (driving/curb/sidewalk/border/restricted/parking/shoulder/stop/other
   all collapsed into one `divider` class) — this was a deliberate choice

@@ -247,12 +247,32 @@ class MapTRv2(MVXTwoStageDetector):
 
         return feats, coords, sizes
     @auto_fp16(apply_to=('points'), out_fp32=True)
-    def extract_lidar_feat(self,points):
+    def extract_lidar_feat(self, points, img_metas=None):
         feats, coords, sizes = self.voxelize(points)
+        if coords.numel() == 0:
+            # Voxelization dropped every point in this batch -- either a
+            # tile's raw point cloud was already empty, or its points fall
+            # entirely outside lidar_point_cloud_range/z_max. Name the
+            # offending sample(s) rather than letting this surface as a
+            # bare IndexError on coords[-1, 0], which gives no way to tell
+            # which tile in a large/unattended run caused it.
+            # img_metas may still be nested per-queue-timestep (fusion
+            # modality, before its later flattening) rather than a flat
+            # per-sample list (lidar modality) -- don't let a shape mismatch
+            # here mask the real error above with an unrelated one.
+            try:
+                sample_idxs = [m.get('sample_idx') for m in img_metas] if img_metas else None
+            except AttributeError:
+                sample_idxs = '<unavailable, nested img_metas>'
+            raise RuntimeError(
+                'extract_lidar_feat: voxelization produced zero voxels for '
+                f'this batch. points per sample: {[p.shape[0] for p in points]}, '
+                f'sample_idx: {sample_idxs}. Check the raw point count/coordinate '
+                'range for these tiles against lidar_point_cloud_range and z_max.')
         # voxel_features = self.lidar_modal_extractor["voxel_encoder"](feats, sizes, coords)
         batch_size = coords[-1, 0] + 1
         lidar_feat = self.lidar_modal_extractor["backbone"](feats, coords, batch_size, sizes=sizes)
-        
+
         return lidar_feat
 
     # @auto_fp16(apply_to=('img', 'points'))
@@ -298,7 +318,7 @@ class MapTRv2(MVXTwoStageDetector):
         """
         lidar_feat = None
         if self.modality in ('fusion', 'lidar'):
-            lidar_feat = self.extract_lidar_feat(points)
+            lidar_feat = self.extract_lidar_feat(points, img_metas=img_metas)
 
         if self.modality == 'lidar':
             # No camera branch and no temporal queue: img_metas is already
@@ -405,7 +425,7 @@ class MapTRv2(MVXTwoStageDetector):
         """Test function without augmentaiton."""
         lidar_feat = None
         if self.modality in ('fusion', 'lidar'):
-            lidar_feat = self.extract_lidar_feat(points)
+            lidar_feat = self.extract_lidar_feat(points, img_metas=img_metas)
         # extract_img_feat/extract_img_feat dereference img.size(0)
         # unconditionally before their own `if img is not None` check, so
         # img=None (lidar-only, no camera branch) must be guarded here.

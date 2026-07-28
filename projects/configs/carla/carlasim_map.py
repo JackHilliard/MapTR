@@ -38,7 +38,18 @@ map_classes = ['divider']
 # LiDAR points are [x, y, z, strength].
 load_dim = 4
 use_dim = 4
-z_max = 15.0
+# Some tiles (confirmed: 6 in the full remote train set, all town03) contain
+# LiDAR returns spanning 100+ meters in z within a single 25m x 25m tile --
+# almost certainly a highway overpass/multi-level structure, not a flat
+# driving surface. z_max=15.0 (tuned only against the flat local town10hd
+# test subset) drops every point in those tiles, crashing
+# extract_lidar_feat's voxelize() with zero surviving points. Raised to
+# comfortably cover the observed range (z in [-66.90, 90.52] across the 6
+# confirmed tiles) rather than filtering those tiles out -- see
+# lidar_point_cloud_range in maptrv2_carla_r50_24ep_lidar.py, which must
+# stay in sync with this value (kept >= its z upper bound so this isn't
+# the tighter constraint).
+z_max = 96.0
 
 input_modality = dict(use_lidar=True, use_camera=False)
 

@@ -15,7 +15,7 @@ ENV FORCE_CUDA="1"
 # Avoid apt hanging on the interactive tzdata prompt.
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y ffmpeg libsm6 libxext6 git ninja-build libglib2.0-0 libsm6 libxrender-dev libxext6 \
+RUN apt-get update && apt-get install -y ffmpeg libsm6 libxext6 git ninja-build libglib2.0-0 libsm6 libxrender-dev libxext6 nano \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

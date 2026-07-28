@@ -22,11 +22,22 @@ point_cloud_range = [-12.5, -12.5, -30.0, 12.5, 12.5, 20.0]
 voxel_size = [0.15, 0.15, 20.0]
 
 # LiDAR branch geometry (kept separate from the map/coder point_cloud_range
-# above -- same 25m x/y extent, but a much tighter z range/coarser z
-# resolution than point_cloud_range's generous margin, since this directly
-# drives sparse_shape's memory footprint. Real observed LiDAR z range for
-# this dataset is roughly [-7.7, 14.8]; [-10, 18] gives margin.
-lidar_point_cloud_range = [-12.5, -12.5, -10.0, 12.5, 12.5, 18.0]
+# above -- same 25m x/y extent). z range was originally [-10, 18] (margin
+# around the flat local town10hd subset's observed [-7.7, 14.8]), but the
+# full remote train set has 6 confirmed town03 tiles with LiDAR returns
+# spanning z in [-66.90, 90.52] within a single tile (a highway
+# overpass/multi-level structure, not flat driving surface) -- the old
+# range dropped every point in those tiles, crashing extract_lidar_feat.
+# Widened to comfortably cover the observed extremes rather than filtering
+# those tiles out; z_max in carlasim_map.py (LoadCarlaPointsFromFile's
+# early filter) must stay >= this range's z upper bound. This is a ~6x
+# increase in z voxel-grid resolution at the same voxel size -- re-measure
+# sparse_shape/lidar_bev_proj.in_channels below via a dummy
+# extract_lidar_feat() call rather than hand-deriving (see CLAUDE.md
+# gotcha #4); sparse convs only compute over occupied voxels so normal
+# (non-degenerate) tiles shouldn't see a proportional compute/memory hit,
+# but this hasn't been verified against real full-dataset tiles yet.
+lidar_point_cloud_range = [-12.5, -12.5, -72.0, 12.5, 12.5, 96.0]
 lidar_voxel_size = [0.1, 0.1, 0.4]
 
 map_classes = ['divider']
@@ -81,8 +92,11 @@ model = dict(
             in_channels=4,  # CARLA points are xyz + strength (not nuScenes' xyz+intensity+ring=5)
             # (x, y, z) order -- confirmed against the working nuScenes
             # fusion config's sparse_shape=[300,600,41] for a 30x60x8m
-            # range at the same voxel resolution.
-            sparse_shape=[251, 251, 71],
+            # range at the same voxel resolution. z re-measured for the
+            # widened lidar_point_cloud_range above via a dummy
+            # extract_lidar_feat() call (was [251,251,71] for the old
+            # [-10,18] z range).
+            sparse_shape=[251, 251, 421],
             output_channels=128,
             order=('conv', 'norm', 'act'),
             encoder_channels=((16, 16, 32), (32, 32, 64), (64, 64, 128), (128,
@@ -123,11 +137,16 @@ model = dict(
             # SparseEncoder outputs C*D channels (output_channels=128 * the
             # z-dim after its internal downsampling); measured empirically
             # via a dummy extract_lidar_feat() call against this exact
-            # config -- output shape was (1, 384, 32, 32), i.e. z downsampled
-            # to 3 (128*3=384) and x/y (250 cells each) downsampled to 32.
+            # config -- output shape is (1, 3200, 32, 32), i.e. z
+            # downsampled to 25 (128*25=3200) and x/y (250 cells each)
+            # downsampled to 32. Was 384 (z downsampled to 3) before
+            # lidar_point_cloud_range's z span widened from 28m to 168m
+            # (see that config's comment) -- the much larger input z-range
+            # downsamples proportionally less, not just linearly, so this
+            # was re-measured rather than scaled by hand.
             lidar_bev_proj=dict(
                 type='ConvFuser',
-                in_channels=[384],
+                in_channels=[3200],
                 out_channels=_dim_,
             ),
             # Structurally required by MapTRPerceptionTransformer.__init__
@@ -249,7 +268,9 @@ test_pipeline = [
         coord_type='LIDAR',
         load_dim=4,
         use_dim=4,
-        z_max=15.0),
+        # Kept in sync with carlasim_map.py's own z_max and this file's
+        # lidar_point_cloud_range z upper bound -- see the comments there.
+        z_max=96.0),
     dict(
         type='MultiScaleFlipAug3D',
         img_scale=(1, 1),
