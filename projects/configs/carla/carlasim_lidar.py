@@ -25,10 +25,10 @@ plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'
 
 dataset_type = 'CarlaSegDataset'
-data_root = 'data/carla/'
-
-# CARLA road-block layout selector: <data_root>/<split>/road_blocks_<tile_size>/blocks/*.npz
-tile_size = 15
+# Local dev/test path (only a `test` split subset exists here so far).
+# For the full remote-cluster dataset, point this at `data/carla/` (with
+# `train`/`val` split subdirectories, each with its own manifest.json) instead.
+data_root = '/home-local/johil9.nobkp/Documents/Code/carla/'
 
 # LiDAR points are [x, y, z, strength]; the z<=15.0 filter matches the source
 # Pointcept dataset.
@@ -71,14 +71,16 @@ test_pipeline = [
     dict(type='CustomCollect3D', keys=['points'])
 ]
 
+# Only a `test` split subset is available locally; reused for train/val/test
+# here purely to exercise the data path (see carlasim_map.py for the same
+# caveat on the map-annotated MapTRv2 training config).
 data = dict(
     samples_per_gpu=1,
     workers_per_gpu=4,
     train=dict(
         type=dataset_type,
         data_root=data_root,
-        split='train',
-        tile_size=tile_size,
+        split='test',
         pipeline=train_pipeline,
         modality=input_modality,
         classes=class_names,
@@ -87,8 +89,7 @@ data = dict(
     val=dict(
         type=dataset_type,
         data_root=data_root,
-        split='val',
-        tile_size=tile_size,
+        split='test',
         pipeline=test_pipeline,
         modality=input_modality,
         classes=class_names,
@@ -97,8 +98,7 @@ data = dict(
     test=dict(
         type=dataset_type,
         data_root=data_root,
-        split='val',
-        tile_size=tile_size,
+        split='test',
         pipeline=test_pipeline,
         modality=input_modality,
         classes=class_names,

@@ -299,8 +299,12 @@ class MapTRv2Head(DETRHead):
             # import ipdb;ipdb.set_trace()
 
 
-        bs, num_cam, _, _, _ = mlvl_feats[0].shape
-        dtype = mlvl_feats[0].dtype
+        if mlvl_feats is not None:
+            bs, num_cam, _, _, _ = mlvl_feats[0].shape
+            dtype = mlvl_feats[0].dtype
+        else:
+            bs = lidar_feat.shape[0]
+            dtype = lidar_feat.dtype
         # import ipdb;ipdb.set_trace()
         if self.query_embed_type == 'all_pts':
             object_query_embeds = self.query_embedding.weight.to(dtype)
@@ -322,8 +326,9 @@ class MapTRv2Head(DETRHead):
         # make attn mask
         """ attention mask to prevent information leakage
         """
+        device = mlvl_feats[0].device if mlvl_feats is not None else lidar_feat.device
         self_attn_mask = (
-            torch.zeros([num_vec, num_vec,]).bool().to(mlvl_feats[0].device)
+            torch.zeros([num_vec, num_vec,]).bool().to(device)
         )
         self_attn_mask[self.num_vec_one2one :, 0 : self.num_vec_one2one,] = True
         self_attn_mask[0 : self.num_vec_one2one, self.num_vec_one2one :,] = True
@@ -418,8 +423,10 @@ class MapTRv2Head(DETRHead):
             seg_bev_embed = bev_embed.permute(1,0,2).view(bs,self.bev_h, self.bev_w, -1).permute(0,3,1,2).contiguous()
             if self.aux_seg['bev_seg']:
                 outputs_seg = self.seg_head(seg_bev_embed)
-            bs, num_cam, embed_dims, feat_h, feat_w = mlvl_feats[-1].shape
             if self.aux_seg['pv_seg']:
+                # Only meaningful with camera features; pv_seg requires
+                # modality != 'lidar' (mlvl_feats is None otherwise).
+                bs, num_cam, embed_dims, feat_h, feat_w = mlvl_feats[-1].shape
                 outputs_pv_seg = self.pv_seg_head(mlvl_feats[-1].flatten(0,1))
                 outputs_pv_seg = outputs_pv_seg.view(bs, num_cam, -1, feat_h, feat_w)
 

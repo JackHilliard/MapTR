@@ -8,12 +8,12 @@ per-block ``.npz`` files. The semantic / instance labels that live in those
 blocks are ignored until a task head is wired up; loading is handled by the
 ``LoadCarlaPointsFromFile`` pipeline transform.
 
-Expected directory layout (mirrors the Pointcept ``get_data_list``)::
+Expected directory layout::
 
-    <data_root>/<split>/road_blocks_<tile_size>/blocks/*.npz
+    <data_root>/<split>/manifest.json
+    <data_root>/<split>/blocks/<tile_name>.npz
 """
 
-import glob
 import os
 from collections.abc import Sequence
 
@@ -21,6 +21,8 @@ import numpy as np
 from mmcv.utils import print_log
 from mmdet.datasets import DATASETS
 from mmdet3d.datasets.custom_3d import Custom3DDataset
+
+from .carla_utils import read_carla_manifest
 
 
 @DATASETS.register_module()
@@ -31,9 +33,8 @@ class CarlaSegDataset(Custom3DDataset):
         data_root (str): Root directory of the CARLA road-block dataset.
         pipeline (list[dict]): Data processing pipeline.
         split (str | Sequence[str]): Split name(s) under ``data_root`` to
-            gather ``.npz`` blocks from. Defaults to ``'train'``.
-        tile_size (int): Road-block tile size, selecting the
-            ``road_blocks_<tile_size>`` sub-directory. Defaults to 15.
+            gather tiles from (each split must have its own
+            ``manifest.json``). Defaults to ``'train'``.
         classes (tuple[str] | None): Kept for API compatibility; unused while
             the dataset is LiDAR-only. Defaults to None.
         modality (dict | None): Input modality. Defaults to LiDAR-only.
@@ -49,7 +50,6 @@ class CarlaSegDataset(Custom3DDataset):
                  data_root,
                  pipeline=None,
                  split='train',
-                 tile_size=15,
                  ann_file=None,
                  classes=None,
                  modality=None,
@@ -60,7 +60,6 @@ class CarlaSegDataset(Custom3DDataset):
         # These must be set before super().__init__ since load_annotations()
         # (called from the base __init__) relies on them.
         self.split = split
-        self.tile_size = tile_size
         if modality is None:
             modality = dict(use_lidar=True, use_camera=False)
         super().__init__(
@@ -74,10 +73,10 @@ class CarlaSegDataset(Custom3DDataset):
             test_mode=test_mode)
 
     def load_annotations(self, ann_file):
-        """Build the sample list by globbing the CARLA block layout.
+        """Build the sample list from each split's ``manifest.json``.
 
-        The ``ann_file`` argument is ignored; samples are discovered from the
-        directory structure instead (matching the Pointcept dataset).
+        The ``ann_file`` argument is ignored; samples are discovered from
+        ``manifest.json['tiles']`` instead.
         """
         if isinstance(self.split, str):
             split_list = [self.split]
@@ -89,14 +88,14 @@ class CarlaSegDataset(Custom3DDataset):
 
         data_infos = []
         for split in split_list:
-            pattern = os.path.join(self.data_root, split,
-                                   f'road_blocks_{self.tile_size}', 'blocks',
-                                   '*.npz')
-            for bf in sorted(glob.glob(pattern)):
+            manifest = read_carla_manifest(self.data_root, split)
+            for tile in manifest['tiles']:
+                name = tile['name']
                 data_infos.append(
                     dict(
-                        pts_path=os.path.relpath(bf, self.data_root),
-                        name=os.path.splitext(os.path.basename(bf))[0],
+                        pts_path=os.path.join(split, 'blocks',
+                                              f'{name}.npz'),
+                        name=name,
                         split=split))
         return data_infos
 
