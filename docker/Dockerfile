@@ -26,10 +26,20 @@ RUN apt-get update && apt-get install -y ffmpeg libsm6 libxext6 git ninja-build 
 # bumped alongside mmcv because both hard-assert an mmcv upper bound in their
 # own __init__.py that the old pins don't cover (mmdet<=1.4.0,
 # mmsegmentation<=1.4.0); 2.28.2/0.30.0 are the last mmdet 2.x/mmsegmentation
-# 0.x releases, with mmcv upper bounds of 1.8.0, comfortably covering 1.7.2 —
-# the latest mmcv-full with a prebuilt wheel for torch==2.1.0+cu118 (already
-# the version preinstalled in this base image).
-RUN pip install mmcv-full==1.7.2 -f https://download.openmmlab.com/mmcv/dist/cu118/torch2.1.0/index.html
+# 0.x releases, with mmcv upper bounds of 1.8.0, comfortably covering 1.7.2.
+#
+# mmcv-full MUST be built from source here, not installed from OpenMMLab's
+# prebuilt wheel index. Their prebuilt cu118/torch2.1.0 wheel was compiled
+# with OpenMMLab's own (unknown, non-configurable) TORCH_CUDA_ARCH_LIST,
+# which does not include Hopper (sm_90) and has no +PTX fallback baked in --
+# this is invisible on Ampere (works fine on this sandbox's RTX 3070) and
+# only surfaces on an actual H100 as `RuntimeError: CUDA error: no kernel
+# image is available for execution on the device` inside mmcv's own CUDA
+# ops (e.g. ms_deform_attn, sigmoid_focal_loss) the first time they run.
+# Building from source makes mmcv's setup.py pick up this Dockerfile's own
+# TORCH_CUDA_ARCH_LIST (set above, "8.6 9.0+PTX"), same as every other
+# custom op in this image (GKT, mmdetection3d's ops) already does.
+RUN MMCV_WITH_OPS=1 pip install --no-cache-dir --no-binary mmcv-full "mmcv-full==1.7.2"
 # mmcv 1.7.2's single-GPU MMDataParallel path (mmcv.parallel.Scatter.forward)
 # calls PyTorch's private torch.nn.parallel._functions._get_stream() with a
 # raw int device id; torch>=2.x's version of that function requires a
