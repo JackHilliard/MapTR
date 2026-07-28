@@ -24,7 +24,7 @@ data_root = 'data/carla/'
 # the same caveat). For the full remote-cluster dataset, re-run the
 # converter with --data-root pointed at the full dataset and update these
 # to real train/val pkls -- no code changes needed.
-ann_file_train = data_root + 'carla_map_infos_test.pkl'
+ann_file_train = data_root + 'carla_map_infos_train.pkl'
 ann_file_val = data_root + 'carla_map_infos_test.pkl'
 ann_file_test = data_root + 'carla_map_infos_test.pkl'
 map_ann_file = data_root + 'carla_map_gt.json'
