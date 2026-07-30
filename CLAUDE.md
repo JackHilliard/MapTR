@@ -322,6 +322,66 @@ tools, verified end-to-end against a real local checkpoint:
   `sys.executable -m tensorboard.main` instead of trusting `$PATH` — do
   the same if adapting this pattern elsewhere.
 
+## LiDAR voxelization was both slow AND silently wrong at large point counts (2026-07-30)
+
+Profiling a real H100 training run (`samples_per_gpu=10`, PyTorch profiler)
+found voxelization consuming **97.6% of all GPU compute time**
+(`_Voxelization` + `point_to_voxelidx_kernel` + `determin_voxel_num` =
+29.167s of 29.871s total self-CUDA time over 20 iterations) — not the
+sparse-conv backbone, not the decoder, not losses.
+
+Root cause: `voxelize()` in `maptrv2.py` calls mmdet3d's legacy
+`Voxelization` CUDA op **once per sample in a Python loop** (unbatched),
+and some CARLA tiles have up to 5,000,000 raw points (the converter
+aggregates an *unbounded* number of scan passes into one static block —
+unlike AV2/nuScenes, which load a hardware-bounded ~10 sweeps, ~300K-1M
+points total, and whose `max_num_points=10`/`max_voxels=[90000,120000]`
+our config copied verbatim without re-tuning for CARLA's much larger
+aggregates).
+
+**Ruled out**: grid-size (the z-range widening from the town03 overpass
+fix) is NOT the cause — verified via an isolated same-point-count
+comparison, wide vs narrow z-range gave near-identical voxelization time.
+The cost scales with raw point count, not grid volume.
+
+**Also found, more serious than the speed issue**: the legacy
+`Voxelization` kernel **silently under-reports occupied voxels at large
+point counts** — confirmed against a synthetic point cloud with a known
+ground truth (exactly 2000 distinct cells, 5,000,000 points): it reported
+only 1,280 occupied voxels, missing 36%. On the real worst-case tile
+(town01_tile_00000, 5,000,000 points), it reported 718 occupied voxels
+where the true count (independently verified via `GridSamplePoints`
+below) is at least 3,242. This means dense tiles weren't just slow to
+process, they were getting **incomplete/wrong voxel data** — a real
+correctness bug, not just a performance one.
+
+**Fix**: `projects/mmdet3d_plugin/datasets/pipelines/loading.py`'s new
+`GridSamplePoints` pipeline transform, wired into
+`maptrv2_carla_r50_24ep_lidar.py`'s `train_pipeline`/`test_pipeline`
+(right after `LoadCarlaPointsFromFile`, `grid_size=lidar_voxel_size` to
+exactly match the model's own LiDAR voxel resolution — no additional
+precision loss beyond what the voxelizer already imposes). Collapses raw
+points to ~1 representative point per occupied cell via integer
+coordinate packing + a single vectorized `torch.unique` (no Python loop),
+*before* the slow/buggy `Voxelization` op ever sees them.
+
+Verified on the real worst-case tile: **26.4x faster** (43.7ms
+grid-sample+voxelize vs 1154.9ms baseline) and **100% occupied-voxel
+recovery** (718/718) — vs. naive random subsampling to a similar point
+budget, which was only 8.6%-22.4% (density-proportional subsampling
+disproportionately thins out sparse regions like divider lines; grid
+sampling is density-*uniform*, so it doesn't). Also verified end-to-end
+via a full local training run (loss trends down normally, eval completes,
+no timing spikes despite the local subset containing one 5M-point tile).
+
+**Still open**: this was only measured with `--point_cloud_range`
+matching each tile's own tile-relative frame; **not yet re-verified on
+the H100 with the real profiler** to confirm the ~97.6%-of-GPU-time
+figure actually drops as expected in the full training loop (only the
+isolated `Voxelization` call and a local-GPU smoke test were checked so
+far). Re-run `tools/maptrv2/profile_train.py` after pulling this fix to
+confirm.
+
 ## Open items / next steps
 
 - **`carlasim_map.py`'s `ann_file_train` is currently stale/inconsistent.**
