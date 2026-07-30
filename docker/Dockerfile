@@ -88,6 +88,14 @@ RUN pip install --no-cache-dir nuscenes-devkit
 # use (removed in numpy 1.24).
 RUN pip install --no-cache-dir "numpy==1.23.5"
 
+# tools/maptrv2/webviewer.py is designed to run outside the container
+# (lightweight, no GPU/ML deps needed) -- these let it also run from
+# inside, if that's more convenient in a given deployment. matplotlib and
+# tensorboard are already present transitively; only flask/seaborn are
+# actually missing (seaborn is a dependency of webviewer.py's reuse of
+# tools/analysis_tools/analyze_logs.py's log parser, not used directly).
+RUN pip install --no-cache-dir flask seaborn
+
 # requirement.txt pins shapely==1.8.5.post1, but nuscenes-devkit (installed
 # after it, with an unpinned shapely dependency) silently upgrades it to
 # 2.x. shapely 2.0 changed STRtree.query() to return integer indices

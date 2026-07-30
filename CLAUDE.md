@@ -6,11 +6,11 @@ it updated as work continues — especially the "Known environment gotchas"
 section, since those bugs are easy to reintroduce by accident (e.g. editing
 `sparse_encoder.py` without touching `sparse_block.py`'s parallel code path).
 
-## Current branch / image state (as of 2026-07-28)
+## Current branch / image state (as of 2026-07-30)
 
-- Branch: `maptrv2`, pushed to `origin/maptrv2` at commit `522405e`.
+- Branch: `maptrv2`, pushed to `origin/maptrv2` at commit `6498067`.
 - Docker image: `jhd0ck3r/maptrv2:latest` on Docker Hub, digest
-  `sha256:683204d26aca96011734b6a2a206c74e2b425a4cde959184584a8ade6549acf5`.
+  `sha256:f1a26d828bb0e128bdf9b876637af4e54b7ef0da614fca100f66642935684308`.
   Built from `docker/Dockerfile` — CUDA 11.8 / torch 2.1.0 / Python 3.10,
   targets both Ampere (sm_86, e.g. local RTX 3070) and Hopper (sm_90, H100)
   via `TORCH_CUDA_ARCH_LIST="8.6 9.0+PTX"`.
@@ -381,6 +381,63 @@ figure actually drops as expected in the full training loop (only the
 isolated `Voxelization` call and a local-GPU smoke test were checked so
 far). Re-run `tools/maptrv2/profile_train.py` after pulling this fix to
 confirm.
+
+## Resuming training with an extended total_epochs shocks the LR schedule (2026-07-30)
+
+User-reported: resuming to train "another N epochs" caused an immediate
+validation-performance drop. Root cause confirmed directly in the
+installed mmcv source (`lr_updater.py`):
+`CosineAnnealingLrUpdaterHook.get_lr()` is **stateless** —
+`progress/max_progress = runner.epoch/runner.max_epochs`, recomputed fresh
+every call, no memory of the training trajectory. `runner.epoch` correctly
+resumes from the checkpoint, but if `total_epochs`/`runner.max_epochs` is
+*extended* for the resumed run (e.g. 24 -> 48, the natural thing to do for
+"24 more epochs"), the schedule doesn't extend -- it reshapes. Epoch 24
+goes from being the *end* of a 24-epoch cosine curve (LR near
+`min_lr_ratio * base_lr`, i.e. near zero) to the *midpoint* of a fresh
+48-epoch one (LR near 50% of peak) -- a real shock to a converged model.
+
+**Not yet fixed in code** -- this is a real mmcv/scheduler design
+limitation, not a bug in this repo. Recommended workaround: for a
+continuation phase, use `--cfg-options load_from=<checkpoint>` (weights
+only, NOT `--resume-from`) with its own fresh, independently-configured
+LR schedule (a much lower peak LR than the original run, appropriate for
+fine-tuning an already-converged model) rather than trying to force
+`CosineAnnealing` to "extend". For future runs where a longer total budget
+is anticipated, set `total_epochs` to the full intended budget from the
+very start, even if training will be paused/resumed partway through --
+that's the only way to get a genuinely seamless `--resume-from` with this
+scheduler.
+
+## Web viewer improvements + a real log-merging bug (2026-07-30)
+
+`tools/maptrv2/webviewer.py`: dark theme (page CSS + matplotlib figure
+both restyled, not just the page), fixed x-axis tick overlap
+(`MaxNLocator`), EMA-smoothed loss curve (raw shown faint underneath),
+named captions under each BEV gallery image, and TensorBoard's startup
+failures are no longer silently swallowed (`stderr` now goes to a real
+temp log file whose path is shown on the page; a `/tb_status` health
+check with JS auto-retry shows a visible warning + the SSH port-forwarding
+hint if it's genuinely unreachable, rather than a silent blank iframe).
+
+**Real bug found and fixed**: the loss/eval curves used to read only the
+*most recent* `*.log.json` (mmcv writes a new timestamped log file every
+time training (re)starts, e.g. after a resume) -- meaning after a resume,
+the eval curve only showed the latest file's epoch range, not the full
+history. Fixed to merge all log files, but **not** via a naive "later
+file wins" `dict.update()`: verified directly against a real resume that
+mmcv logs a near-empty bookkeeping entry (a checkpoint-save marker, e.g.
+`{'epoch': 1, 'iter': 259}`, no `loss` key) for the epoch a resumed run
+started *from*, written into the *new* log file -- a naive merge let that
+sparse marker silently replace the earlier file's complete data for that
+same epoch. `merge_log_dicts()` now keeps whichever entry actually has
+more recorded iterations, per epoch.
+
+**Debugging note**: `pkill -f "webviewer.py"` combined with a subsequent
+launch command *in the same shell invocation* self-matches and kills the
+wrapper script before the launch runs (the pattern matches the launch
+command's own text later in the same invocation) -- run kill and (re)launch
+as separate tool calls/invocations, not combined in one script.
 
 ## Open items / next steps
 
