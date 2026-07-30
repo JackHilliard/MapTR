@@ -8,9 +8,9 @@ section, since those bugs are easy to reintroduce by accident (e.g. editing
 
 ## Current branch / image state (as of 2026-07-28)
 
-- Branch: `maptrv2`, pushed to `origin/maptrv2` at commit `94029ab`.
+- Branch: `maptrv2`, pushed to `origin/maptrv2` at commit `522405e`.
 - Docker image: `jhd0ck3r/maptrv2:latest` on Docker Hub, digest
-  `sha256:300a93364ccf6ae0f0533d3f3ee364b29beada49d0aa02038d4ca9bc1fbff06d`.
+  `sha256:683204d26aca96011734b6a2a206c74e2b425a4cde959184584a8ade6549acf5`.
   Built from `docker/Dockerfile` — CUDA 11.8 / torch 2.1.0 / Python 3.10,
   targets both Ampere (sm_86, e.g. local RTX 3070) and Hopper (sm_90, H100)
   via `TORCH_CUDA_ARCH_LIST="8.6 9.0+PTX"`.
@@ -54,7 +54,7 @@ section, since those bugs are easy to reintroduce by accident (e.g. editing
 # From repo root, with the CARLA data + repo dirs bind-mounted (mounting
 # subpaths only — never bind-mount the whole repo root or mmdetection3d/,
 # it shadows compiled .so extensions and breaks imports):
-docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all -e PYTHONPATH=/MapTR \
+docker run --rm --runtime=nvidia --shm-size=8g -e NVIDIA_VISIBLE_DEVICES=all -e PYTHONPATH=/MapTR \
   -v $(pwd)/projects:/MapTR/projects \
   -v $(pwd)/data:/MapTR/data \
   -v $(pwd)/tools:/MapTR/tools \
@@ -229,6 +229,98 @@ so don't assume "it built fine" means "it actually works."
     does **not** fix the underlying data issue — see "full-dataset empty
     tiles" in Open items below for how to hunt down the actual culprit
     tile(s).
+
+14. **`docker run` needs `--shm-size` explicitly raised for
+    `data.workers_per_gpu > 0`**, or training crashes partway through (not
+    immediately — took ~70-90 iterations locally) with `RuntimeError:
+    DataLoader worker (pid ...) is killed by signal: Bus error. It is
+    possible that dataloader's workers are out of shared memory.` Docker
+    defaults `/dev/shm` to 64MB; PyTorch's multi-worker DataLoader passes
+    tensors between worker processes and the main process through shared
+    memory, and this dataset's point clouds are large enough (up to
+    5,000,000 points/tile) to exhaust that default quickly. **Every
+    verification run earlier in this project used `workers_per_gpu=0`**,
+    which never touches this path at all — so this was completely
+    invisible until the first real `workers_per_gpu>0` benchmark. **Fix**:
+    add `--shm-size=8g` (or larger) to any `docker run` invocation that
+    uses `workers_per_gpu>0` — see the updated smoke-test command above.
+    If the actual cluster deployment runs via Singularity/Apptainer rather
+    than Docker directly, note that Singularity's default behavior differs
+    (it typically shares the host's real `/dev/shm` rather than an
+    isolated small allocation) — this specific bug may not reproduce
+    there, but hasn't been verified either way; if a Singularity run hits
+    the same "Bus error"/shared-memory symptom, look for an equivalent
+    `--shm-size`-style container option.
+
+## Batch size / num_workers benchmarking (2026-07-29, local RTX 3070 8GB)
+
+Benchmarked against the real full train set (4103 tiles, 5 towns,
+`data/carla/carla_map_infos_train.pkl`) to inform settings for the
+eventual H100 MIG 20GB / 16 CPU / 64GB RAM cluster target. Local GPU is
+much smaller than the target, so **memory numbers are extrapolated
+linearly and not yet verified on real H100 MIG hardware** — compute/
+throughput numbers don't transfer across architectures at all and are
+local-only reference points.
+
+Measured (fp16, real training step, `log_config`'s reported `memory`):
+- `samples_per_gpu=1`: ~3555 MiB, ~0.75-0.87s/iter
+- `samples_per_gpu=2`: ~6731 MiB, ~0.73s/iter (2 samples/iter, i.e. ~0.37s/sample -- batching improves per-sample throughput)
+- `samples_per_gpu=3`: OOMs on this 8GB card (needed >7.5GB)
+- Linear fit from the 1/2 data points: ~379 MiB fixed + ~3176 MiB/sample
+- `num_workers`: `data_time` drops from ~0.12s (0 workers) to ~0.005s
+  (negligible) already at 4 workers; 8 and 16 workers showed **no further
+  improvement** -- not CPU/data-loading bound past 4 workers on this
+  16-core machine.
+- Confirmed the dataset's occasional 5,000,000-raw-point tiles (18/4103,
+  see gotcha #13's context) do **not** cause memory spikes -- voxelizer's
+  `max_voxels=[90000,120000]` cap bounds memory regardless of raw point
+  count, verified directly against one of these tiles.
+
+Extrapolated to 20GB (20480 MiB), applying the linear fit:
+- `samples_per_gpu=4`: ~13.1GB (64% of 20GB)
+- `samples_per_gpu=5`: ~16.3GB (79% of 20GB)
+- `samples_per_gpu=6`: ~19.4GB (95% of 20GB -- tight, don't trust without verifying)
+
+**Recommendation given to user**: `samples_per_gpu=4-5`, `workers_per_gpu=4-8`,
+plus `--shm-size=8g` (gotcha #14) and re-verifying batch size empirically
+on the actual H100 MIG partition before a long run (a 10-20 iteration dry
+run checking logged `memory` is enough). Also flagged: `lr=6e-4` and
+`warmup_iters=500` in `maptrv2_carla_r50_24ep_lidar.py` were implicitly
+tuned for `samples_per_gpu=1` (inherited from the nuScenes/AV2-derived
+base configs) -- increasing batch size should come with linear LR scaling
+(`new_lr ≈ 6e-4 * new_batch_size`), and `warmup_iters=500` should be
+reconsidered since it's a much larger fraction of the first epoch at
+higher batch sizes (iterations/epoch = 4103/samples_per_gpu drops
+sharply as batch size grows).
+
+## Viewing training outputs (2026-07-30)
+
+No prediction visualizer existed for CARLA — the repo's existing ones
+(`tools/maptrv2/av2_vis_pred.py`, `tools/maptrv2/nusc_vis_pred.py`,
+`tools/maptr/vis_pred.py`, `tools/analysis_tools/visual.py`) are all
+coupled to their source dataset's multi-camera setup or the
+`nuscenes-devkit` SDK, and `tools/test.py --show` doesn't work either
+since `CustomCarlaLocalMapDataset` never implements `show()`. Two new
+tools, verified end-to-end against a real local checkpoint:
+
+- `tools/maptrv2/carla_bev_vis.py` — runs inside the container (needs
+  config+checkpoint+GPU). Renders GT-vs-predicted divider polylines
+  overlaid in one PNG per sample, adapted from `av2_vis_pred.py`'s
+  self-contained BEV-only plotting block (that script's camera-projection
+  code is irrelevant here, CARLA is LiDAR-only). GT is read directly from
+  `dataset.data_infos[i]['annotation']['divider']` rather than through the
+  model-input pipeline, since `CustomCarlaLocalMapDataset`'s test-mode
+  path never attaches `gt_bboxes_3d`/`gt_labels_3d` (only train-mode does,
+  via `vectormap_pipeline`).
+- `tools/maptrv2/webviewer.py` — standalone, runs *outside* the container
+  (`pip install flask matplotlib seaborn tensorboard`), single file. Shows
+  loss/eval curves, embedded TensorBoard, and the BEV gallery on one
+  `localhost` page. **Gotcha found while testing**: the bare `tensorboard`
+  command can hang forever on startup with no useful error if a stale
+  system/apt-packaged TensorBoard shadows a real pip install on `$PATH`
+  (hit this exact thing in this dev environment). Fixed by launching it as
+  `sys.executable -m tensorboard.main` instead of trusting `$PATH` — do
+  the same if adapting this pattern elsewhere.
 
 ## Open items / next steps
 
