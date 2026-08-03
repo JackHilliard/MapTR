@@ -8,9 +8,9 @@ section, since those bugs are easy to reintroduce by accident (e.g. editing
 
 ## Current branch / image state (as of 2026-07-30)
 
-- Branch: `maptrv2`, pushed to `origin/maptrv2` at commit `6498067`.
+- Branch: `maptrv2`, pushed to `origin/maptrv2` at commit `49be948`.
 - Docker image: `jhd0ck3r/maptrv2:latest` on Docker Hub, digest
-  `sha256:f1a26d828bb0e128bdf9b876637af4e54b7ef0da614fca100f66642935684308`.
+  `sha256:7d3c08f816cb0fcc2e5940047cc57cf14ba650cb4a33e553448a3c9c88a0ce76`.
   Built from `docker/Dockerfile` — CUDA 11.8 / torch 2.1.0 / Python 3.10,
   targets both Ampere (sm_86, e.g. local RTX 3070) and Hopper (sm_90, H100)
   via `TORCH_CUDA_ARCH_LIST="8.6 9.0+PTX"`.
@@ -438,6 +438,87 @@ launch command *in the same shell invocation* self-matches and kills the
 wrapper script before the launch runs (the pattern matches the launch
 command's own text later in the same invocation) -- run kill and (re)launch
 as separate tool calls/invocations, not combined in one script.
+
+## LIKELY MAJOR BUG: GT polylines are in the wrong frame (2026-08-03)
+
+Found while building `tools/maptrv2/dataset_viewer.py`. **Not yet fixed --
+fixing it means regenerating the pkls and retraining, which is the user's
+call.**
+
+Each tile's `.npz` carries two *different* origins:
+  * `offset`      -- what `features[:, 0:3]` is actually relative to.
+                     Verified exactly: `points - offset == features[:, :3]`.
+  * `tile_center` -- the nominal geometric centre of the tile.
+
+`tools/maptrv2/custom_carla_map_converter.py` builds the training pkl with
+`divider.append(pts - tile_center)`, i.e. it puts the GT polylines in the
+**tile_center** frame while the point clouds the model actually sees are in
+the **offset** frame. Across 400 train tiles those origins differ by a mean
+of **2.37 m** (max 7.58 m); 72% of tiles are off by >1 m.
+
+Measured against real driving-surface returns (points with `label == 0`),
+median distance from polyline vertices to the nearest road point, 40 tiles:
+```
+polyline - offset       ->  0.038 m   (correct: sits on the road)
+polyline - tile_center  ->  0.388 m   (what the converter does)
+```
+Chamfer eval thresholds are 0.5/1.0/1.5 m, so a systematic multi-metre GT
+offset would badly suppress mAP -- a strong candidate for why
+`CarlaMap_chamfer/mAP` has been stuck around 0.02. The `label` +
+`gt_frame` controls in the dataset viewer show it directly: with `offset`
+the polylines sit centred in the blue driving-lane points; with
+`tile_center` they're visibly displaced and clipped at the tile edge.
+
+**If fixing**: change the converter to subtract `offset` (read from the
+tile's own `.npz`) rather than `tile_center`, regenerate both pkls, and
+retrain to compare. Note `.npz['labels']` also holds the per-point
+`lane_type_lookup` class ids (-1 = unlabeled), which the current
+divider-only pipeline ignores entirely but could be used for a real
+multi-class taxonomy later.
+
+## Degenerate 5,000,000-point tiles (2026-08-03)
+
+The 18 tiles whose manifest `n_points` is exactly 5,000,000 are junk: in
+`town01_tile_00000`, 4,994,233 of the 5,000,000 points sit at a *single*
+xy location (median cell occupancy across the tile: 3 points), with only
+4,321 unique xy positions in total. They carry almost no geometric
+information despite dominating the dataset's point-count statistics.
+
+This retroactively explains two earlier puzzles: why `GridSamplePoints`
+collapsed 5M -> 3,242 points on that tile, and why the voxelizer only ever
+found 718 occupied voxels there. Worth excluding these tiles from training
+rather than paying to load and process them.
+
+## `tools/maptrv2/dataset_viewer.py` (2026-08-03)
+
+Standalone dark-themed CARLA dataset browser -- no torch/mmdet3d/GPU, just
+flask/matplotlib/numpy. Auto-discovers every `<data-root>/*/manifest.json`,
+so towns from all splits appear in one picker labelled with their split.
+Representations: true RGB (from `features[:, 3:6]`), lane label, flat
+top-down, 1 m² density heat map, intensity; polylines and log/linear
+density as overlays.
+
+**Three real bugs hit while building it, all worth not re-learning:**
+
+1. **`&gt_frame=` in an HTML attribute is parsed as `>_frame=`.** Browsers
+   resolve known entity names (`&gt`) even without the closing `;`, so the
+   emitted `...&mode=density&gt_frame=offset...` reached the server as
+   `mode="density>_frame=offset"` with `gt_frame` dropped entirely. Every
+   request fell through to the default branch and rendered "top-down" no
+   matter what was selected. **curl can never reproduce this** -- nothing
+   HTML-parses the URL -- so it survived several rounds of "the server is
+   provably correct" testing. Fixed by building URLs with `urlencode()` +
+   `html.escape()`. **When debugging a web UI, test by parsing the emitted
+   HTML (`html.parser`), not by curling URLs you constructed yourself.**
+2. **matplotlib in a threaded Flask server segfaults.** Needs *both* the
+   OO `Figure`/`FigureCanvasAgg` API (never `pyplot`, a global state
+   machine) *and* a `threading.Lock` around rendering. The OO API alone
+   still crashed under a concurrent-request stress test. Sequential curl
+   never reproduces it; a browser loading a gallery does.
+3. **A colormap whose low end equals the page background** makes a heat map
+   look blank. Combined with this dataset's enormous density dynamic range
+   (see degenerate tiles above), the density view appeared empty. Fixed
+   with `inferno` + a log norm by default.
 
 ## Open items / next steps
 
