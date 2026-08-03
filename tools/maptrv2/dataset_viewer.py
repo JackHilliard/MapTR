@@ -63,6 +63,7 @@ import matplotlib.patheffects as pe
 from flask import Flask, abort, make_response, request, send_file
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 
 app = Flask(__name__)
 STATE = {}
@@ -160,6 +161,67 @@ def load_polylines(name, origin, split):
     return out
 
 
+def discover_results(work_dir):
+    """Find every prediction-results json under a training work_dir.
+
+    Two locations matter, because they're written by different code paths:
+      * <work_dir>/**/carlamap_results.json -- what you get from
+        `tools/test.py --format-only --eval-options jsonfile_prefix=...`
+        when you point it inside the work_dir.
+      * val/<work_dir>/<ctime>/carlamap_results.json -- what the *training*
+        eval hook writes. Note mmdet_train.py hardcodes
+        `osp.join('val', cfg.work_dir, <ctime>)`, i.e. a path relative to
+        the CWD training ran from, OUTSIDE the work_dir. If training ran in
+        a container without that path bind-mounted, those results were
+        discarded when the container exited.
+
+    Returns {label: path}, newest first.
+    """
+    found = {}
+    roots = [work_dir, osp.join('val', work_dir)]
+    for root in roots:
+        if not osp.isdir(root):
+            continue
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for fn in filenames:
+                if fn.endswith('.json') and 'result' in fn.lower():
+                    p = osp.join(dirpath, fn)
+                    label = osp.relpath(p, work_dir if root == work_dir
+                                         else osp.dirname(work_dir))
+                    found[label] = p
+    return dict(sorted(found.items(),
+                        key=lambda kv: osp.getmtime(kv[1]), reverse=True))
+
+
+def load_results(path):
+    """Parse a carlamap_results.json into {sample_token: [(pts, score, cls)]}.
+
+    Predicted points are already in the model's tile-local BEV frame (the
+    same frame as the LiDAR points fed in, i.e. the block's `offset`
+    frame), so unlike the GT reference lines they need no origin
+    subtraction -- they're plotted as-is.
+    """
+    cached = STATE['results_cache'].get(path)
+    if cached is not None:
+        return cached
+    with open(path) as f:
+        blob = json.load(f)
+    out = {}
+    for entry in blob.get('results', []):
+        token = entry.get('sample_token')
+        vecs = []
+        for v in entry.get('vectors', []):
+            pts = np.asarray(v.get('pts', []), dtype=np.float32)
+            if pts.ndim != 2 or pts.shape[0] < 2:
+                continue
+            vecs.append((pts[:, :2],
+                          float(v.get('confidence_level', 1.0)),
+                          v.get('cls_name', '?')))
+        out[token] = vecs
+    STATE['results_cache'][path] = out
+    return out
+
+
 def style_axes(ax, radius):
     ax.set_facecolor(BG)
     ax.set_xlim(-radius, radius)
@@ -177,7 +239,8 @@ def render_tile(*args, **kwargs):
 
 
 def _render_tile(name, mode, show_polylines, gt_frame,
-                  point_size, max_points, log_density=True, split=None):
+                  point_size, max_points, log_density=True, split=None,
+                  results_path=None, score_thresh=0.3):
     if split is None:
         t = tile_by_name(name)
         split = t['_split'] if t else None
@@ -269,16 +332,55 @@ def _render_tile(name, mode, show_polylines, gt_frame,
         title_extra = ('top-down' if mode != 'label'
                         else 'top-down (no labels in this block)')
 
+    outline = [pe.Stroke(linewidth=3.0, foreground='#000000', alpha=0.6),
+                pe.Normal()]
+    overlay_handles = []
+
     if show_polylines:
         # red reads well on the dark scatter views but disappears against
         # inferno's orange/yellow mid-range, so switch to cyan there; the
         # black outline keeps it legible over inferno's bright cells too.
         pl_color = '#00e5ff' if mode == 'density' else '#f85149'
-        outline = [pe.Stroke(linewidth=3.0, foreground='#000000', alpha=0.6),
-                    pe.Normal()]
-        for pl in load_polylines(name, origin, split):
+        gt = load_polylines(name, origin, split)
+        for pl in gt:
             ax.plot(pl[:, 0], pl[:, 1], color=pl_color, linewidth=1.8,
                      alpha=0.98, zorder=5, path_effects=outline)
+        if gt:
+            overlay_handles.append(
+                Line2D([], [], color=pl_color, linewidth=1.8,
+                        label=f'GT ({len(gt)})'))
+
+    n_pred = 0
+    if results_path:
+        # Predictions are deliberately styled to be unmistakable against
+        # GT: bright yellow, dashed, thicker, drawn on top (higher zorder).
+        preds = load_results(results_path).get(name, [])
+        for pts, score, _cls in preds:
+            if score < score_thresh:
+                continue
+            n_pred += 1
+            ax.plot(pts[:, 0], pts[:, 1], color='#ffd60a', linewidth=2.0,
+                     alpha=0.95, zorder=6, linestyle='--',
+                     path_effects=outline)
+        overlay_handles.append(
+            Line2D([], [], color='#ffd60a', linewidth=2.0, linestyle='--',
+                    label=f'pred ({n_pred} @ score≥{score_thresh:g})'))
+
+    if overlay_handles:
+        # ax.legend() REPLACES any existing legend, so the label-mode class
+        # legend has to be re-added as a standalone artist first, otherwise
+        # adding this overlay legend silently removes it.
+        existing = ax.get_legend()
+        if existing is not None:
+            existing.set_zorder(20)
+            ax.add_artist(existing)
+        leg2 = ax.legend(handles=overlay_handles, fontsize=6, loc='lower left',
+                          facecolor=BG_PANEL, edgecolor=BORDER,
+                          labelcolor=TEXT, framealpha=0.95)
+        leg2.get_frame().set_linewidth(0.5)
+        # legends default to zorder 5, but predictions are drawn at 6 and
+        # would otherwise scribble straight over the legend box
+        leg2.set_zorder(20)
 
     sub_note = f', showing {max_points:,}' if subsampled else ''
     ax.set_title(f'{name}  [{split}]\n{n_raw:,} pts{sub_note} — {title_extra}',
@@ -368,6 +470,7 @@ PAGE = """<!doctype html>
     <label><input type="checkbox" name="linear_density" value="1" {lin_checked}>
       linear density scale (default: log)</label>
   </fieldset>
+  {pred_fields}
   <button type="submit">Render</button>
 </form>
 
@@ -393,6 +496,105 @@ MISALIGN_WARNING = """
 """
 
 
+PRED_FIELDS = """
+  <fieldset>
+    <label class="top">Predictions (work-dir)</label>
+    <select name="results">{result_opts}</select>
+  </fieldset>
+  <fieldset>
+    <label class="top">Pred score &ge;</label>
+    <input type="number" name="score_thresh" value="{score_thresh}"
+           min="0" max="1" step="0.05">
+  </fieldset>
+"""
+
+NO_WORKDIR_NOTE = """
+  <fieldset>
+    <label class="top">Predictions</label>
+    <div class="meta" style="max-width:22em">
+      pass <code>--work-dir &lt;dir&gt;</code> at startup to overlay predicted
+      polylines from a results json
+    </div>
+  </fieldset>
+"""
+
+NO_RESULTS_NOTE = """
+  <fieldset>
+    <label class="top">Predictions</label>
+    <div class="meta" style="max-width:30em">
+      No predictions found in <code>{work_dir}</code>. Training only writes
+      checkpoints and logs there &mdash; the training-time eval hook writes its
+      results to <code>val/&lt;work_dir&gt;/&lt;timestamp&gt;/</code> relative
+      to the CWD training ran from, which for a container run is usually not
+      bind-mounted, so they were discarded.
+      {howto}
+    </div>
+  </fieldset>
+"""
+
+HOWTO_WITH_CKPT = """
+      <br><br>Generate them from the checkpoint already in this work-dir:
+      <br><code style="display:block;white-space:pre-wrap;margin-top:.4em">python3 tools/test.py \\
+  {config} \\
+  {ckpt} \\
+  --format-only --eval-options jsonfile_prefix={work_dir}/results</code>
+      then reload this page (results are re-scanned per request).
+"""
+
+HOWTO_NO_CKPT = """
+      <br><br>There's no <code>.pth</code> checkpoint here either, so train
+      first, then run <code>tools/test.py --format-only --eval-options
+      jsonfile_prefix=&lt;work_dir&gt;/results</code>.
+"""
+
+
+def no_results_note(work_dir):
+    """Build the 'no predictions' note, filled in with the checkpoint and
+    config actually present in this work_dir so the suggested command is
+    copy-pasteable rather than a template with placeholders."""
+    ckpts = sorted(glob_pth(work_dir))
+    cfgs = sorted(f for f in os.listdir(work_dir) if f.endswith('.py')) \
+        if osp.isdir(work_dir) else []
+    if ckpts:
+        # prefer latest.pth / best_*, else whatever's newest
+        preferred = next((c for c in ckpts if osp.basename(c) == 'latest.pth'),
+                          None) or ckpts[-1]
+        cfg = (osp.join(work_dir, cfgs[0]) if cfgs
+               else 'projects/configs/maptrv2/maptrv2_carla_r50_24ep_lidar.py')
+        howto = HOWTO_WITH_CKPT.format(config=cfg, ckpt=preferred,
+                                        work_dir=work_dir)
+    else:
+        howto = HOWTO_NO_CKPT
+    return NO_RESULTS_NOTE.format(work_dir=work_dir, howto=howto)
+
+
+def glob_pth(work_dir):
+    out = []
+    if not osp.isdir(work_dir):
+        return out
+    for dirpath, _d, filenames in os.walk(work_dir):
+        for fn in filenames:
+            if fn.endswith('.pth'):
+                out.append(osp.join(dirpath, fn))
+    return out
+
+
+def _safe_float(v, default):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def resolve_results_path(label):
+    """Map a UI label back to a real path, and refuse anything not in the
+    discovered set -- the label reaches us straight from a query string, so
+    it must never be joined onto a filesystem path unchecked."""
+    if not label or not STATE.get('work_dir'):
+        return None
+    return discover_results(STATE['work_dir']).get(label)
+
+
 def _opts(values, current, labels=None):
     out = []
     for i, v in enumerate(values):
@@ -416,10 +618,19 @@ def index():
     point_size = request.args.get('point_size', '1.5')
     polylines = '1' if request.args.get('polylines') else ''
     linear_density = '1' if request.args.get('linear_density') else ''
+    results = request.args.get('results', '')
+    score_thresh = request.args.get('score_thresh', '0.3')
     # first load defaults to polylines on -- it's the most useful view and
     # makes the frame issue above immediately visible
     if not request.args:
         polylines = '1'
+
+    # re-scan on each request so results produced while the viewer is
+    # running show up without a restart
+    result_files = (discover_results(STATE['work_dir'])
+                     if STATE.get('work_dir') else {})
+    if results and results not in result_files:
+        results = ''
 
     # town keys may be 'split:town' if a town name ever collides across
     # splits (see build_index); match on the bare town name either way
@@ -451,6 +662,9 @@ def index():
             params['polylines'] = '1'
         if linear_density:
             params['linear_density'] = '1'
+        if results:
+            params['results'] = results
+            params['score_thresh'] = score_thresh
         # urlencode + html.escape is REQUIRED here, not cosmetic. A raw "&"
         # separator in an HTML attribute starts an entity reference, and
         # browsers resolve known entity names even without the closing ";"
@@ -462,11 +676,19 @@ def index():
         # HTML-parsing the URL; only a real browser triggers it.
         q = '?' + urlencode(params)
         q_attr = html.escape(q, quote=True)
+        cap = (f'{t["name"]} — {t["n_points"]:,} pts, '
+               f'{t["n_polylines"]} GT polylines')
+        if results:
+            preds = load_results(result_files[results]).get(t['name'])
+            if preds is None:
+                cap += ' — <span style="color:#d29922">no preds for this tile</span>'
+            else:
+                kept = sum(1 for _p, s, _c in preds if s >= float(score_thresh))
+                cap += f', {kept} preds'
         figs.append(
             f'<figure><a href="/tile.png{q_attr}" target="_blank">'
             f'<img src="/tile.png{q_attr}"></a>'
-            f'<figcaption>{t["name"]} — {t["n_points"]:,} pts, '
-            f'{t["n_polylines"]} polylines</figcaption></figure>')
+            f'<figcaption>{cap}</figcaption></figure>')
 
     # NB: not named `html` -- that shadows the stdlib `html` module used
     # above for attribute escaping.
@@ -493,6 +715,14 @@ def index():
                           ['offset (correct)', 'tile_center (converter)']),
         pl_checked='checked' if polylines else '',
         lin_checked='checked' if linear_density else '',
+        pred_fields=(
+            NO_WORKDIR_NOTE if not STATE.get('work_dir')
+            else no_results_note(STATE['work_dir'])
+            if not result_files
+            else PRED_FIELDS.format(
+                score_thresh=score_thresh,
+                result_opts=_opts([''] + list(result_files.keys()), results,
+                                   ['(none)'] + list(result_files.keys())))),
         gallery='\n'.join(figs) or
                 f'<p style="color:{TEXT_MUTED}">no tiles for that town/range</p>',
     )
@@ -520,6 +750,8 @@ def tile_png():
         max_points=STATE['max_points'],
         log_density=request.args.get('linear_density') != '1',
         split=request.args.get('split'),
+        results_path=resolve_results_path(request.args.get('results')),
+        score_thresh=_safe_float(request.args.get('score_thresh'), 0.3),
     )
     if buf is None:
         abort(404)
@@ -539,6 +771,11 @@ def parse_args():
                     help='restrict to a single split; default is to load '
                          'every <data-root>/*/manifest.json found (so towns '
                          'from train and test both appear in the picker)')
+    p.add_argument('--work-dir', default=None,
+                    help='training work_dir; enables overlaying predicted '
+                         'polylines from any *result*.json found under it '
+                         '(or under val/<work-dir>, where the training eval '
+                         'hook writes them)')
     p.add_argument('--port', type=int, default=5001)
     p.add_argument('--max-points', type=int, default=150000,
                     help='cap on points drawn in scatter modes (density mode '
@@ -550,6 +787,20 @@ def main():
     args = parse_args()
     STATE['data_root'] = args.data_root
     STATE['max_points'] = args.max_points
+    STATE['work_dir'] = args.work_dir
+    STATE['results_cache'] = {}
+    if args.work_dir is not None and not osp.isdir(args.work_dir):
+        hint = ''
+        if osp.isfile(args.work_dir):
+            hint = (f'\n  That is a file, not a directory -- did you mean '
+                    f'its parent?\n    --work-dir {osp.dirname(args.work_dir)}')
+        elif osp.isdir(osp.dirname(args.work_dir) or '.'):
+            siblings = [d for d in os.listdir(osp.dirname(args.work_dir) or '.')
+                        if osp.isdir(osp.join(osp.dirname(args.work_dir) or '.', d))]
+            if siblings:
+                hint = ('\n  Directories that do exist there: '
+                        + ', '.join(sorted(siblings)[:8]))
+        raise SystemExit(f'--work-dir is not a directory: {args.work_dir}{hint}')
     if not osp.isdir(args.data_root):
         raise SystemExit(f'no such data root: {args.data_root}')
 

@@ -520,6 +520,46 @@ density as overlays.
    (see degenerate tiles above), the density view appeared empty. Fixed
    with `inferno` + a log norm by default.
 
+## Generating predictions: `tools/test.py` was broken three ways (2026-08-03)
+
+Training **never writes predictions anywhere persistent**. The eval hook
+uses `osp.join('val', cfg.work_dir, <ctime>)` (`mmdet_train.py` ~line 177)
+-- relative to the CWD training ran from, *outside* the work_dir. In a
+container run that path isn't bind-mounted, so results are discarded on
+exit. You must generate them explicitly with `tools/test.py --format-only`,
+which needed three fixes before it would run at all:
+
+1. **The single-GPU path was disabled by a bare `assert False`** (the two
+   real lines left commented out beneath it). Re-enabled -- it's the path
+   that actually works here.
+2. **The distributed path is broken under torch 2.1**: mmcv 1.7.2's
+   `MMDistributedDataParallel` hits `AttributeError: ... has no attribute
+   '_use_replicated_tensor_module'` inside torch's `_run_ddp_forward`.
+   Same family as gotcha #5's `_get_stream` bug. NOT fixed -- use the
+   single-GPU path. (So before these fixes, *both* paths were dead ends.)
+3. **`--eval-options jsonfile_prefix=...` was silently overwritten** by a
+   hardcoded `test/<config>/<ctime>/` default, so results always went to
+   that (unmounted, therefore discarded) path regardless of what was
+   asked for. Changed to `setdefault`.
+
+Working invocation:
+```bash
+python3 tools/test.py <work_dir>/<config>.py <work_dir>/latest.pth \
+    --format-only --eval-options jsonfile_prefix=<work_dir>/results
+```
+writes `<work_dir>/results/pts_bbox/carlamap_results.json`, schema
+`{meta, results:[{sample_token, vectors:[{pts, pts_num, cls_name, type,
+confidence_level}]}]}` with `pts` shape `(num_pts_per_vec, 2)` already in
+the tile-local BEV frame (no origin shift needed to plot).
+
+**Note on confidence scores**: a 1-epoch checkpoint produces scores of only
+~0.14-0.17, so any score threshold of 0.3 filters out *everything*. Check
+the actual score range before concluding a viewer/eval shows nothing.
+
+`tools/maptrv2/dataset_viewer.py --work-dir <dir>` overlays these
+predictions (yellow dashed) over GT (red solid), re-scanning per request so
+newly generated results appear without a restart.
+
 ## Open items / next steps
 
 - **`carlasim_map.py`'s `ann_file_train` is currently stale/inconsistent.**
