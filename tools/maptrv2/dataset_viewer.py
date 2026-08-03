@@ -26,10 +26,15 @@ train split, so the choice matters a lot. Measured against the actual
 driving-surface returns (points whose label == 0), across 40 tiles:
     polyline - offset       -> median 0.038 m to nearest road point
     polyline - tile_center  -> median 0.388 m to nearest road point
-So `offset` is the correct frame; this viewer uses it by default. The
-`?gt_frame=tile_center` toggle renders the other one for comparison --
-which is what tools/maptrv2/custom_carla_map_converter.py currently uses
-when building the training pkl (see CLAUDE.md).
+So `offset` is the correct frame, and this viewer always uses it. There is
+deliberately no way to render the `tile_center` variant -- it is simply
+wrong, and having it selectable only invited misreading a misaligned plot
+as real.
+
+tools/maptrv2/custom_carla_map_converter.py originally used `tile_center`,
+which misaligned every GT polyline against its own point cloud; it now
+subtracts `offset` and records the origin it used as `annotation_origin`
+in each pkl sample.
 """
 import argparse
 import html
@@ -238,7 +243,7 @@ def render_tile(*args, **kwargs):
         return _render_tile(*args, **kwargs)
 
 
-def _render_tile(name, mode, show_polylines, gt_frame,
+def _render_tile(name, mode, show_polylines,
                   point_size, max_points, log_density=True, split=None,
                   results_path=None, score_thresh=0.3):
     if split is None:
@@ -252,7 +257,11 @@ def _render_tile(name, mode, show_polylines, gt_frame,
     labels = block['labels'] if 'labels' in block else None
     radius = float(block['tile_radius']) if 'tile_radius' in block else 12.5
 
-    origin = block['offset'] if gt_frame == 'offset' else block['tile_center']
+    # Always the block's own `offset` -- the frame `features[:, 0:3]` is
+    # stored in, and (since the converter fix) the frame the training pkl's
+    # GT is built in too. `tile_center` is NOT interchangeable: it differs
+    # by a mean of ~2.4m, which is what the old converter got wrong.
+    origin = block['offset']
 
     fig = Figure(figsize=(6, 6))
     FigureCanvasAgg(fig)
@@ -423,19 +432,14 @@ PAGE = """<!doctype html>
   figure img {{ display: block; width: 420px; border-radius: 3px; }}
   figcaption {{ font-size: 0.72em; color: {muted}; margin-top: 5px;
                 text-align: center; word-break: break-all; }}
-  .warn {{ background: #3d2a12; border: 1px solid #d29922; border-radius: 6px;
-           padding: 0.9em 1.1em; font-size: 0.85em; margin-bottom: 1.5em; }}
-  .warn code {{ background: #00000040; padding: 1px 4px; border-radius: 3px; }}
   a {{ color: {accent}; }}
 </style>
 </head><body>
 <h1>CARLA dataset viewer</h1>
-<div class="sub">{data_root} &mdash; split <code>{split}</code> &mdash;
-  splits: <code>{split}</code> &mdash; {n_tiles:,} tiles across {n_towns} towns<br>
+<div class="sub">{data_root} &mdash; splits: <code>{split}</code> &mdash;
+  {n_tiles:,} tiles across {n_towns} towns<br>
   showing <b>{town}</b> (<b>{town_split}</b>) tiles {start}&ndash;{end} &mdash;
-  representation: <b>{mode}</b>, GT frame: <b>{gt_frame}</b></div>
-
-{warning}
+  representation: <b>{mode}</b></div>
 
 <form method="get">
   <fieldset>
@@ -453,10 +457,6 @@ PAGE = """<!doctype html>
   <fieldset>
     <label class="top">Representation</label>
     <select name="mode">{mode_opts}</select>
-  </fieldset>
-  <fieldset>
-    <label class="top">GT frame</label>
-    <select name="gt_frame">{frame_opts}</select>
   </fieldset>
   <fieldset>
     <label class="top">Point size</label>
@@ -478,21 +478,6 @@ PAGE = """<!doctype html>
 {gallery}
 </div>
 </body></html>
-"""
-
-MISALIGN_WARNING = """
-<div class="warn">
-  <strong>Heads-up — GT frame mismatch in the training converter.</strong>
-  Each tile's point cloud (<code>features</code>) is stored relative to the
-  <code>.npz</code>'s <code>offset</code>, but
-  <code>tools/maptrv2/custom_carla_map_converter.py</code> builds the training
-  pkl by subtracting <code>tile_center</code> instead. Those two origins differ
-  by a mean of ~2.4&thinsp;m (max &gt;7&thinsp;m) across this split. Measured
-  against actual driving-surface returns, <code>offset</code> puts polylines
-  0.038&thinsp;m from the road and <code>tile_center</code> puts them
-  0.388&thinsp;m away. Flip the <em>GT frame</em> selector above with polylines
-  enabled to see it directly.
-</div>
 """
 
 
@@ -614,7 +599,6 @@ def index():
     count = max(1, min(60, int(request.args.get('count', 6))))
     start = max(0, int(request.args.get('start', 0)))
     mode = request.args.get('mode', 'rgb')
-    gt_frame = request.args.get('gt_frame', 'offset')
     point_size = request.args.get('point_size', '1.5')
     polylines = '1' if request.args.get('polylines') else ''
     linear_density = '1' if request.args.get('linear_density') else ''
@@ -654,7 +638,6 @@ def index():
             'name': t['name'],
             'split': t['_split'],
             'mode': mode,
-            'gt_frame': gt_frame,
             'point_size': point_size,
             'v': cachebust,
         }
@@ -698,9 +681,8 @@ def index():
         data_root=osp.abspath(STATE['data_root']),
         split=', '.join(STATE['splits'].keys()),
         n_tiles=len(STATE['tiles']), n_towns=len(towns),
-        town=town, town_split=town_split, mode=mode, gt_frame=gt_frame,
+        town=town, town_split=town_split, mode=mode,
         end=start + len(tiles),
-        warning=MISALIGN_WARNING,
         town_opts=_opts(towns, town,
                          [f'{t}  ({STATE["town_split"][t]}'
                           f', {STATE["town_counts"][t]:,} tiles)'
@@ -711,8 +693,6 @@ def index():
                          ['true RGB colour', 'lane label',
                           'top-down (flat colour)',
                           'density heat map (1 m² bins)', 'intensity']),
-        frame_opts=_opts(['offset', 'tile_center'], gt_frame,
-                          ['offset (correct)', 'tile_center (converter)']),
         pl_checked='checked' if polylines else '',
         lin_checked='checked' if linear_density else '',
         pred_fields=(
@@ -745,7 +725,6 @@ def tile_png():
         name,
         mode=request.args.get('mode', 'rgb'),
         show_polylines=bool(request.args.get('polylines')),
-        gt_frame=request.args.get('gt_frame', 'offset'),
         point_size=point_size,
         max_points=STATE['max_points'],
         log_density=request.args.get('linear_density') != '1',

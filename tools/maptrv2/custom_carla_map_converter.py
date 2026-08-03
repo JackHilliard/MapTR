@@ -67,12 +67,29 @@ def convert_carla_tiles(data_root, split, lane_types=None):
     total_instances = 0
     for idx, tile in enumerate(manifest['tiles']):
         name = tile['name']
-        tile_center = np.array(tile['center'], dtype=np.float32)
 
         lidar_path = os.path.abspath(
             os.path.join(split_dir, 'blocks', f'{name}.npz'))
         if not os.path.isfile(lidar_path):
             raise FileNotFoundError(lidar_path)
+
+        # The polylines below are in WORLD coordinates and must be shifted
+        # into the same frame as the LiDAR points the model actually sees.
+        # That frame is the block's `offset`, NOT its `tile_center`:
+        # LoadCarlaPointsFromFile reads `features[:, 0:3]`, and
+        # `points - offset == features[:, :3]` holds exactly, while
+        # tile_center differs from offset by a mean of ~2.4m (max >7m)
+        # across the train split. Measured against real driving-surface
+        # returns (label == 0), `- offset` puts polylines a median 0.038m
+        # from the road vs 0.388m for `- tile_center`. Using tile_center
+        # here (as this converter originally did) misaligns every GT
+        # polyline against its own point cloud, which matters a lot given
+        # chamfer eval thresholds of 0.5/1.0/1.5m.
+        #
+        # np.load is lazy, so this reads only the small `offset` array --
+        # it does not pull the full point cloud into memory.
+        with np.load(lidar_path) as block:
+            origin = np.asarray(block['offset'], dtype=np.float32)
 
         ref_path = os.path.join(split_dir, 'reference_lines',
                                 f'{name}_reference_lines.json')
@@ -86,7 +103,7 @@ def convert_carla_tiles(data_root, split, lane_types=None):
             pts = np.array(poly['points'], dtype=np.float32)
             if pts.shape[0] < 2:
                 continue
-            divider.append(pts - tile_center)
+            divider.append(pts - origin)
             total_instances += 1
 
         # Sanity check only (tiles are asserted to already be the patch, so
@@ -107,6 +124,10 @@ def convert_carla_tiles(data_root, split, lane_types=None):
                 timestamp=idx,
                 town=tile.get('town'),
                 tile_center=tile['center'],
+                # the origin the annotation below is actually relative to --
+                # recorded explicitly so the frame isn't ambiguous when
+                # reading the pkl back (tile_center above is NOT it)
+                annotation_origin=origin.tolist(),
                 tile_bounds=tile.get('bounds'),
                 annotation=dict(divider=divider),
             ))

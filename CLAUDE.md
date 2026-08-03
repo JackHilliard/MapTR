@@ -439,41 +439,47 @@ wrapper script before the launch runs (the pattern matches the launch
 command's own text later in the same invocation) -- run kill and (re)launch
 as separate tool calls/invocations, not combined in one script.
 
-## LIKELY MAJOR BUG: GT polylines are in the wrong frame (2026-08-03)
-
-Found while building `tools/maptrv2/dataset_viewer.py`. **Not yet fixed --
-fixing it means regenerating the pkls and retraining, which is the user's
-call.**
+## FIXED: GT polylines were in the wrong frame (2026-08-03)
 
 Each tile's `.npz` carries two *different* origins:
   * `offset`      -- what `features[:, 0:3]` is actually relative to.
                      Verified exactly: `points - offset == features[:, :3]`.
   * `tile_center` -- the nominal geometric centre of the tile.
 
-`tools/maptrv2/custom_carla_map_converter.py` builds the training pkl with
-`divider.append(pts - tile_center)`, i.e. it puts the GT polylines in the
-**tile_center** frame while the point clouds the model actually sees are in
-the **offset** frame. Across 400 train tiles those origins differ by a mean
-of **2.37 m** (max 7.58 m); 72% of tiles are off by >1 m.
+`custom_carla_map_converter.py` used to build the pkl with
+`divider.append(pts - tile_center)`, putting GT polylines in the
+**tile_center** frame while the point clouds the model sees are in the
+**offset** frame. Across 400 train tiles those origins differ by a mean of
+**2.37 m** (max 7.58 m); 72% of tiles are off by >1 m. Chamfer eval
+thresholds are 0.5/1.0/1.5 m, so this systematically suppressed mAP and is
+a strong candidate for why `CarlaMap_chamfer/mAP` sat around 0.02.
 
-Measured against real driving-surface returns (points with `label == 0`),
-median distance from polyline vertices to the nearest road point, 40 tiles:
+**Fixed**: the converter now reads `offset` from each tile's own `.npz`
+(cheap -- `np.load` is lazy, so only the small offset array is read, not
+the point cloud) and records it as `annotation_origin` in every pkl sample
+so the frame is unambiguous on read-back. Both pkls were regenerated.
+Verified by measuring median distance from GT polyline vertices to real
+driving-surface returns (`label == 0`), old pkl vs new, 40 tiles each:
 ```
-polyline - offset       ->  0.038 m   (correct: sits on the road)
-polyline - tile_center  ->  0.388 m   (what the converter does)
+          old (tile_center)   new (offset)
+train         0.387 m           0.038 m
+test          0.179 m           0.043 m
 ```
-Chamfer eval thresholds are 0.5/1.0/1.5 m, so a systematic multi-metre GT
-offset would badly suppress mAP -- a strong candidate for why
-`CarlaMap_chamfer/mAP` has been stuck around 0.02. The `label` +
-`gt_frame` controls in the dataset viewer show it directly: with `offset`
-the polylines sit centred in the blue driving-lane points; with
-`tile_center` they're visibly displaced and clipped at the tile edge.
+Instance counts are unchanged (train 4103 tiles/15810 instances, test
+259/1210) -- only coordinates moved, nothing was dropped or added.
 
-**If fixing**: change the converter to subtract `offset` (read from the
-tile's own `.npz`) rather than `tile_center`, regenerate both pkls, and
-retrain to compare. Note `.npz['labels']` also holds the per-point
+**Still outstanding as a result of this fix:**
+* `data/carla/carla_map_gt.json` is **stale** -- it's the cached GT used by
+  chamfer eval, built from the old misaligned pkl, and `_format_gt()`
+  skips regeneration whenever the file already exists. Delete it before
+  the next eval or it will silently score against the old GT.
+* Any checkpoint trained before this fix learned the displaced frame, so
+  its predictions carry the same ~2.4 m offset and its mAP is not
+  comparable. A retrain is needed before the numbers mean anything.
+
+Unrelated but noted while here: `.npz['labels']` holds per-point
 `lane_type_lookup` class ids (-1 = unlabeled), which the current
-divider-only pipeline ignores entirely but could be used for a real
+divider-only pipeline ignores entirely but could support a real
 multi-class taxonomy later.
 
 ## Degenerate 5,000,000-point tiles (2026-08-03)
