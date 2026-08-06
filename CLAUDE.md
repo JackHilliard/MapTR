@@ -225,10 +225,10 @@ so don't assume "it built fine" means "it actually works."
     `simple_test`) and raises a clear `RuntimeError` naming the offending
     `sample_idx`(es) and each sample's raw point count before it would
     otherwise hit the opaque `IndexError` — makes it possible to identify
-    the bad tile(s) from a single log line instead of just a crash. This
-    does **not** fix the underlying data issue — see "full-dataset empty
-    tiles" in Open items below for how to hunt down the actual culprit
-    tile(s).
+    the bad tile(s) from a single log line instead of just a crash. It is
+    now only the *last* line of defence — such tiles are dropped up front
+    by the converter and again by the dataset; see "Zero-voxel tiles are
+    now discarded" below.
 
 14. **`docker run` needs `--shm-size` explicitly raised for
     `data.workers_per_gpu > 0`**, or training crashes partway through (not
@@ -566,6 +566,60 @@ the actual score range before concluding a viewer/eval shows nothing.
 predictions (yellow dashed) over GT (red solid), re-scanning per request so
 newly generated results appear without a restart.
 
+## Zero-voxel tiles are now discarded (2026-08-06)
+
+A tile whose LiDAR points all fall outside `lidar_point_cloud_range` (or
+whose block is empty) voxelizes to **zero voxels** and takes the whole run
+down via gotcha #13's `RuntimeError`. That error is a good diagnostic but a
+terrible outcome for an unattended cluster job, so such tiles are now
+dropped in three places:
+
+1. **`tools/maptrv2/custom_carla_map_converter.py`** counts, per tile, the
+   points that survive both `z <= --z-max` and `--lidar-point-cloud-range`
+   (defaults match the config; `GridSamplePoints` sits between the two in
+   the real pipeline but only *clamps* grid coords, so it cannot change
+   this count). Tiles below `--min-lidar-points` (default 1) are dropped
+   from the pkl and listed in a new sidecar
+   `carla_map_infos_<split>_dropped.json`; every kept sample records
+   `num_lidar_points` / `num_lidar_points_in_range`, and the pkl gains a
+   `lidar_check` block recording the geometry those counts were measured
+   against. `--no-lidar-check` restores the old, faster, no-scan behaviour.
+   The scan reads each block's full `features` array — ~5s for 259 tiles,
+   ~95s for 4103.
+2. **`CustomCarlaLocalMapDataset.load_annotations`** re-filters on that
+   recorded count (`min_lidar_points`, `lidar_pc_range` ctor kwargs, both
+   wired in `maptrv2_carla_r50_24ep_lidar.py`'s `data.train/val/test`), so
+   an already-generated pkl is still protected. It warns loudly if the pkl
+   records no counts at all, or if its recorded range disagrees with the
+   config's. **Filtering has to happen here, not in `__getitem__`** — it
+   runs before `_set_group_flag()`, keeping `self.flag`, `len(self)`,
+   `format_results()`'s length assert and `_format_bbox()`'s positional
+   `data_infos[sample_id]` indexing mutually consistent. Skipping at
+   `__getitem__` time only works in train mode (which resamples on `None`)
+   and would silently desynchronise eval.
+3. **`GridSamplePoints`** raises a new `EmptyLidarTileError` (defined in
+   `pipelines/loading.py`) naming the tile; `prepare_train_data` catches it
+   and returns `None` so training resamples, giving up after 100
+   consecutive skips so a globally wrong range fails fast instead of
+   spinning. Test mode lets it propagate, for the reason in (2). This also
+   fixed a latent crash: `GridSamplePoints` on a genuinely empty point
+   cloud hit `torch.unique(...).max()` on a zero-length tensor.
+
+**Verified**: converting the local 259-tile test split and the full
+4103-tile train split both reproduce their known baselines exactly
+(1210 / 15810 divider instances) with **0 tiles dropped** under the current
+widened range. Re-running the train split with the *old* narrow z-range
+(`-10..18`) drops exactly the 6 town03 overpass tiles gotcha-#13's config
+comment names — a real-data check that the criterion identifies the right
+tiles. Synthetic all-out-of-range and zero-point tiles are dropped by the
+converter and, when present in a pre-fix pkl, skipped at runtime.
+
+**When the sample set changes, delete `data/carla/carla_map_gt.json`** —
+`_format_gt()` skips regeneration whenever that file exists, so eval would
+otherwise silently score against the old tile set. This was already true
+after the 2026-08-03 GT-frame fix; tile dropping is a second way to
+trigger it.
+
 ## Open items / next steps
 
 - **`carlasim_map.py`'s `ann_file_train` is currently stale/inconsistent.**
@@ -588,23 +642,12 @@ newly generated results appear without a restart.
   stride-based, before a real training run). Re-running the converter
   against the full dataset needs no code changes, just `--data-root`
   pointed at the right path and new `ann_file` names in the config.
-- **Full-dataset run hit an empty-tile crash (see gotcha #13) not
-  reproducible locally.** Before re-running training on the cluster, scan
-  the full dataset's `manifest.json` for suspect tiles directly (much
-  faster than waiting to hit them during training) — for each tile, check
-  `n_points` for zero/very-low counts, and cross-check any survivors
-  against the raw `.npz` block's actual `features` xyz range vs
-  `lidar_point_cloud_range`/`z_max=15.0` in
-  `maptrv2_carla_r50_24ep_lidar.py`. On the local subset, raw block
-  `features` xyz is already tile-relative (verified: roughly matches
-  `tile_radius=12.5` for x/y, and lands within `[-8, 15]` for z after
-  each tile's own baked-in offset) — so this is not a world-vs-tile
-  coordinate bug, but some tiles in the full/multi-town dataset may
-  genuinely have near-zero LiDAR returns (e.g. sparse-geometry areas) or
-  an unusually tall/deep local feature pushing all points outside the
-  z-bounds tuned against the single local test town. If real, either
-  filter such tiles out at converter time or widen
-  `lidar_point_cloud_range`/`z_max` to a per-tile-safe margin.
+- **Empty-tile crashes (gotcha #13) are now handled at converter+dataset
+  level** — see "Zero-voxel tiles are now discarded" above. Nothing further
+  is outstanding for the 4103-tile dataset (0 tiles drop under the current
+  range), but a *new/larger* dataset should be converted first and its
+  `carla_map_infos_<split>_dropped.json` inspected before a long run: a
+  large drop count means the range is wrong, not that the data is bad.
 - **Class taxonomy is divider-only, including *all* CARLA lane types**
   (driving/curb/sidewalk/border/restricted/parking/shoulder/stop/other
   all collapsed into one `divider` class) — this was a deliberate choice

@@ -459,6 +459,18 @@ class CustomPointToMultiViewDepth(object):
         return results
 
 
+class EmptyLidarTileError(RuntimeError):
+    """A tile has no LiDAR point inside the voxelizer's range.
+
+    Such a tile voxelizes to zero voxels, which crashes
+    ``MapTRv2.extract_lidar_feat``. Raised by ``GridSamplePoints`` so that
+    ``CustomCarlaLocalMapDataset`` can skip the sample instead (train mode
+    only -- see its ``prepare_train_data``). Tiles like this are normally
+    already dropped at conversion time; this exists for annotation files
+    that predate that check.
+    """
+
+
 @PIPELINES.register_module()
 class LoadCarlaPointsFromFile(object):
     """Load CARLA-simulator LiDAR point clouds from an ``.npz`` block.
@@ -563,11 +575,20 @@ class GridSamplePoints(object):
             losing xy precision the model could otherwise use.
         point_cloud_range (list[float]): must match the range passed to
             the LiDAR voxelizer downstream (``lidar_point_cloud_range`` in
-            the training config) -- used only to bound/offset the integer
-            grid coordinates, not to filter points.
+            the training config) -- used to bound/offset the integer grid
+            coordinates and to detect tiles with nothing in range, but not
+            to filter points (the voxelizer does that itself).
+        min_points (int): raise ``EmptyLidarTileError`` when fewer than
+            this many points fall inside ``point_cloud_range``, since the
+            voxelizer would then produce zero (or near-zero) voxels and
+            crash ``extract_lidar_feat``. Set to 0 to disable the check.
+            Defaults to 1.
     """
 
-    def __init__(self, grid_size=(0.1, 0.1, 0.4), point_cloud_range=None):
+    def __init__(self,
+                 grid_size=(0.1, 0.1, 0.4),
+                 point_cloud_range=None,
+                 min_points=1):
         if point_cloud_range is None:
             raise ValueError('GridSamplePoints requires point_cloud_range '
                               '(must match the downstream LiDAR voxelizer\'s '
@@ -576,6 +597,7 @@ class GridSamplePoints(object):
             grid_size = (grid_size, grid_size, grid_size)
         self.grid_size = grid_size
         self.point_cloud_range = point_cloud_range
+        self.min_points = min_points
         self.dims = [
             int(round((point_cloud_range[3 + i] - point_cloud_range[i])
                       / grid_size[i])) + 1
@@ -587,6 +609,17 @@ class GridSamplePoints(object):
         tensor = points.tensor
         xyz = tensor[:, :3]
         lo = xyz.new_tensor(self.point_cloud_range[:3])
+        hi = xyz.new_tensor(self.point_cloud_range[3:])
+        if tensor.shape[0] == 0:
+            # torch.unique(...).max() below is undefined on an empty tensor,
+            # so bail out before it: nothing to downsample either way.
+            self._check_not_empty(results, 0, 0)
+            return results
+        # Counted before the clamp below, which would otherwise pull
+        # out-of-range points into edge cells and hide the fact that the
+        # voxelizer is about to drop every one of them.
+        n_in_range = int(((xyz >= lo) & (xyz < hi)).all(1).sum())
+        self._check_not_empty(results, tensor.shape[0], n_in_range)
         gsize = xyz.new_tensor(self.grid_size)
         gcoord = torch.floor((xyz - lo) / gsize).long()
         gcoord[:, 0].clamp_(0, self.dims[0] - 1)
@@ -604,6 +637,18 @@ class GridSamplePoints(object):
         results['points'] = points[rep_idx]
         return results
 
+    def _check_not_empty(self, results, n_raw, n_in_range):
+        if self.min_points <= 0 or n_in_range >= self.min_points:
+            return
+        raise EmptyLidarTileError(
+            f'tile {results.get("sample_idx")} has {n_in_range} of {n_raw} '
+            f'point(s) inside point_cloud_range={self.point_cloud_range} '
+            f'(need >= {self.min_points}); it would voxelize to zero voxels. '
+            'Regenerate the annotation pkl with '
+            'tools/maptrv2/custom_carla_map_converter.py to drop tiles like '
+            'this up front, or widen the range.')
+
     def __repr__(self):
         return (f'{self.__class__.__name__}(grid_size={self.grid_size}, '
-                f'point_cloud_range={self.point_cloud_range})')
+                f'point_cloud_range={self.point_cloud_range}, '
+                f'min_points={self.min_points})')

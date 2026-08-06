@@ -13,18 +13,21 @@ they have no AV2-SDK dependency in their bodies.
 import json
 import os
 import tempfile
+import warnings
 from os import path as osp
 
 import mmcv
 import numpy as np
 import torch
 from mmcv.parallel import DataContainer as DC
+from mmcv.utils import print_log
 from mmdet.datasets import DATASETS
 from mmdet.datasets.pipelines import to_tensor
 from mmdet3d.datasets.custom_3d import Custom3DDataset
 
 from .av2_offlinemap_dataset import (LiDARInstanceLines,
                                      VectorizedAV2LocalMap, output_to_vecs)
+from .pipelines.loading import EmptyLidarTileError
 
 
 @DATASETS.register_module()
@@ -54,6 +57,8 @@ class CustomCarlaLocalMapDataset(Custom3DDataset):
                  ),
                  code_size=2,
                  eval_nproc=8,
+                 min_lidar_points=1,
+                 lidar_pc_range=None,
                  classes=None,
                  modality=None,
                  box_type_3d='LiDAR',
@@ -79,6 +84,11 @@ class CustomCarlaLocalMapDataset(Custom3DDataset):
         self.eval_use_same_gt_sample_num_flag = eval_use_same_gt_sample_num_flag
         self.aux_seg = aux_seg
         self.eval_nproc = eval_nproc
+        self.min_lidar_points = min_lidar_points
+        self.lidar_pc_range = lidar_pc_range
+        # Counts consecutive samples skipped by the runtime empty-tile guard
+        # in prepare_train_data -- see the comment there.
+        self._consecutive_empty_skips = 0
         self.vector_map = VectorizedAV2LocalMap(
             canvas_size=bev_size,
             patch_size=self.patch_size,
@@ -101,7 +111,71 @@ class CustomCarlaLocalMapDataset(Custom3DDataset):
 
     def load_annotations(self, ann_file):
         data = mmcv.load(ann_file, file_format='pkl')
-        return sorted(data['samples'], key=lambda e: e['sample_idx'])
+        samples = sorted(data['samples'], key=lambda e: e['sample_idx'])
+        return self._filter_empty_lidar_tiles(samples,
+                                              data.get('lidar_check'))
+
+    def _filter_empty_lidar_tiles(self, samples, lidar_check):
+        """Drop tiles whose LiDAR points would voxelize to zero voxels.
+
+        The converter (tools/maptrv2/custom_carla_map_converter.py) already
+        drops these and records ``num_lidar_points_in_range`` on every
+        sample it keeps; this is the second line of defence, so an
+        already-generated pkl (or one converted against a different
+        ``lidar_point_cloud_range``) still can't take a run down with the
+        ``extract_lidar_feat`` zero-voxel RuntimeError.
+
+        Filtering here rather than in ``__getitem__`` is deliberate: it
+        happens before ``Custom3DDataset.__init__`` calls
+        ``_set_group_flag()``, so ``self.flag``, ``len(self)``,
+        ``format_results()``'s length assert and ``_format_bbox()``'s
+        positional ``data_infos[sample_id]`` indexing all stay consistent.
+        Skipping at ``__getitem__`` time would only work in train mode
+        (which resamples on ``None``) and would silently desynchronise
+        eval.
+        """
+        if lidar_check is not None and self.lidar_pc_range is not None:
+            recorded = lidar_check.get('point_cloud_range')
+            if recorded is not None and \
+                    not np.allclose(recorded, self.lidar_pc_range):
+                warnings.warn(
+                    f'{self.__class__.__name__}: the annotation file\'s '
+                    f'point counts were measured against '
+                    f'lidar_point_cloud_range={list(recorded)}, but this '
+                    f'config uses {list(self.lidar_pc_range)}. The recorded '
+                    'num_lidar_points_in_range values do not describe what '
+                    'this run will voxelize -- regenerate the pkl with a '
+                    'matching --lidar-point-cloud-range.')
+
+        if not any(
+                s.get('num_lidar_points_in_range') is not None
+                for s in samples):
+            warnings.warn(
+                f'{self.__class__.__name__}: no sample in this annotation '
+                'file records num_lidar_points_in_range, so empty (zero-'
+                'voxel) tiles cannot be filtered out. Regenerate it with '
+                'python tools/maptrv2/custom_carla_map_converter.py '
+                '--data-root <path> --out-dir data/carla/ --split <split>')
+            return samples
+
+        kept, dropped = [], []
+        for s in samples:
+            n = s.get('num_lidar_points_in_range')
+            if n is not None and n < self.min_lidar_points:
+                dropped.append(s)
+            else:
+                kept.append(s)
+
+        if dropped:
+            names = ', '.join(s['sample_idx'] for s in dropped[:10])
+            if len(dropped) > 10:
+                names += f', ... (+{len(dropped) - 10} more)'
+            print_log(
+                f'{self.__class__.__name__}: dropped {len(dropped)} of '
+                f'{len(samples)} tiles with fewer than '
+                f'{self.min_lidar_points} in-range LiDAR point(s): {names}',
+                logger='current')
+        return kept
 
     @classmethod
     def get_map_classes(cls, map_classes=None):
@@ -165,7 +239,21 @@ class CustomCarlaLocalMapDataset(Custom3DDataset):
         if input_dict is None:
             return None
         self.pre_pipeline(input_dict)
-        example = self.pipeline(input_dict)
+        try:
+            example = self.pipeline(input_dict)
+        except EmptyLidarTileError as e:
+            # Last resort for a pkl that predates the converter's own check
+            # (or one converted against a different range). Returning None
+            # makes Custom3DDataset.__getitem__ resample another index --
+            # but if the *config's* range is wrong then every tile is empty
+            # and that would spin forever, so give up after a run of them.
+            self._consecutive_empty_skips += 1
+            if self._consecutive_empty_skips > 100:
+                raise
+            warnings.warn(f'{self.__class__.__name__}: skipping sample '
+                          f'{input_dict["sample_idx"]} -- {e}')
+            return None
+        self._consecutive_empty_skips = 0
         example = self.vectormap_pipeline(example, input_dict)
         if self.filter_empty_gt and \
                 (example is None or

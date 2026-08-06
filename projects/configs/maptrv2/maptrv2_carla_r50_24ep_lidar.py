@@ -321,12 +321,21 @@ test_pipeline = [
 
 # carlasim_map.py's dataset dicts don't set these (they're model-config
 # concerns, matching the nuScenes/AV2 convention of overriding them here).
+#
+# min_lidar_points/lidar_pc_range drop tiles whose LiDAR points all fall
+# outside lidar_point_cloud_range -- those voxelize to zero voxels and crash
+# extract_lidar_feat. The converter already drops them when generating the
+# pkl (and records the per-tile in-range count each sample carries); these
+# make the dataset re-check, and warn if the pkl was generated against a
+# different range than the one this config uses.
 data = dict(
     train=dict(
         pipeline=train_pipeline,
         fixed_ptsnum_per_line=fixed_ptsnum_per_gt_line,
         eval_use_same_gt_sample_num_flag=eval_use_same_gt_sample_num_flag,
         bev_size=(bev_h_, bev_w_),
+        min_lidar_points=1,
+        lidar_pc_range=lidar_point_cloud_range,
         # Needed so the dataset's own vector_map produces gt_seg_mask,
         # matching aux_seg_cfg's use_aux_seg/bev_seg above (only wired for
         # train -- bev_seg is a training-time auxiliary loss).
@@ -335,12 +344,16 @@ data = dict(
         pipeline=test_pipeline,
         fixed_ptsnum_per_line=fixed_ptsnum_per_gt_line,
         eval_use_same_gt_sample_num_flag=eval_use_same_gt_sample_num_flag,
-        bev_size=(bev_h_, bev_w_)),
+        bev_size=(bev_h_, bev_w_),
+        min_lidar_points=1,
+        lidar_pc_range=lidar_point_cloud_range),
     test=dict(
         pipeline=test_pipeline,
         fixed_ptsnum_per_line=fixed_ptsnum_per_gt_line,
         eval_use_same_gt_sample_num_flag=eval_use_same_gt_sample_num_flag,
-        bev_size=(bev_h_, bev_w_)),
+        bev_size=(bev_h_, bev_w_),
+        min_lidar_points=1,
+        lidar_pc_range=lidar_point_cloud_range),
     shuffler_sampler=dict(type='DistributedGroupSampler'),
     nonshuffler_sampler=dict(type='DistributedSampler'),
 )
