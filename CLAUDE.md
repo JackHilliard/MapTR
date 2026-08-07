@@ -498,8 +498,10 @@ rather than paying to load and process them.
 ## `tools/maptrv2/dataset_viewer.py` (2026-08-03)
 
 Standalone dark-themed CARLA dataset browser -- no torch/mmdet3d/GPU, just
-flask/matplotlib/numpy. Auto-discovers every `<data-root>/*/manifest.json`,
-so towns from all splits appear in one picker labelled with their split.
+flask/matplotlib/numpy. Auto-discovers every `manifest.json` /
+`grid_manifest.json` at or below `--data-root` (see the 2026-08-05 note
+below), so towns from all splits appear in one picker labelled with their
+split.
 Representations: true RGB (from `features[:, 3:6]`), lane label, flat
 top-down, 1 m² density heat map, intensity; polylines and log/linear
 density as overlays.
@@ -525,6 +527,143 @@ density as overlays.
    look blank. Combined with this dataset's enormous density dynamic range
    (see degenerate tiles above), the density view appeared empty. Fixed
    with `inferno` + a log norm by default.
+
+### Viewer now also reads `grid_manifest.json` + polyline classes (2026-08-05)
+
+Verified against `/gel/usr/johil9/Documents/carla/Town10HD/grid_tiles`
+(30 tiles, 60 m square, `tile_radius=30`) as well as the old
+`<root>/{train,test}/manifest.json` layout. What the grid export changes:
+
+- **A different manifest, missing most of what the viewer assumed.**
+  `grid_manifest.json` has no `split`, no `towns`, no `tiles_per_town`, and
+  its tiles carry no `town` key and no town prefix in their names
+  (`tile_00000`, not `town10hd_tile_00000`). The split now falls back to
+  the manifest directory's name and the town is inferred from `town_ply`'s
+  filename (`Town10HD_full.ply` -> `Town10HD`). Discovery is a
+  bounded-depth walk (data-root itself plus two levels) accepting either
+  manifest name, so `--data-root .../grid_tiles` and `--data-root
+  .../carla` both work.
+- **Tile names are only unique within their own directory.** Every town's
+  grid export contains a `tile_00000`, so the old global
+  `{name: tile}` index would have silently shadowed one with another.
+  Tiles are keyed `<dataset>/<name>` throughout, and `/tile.png` requires
+  both `name` and `ds` (validating the pair is also what keeps `ds` from
+  reaching a filesystem join unchecked).
+- **Counts in the manifest are not trustworthy.** The packaged
+  `manifest.json` sitting next to `grid_manifest.json` in that directory
+  reports the whole dataset's `n_tiles: 4103` while listing only its own
+  30 tiles, and `tiles_per_town: {town10HD: 30}`. Everything the UI shows
+  is recomputed from the tile list. Where both files exist, `manifest.json`
+  wins and `grid_manifest.json` only backfills keys it lacks.
+- **Polylines now carry a class** (`class_id`/`class`, decoded by the
+  manifest's `class_lookup`: driving_centerline / curb / road_edge /
+  lane_divider / center_divider / sidewalk_edge / median / crosswalk).
+  They render per-class coloured with a per-class legend and count, and
+  checkboxes filter which classes are drawn. Predictions reuse the same
+  palette by mapping `cls_name` back through `class_lookup`; a class-free
+  result set (today's divider-only model) still draws yellow dashed as
+  before. Older class-free exports render as one unclassified red set.
+  Note the current Town10HD export only *populates* one class
+  (driving_centerline, 299 polylines) — the other seven are declared but
+  unused, so the multi-class path was verified against a synthetic export
+  with all eight populated.
+
+**Real display bug found and fixed while doing this**: the axes were
+`±tile_radius` around the origin, but rendering happens in the `offset`
+frame, where the tile is *not* centred on (0,0) — the tile centre sits at
+`tile_center - offset`. Every plot was therefore cropped. It was mild on
+the old 12.5 m tiles (~1.3 m) and severe on the 30 m grid tiles, where
+that shift reaches 17 m and cut more than half a radius off one side of
+tile_00000. Axes and the density histogram's bin edges are now both
+centred on `tile_center - offset`.
+
+Re-verified that `offset` (not `tile_center`) is still the correct GT frame
+for the grid export, the same way as before — median distance from GT
+vertices to driving-labelled points over 10 tiles: **0.083 m** via
+`offset`, **2.854 m** via `tile_center`.
+
+### Dataset-statistics tab (2026-08-06)
+
+`dataset_viewer.py` now has two tabs: `?tab=browse` (the per-tile viewer)
+and `?tab=stats`. The statistics tab exists so dataset-distribution
+questions stop being answered by throwaway scripts that are then lost. Two
+tiers, because their costs differ by three orders of magnitude:
+
+* **manifest tier** — points/tile, points/m², polylines/tile, per-class
+  polyline counts. Straight off the tile entries already in memory, zero
+  I/O, always shown.
+* **deep tier** — effective (post-grid-sampling) point count, z extent,
+  per-point label mix, `|tile_center − offset|`, and polyline vertex counts
+  and arc lengths. Reads every tile's `.npz`, so it is opt-in behind a
+  button, runs in a background thread (`--scan-workers`, default 8), and is
+  cached to disk. **The whole 4362-tile / ~12 GB local set scans in about
+  60 s** and reloads instantly from cache thereafter.
+
+Cache lives under `~/.cache/maptr_dataset_viewer/` (override
+`--stats-cache`), one file per *dataset directory* so a scan done via
+`--data-root <root>` is reused by a later `--data-root <root>/train`. Never
+written inside the dataset dir — that is `:ro` in the container workflow.
+The cache key includes the grid size, so changing `--scan-grid` invalidates
+it rather than silently mixing incomparable numbers.
+
+**Defaults are taken from `maptrv2_carla_r50_24ep_lidar.py`, and two of
+them are easy to get wrong from CLAUDE.md alone:**
+* `--pc-range-z` defaults to **`-72 96`**, the *current* widened
+  `lidar_point_cloud_range` z span — not the `[-8, 15]` this file quotes in
+  gotcha #13, which predates the town03 overpass fix. Using the old values
+  flags 3,399 of 4,362 tiles, i.e. pure noise.
+* `--scan-grid` defaults to **`0.1 0.1 0.4`**, matching `lidar_voxel_size`
+  (which is anisotropic), so "effective points" means "points the model
+  actually sees". It is deliberately *not* expected to match
+  `GridSamplePoints` exactly — that transform phases its grid on
+  `point_cloud_range`'s origin and clamps out-of-range coords, this one
+  phases on the tile's own minimum, so they differ by a few percent
+  (town01_tile_00000: 4,132 here vs ~3,242 through the real transform).
+  The 1200x collapse is the robust signal, not the last digit.
+
+**What the first full scan actually found** (all 4362 local tiles):
+* **20 tiles sit at the 5,000,000-point cap, not 18** — the 18 counted in
+  "Degenerate 5,000,000-point tiles" above are the *train* ones; town10hd
+  contributes 2 more. Of the 20, only
+  **15** are genuinely degenerate (raw→effective collapse below 1%); the
+  other 5 reach 55k–67k distinct cells and are merely oversampled.
+* **98 tiles fall outside the widened z range**, all town03/town05, with
+  `z_min` down to **−97.1** against the config's −72 lower bound. The
+  comment in the config says the observed extreme was `[-66.90, 90.52]`,
+  measured before the full dataset was available — it is not wide enough.
+  Points below −72 are silently dropped by the voxelizer.
+* **Zero tiles are flagged `no-GT` or `near-empty`** on this data, so
+  gotcha #13's empty-voxel crash does not originate here.
+* Per-tile GT totals reproduce the converter's own counts exactly
+  (train 15,810 / test 1,210), which is what confirms the tab is reading
+  the same reference lines the converter does.
+* `|tile_center − offset|` medians are **1.2–2.3 m per town** — every one
+  above the 1.5 m chamfer threshold, i.e. a direct measure of how much the
+  pre-`aaf4b46` GT frame bug cost. Deliberately *not* a suspect flag: it is
+  a property of tile geometry (7.3 m median on the 60 m grid export, where
+  nothing is wrong), so flagging on it would light up every tile.
+
+Suspect tiles are listed in a ranked table with reason chips
+(`degenerate` / `near-empty` / `no-GT` / `z-out-of-range` /
+`gt-outside-tile`), each linking straight into the browse tab at that tile.
+Everything is also downloadable per-tile as `/stats.csv`.
+
+Charting conventions, if extending this: a distribution compared across
+groups is a horizontal box plot in a **single** hue (six towns is at the
+categorical cap, and the axis labels already carry identity); categorical
+colour is reserved for the two charts whose subject really is a category
+(polyline class, lane label) and reuses the browse tab's `CLASS_COLORS` /
+`LABEL_COLORS`; the effective-vs-raw scatter uses emphasis (one muted hue
+plus a status colour for the flagged points) rather than colouring by town.
+
+**Two layout traps hit while building the charts**, both of which produce
+silently clipped output rather than an error:
+1. `fig.tight_layout()` must run **after** the title and axis labels exist,
+   or it reserves no room for them and they are cut off the canvas. The
+   `finish()` helper takes `tight=True` and does it in the right order.
+2. Fractional `subplots_adjust` margins shrink in absolute terms as these
+   variable-height figures get shorter, which clipped the x-axis label off
+   every one-group plot. Use `abs_margins()`, which takes inches.
 
 ## Generating predictions: `tools/test.py` was broken three ways (2026-08-03)
 
@@ -622,6 +761,21 @@ trigger it.
 
 ## Open items / next steps
 
+- **`lidar_point_cloud_range`'s z lower bound is still too high.** The
+  statistics tab's first full scan (2026-08-06) found **98 tiles with
+  `z_min` below the configured −72**, reaching **−97.1** in town03. The
+  config's own comment cites an observed extreme of `[-66.90, 90.52]`,
+  which was measured before the whole dataset could be checked. Points
+  below the range are dropped by the voxelizer, so those tiles are training
+  on partial geometry. Either widen the range again (and re-measure
+  `sparse_shape`/`lidar_bev_proj.in_channels` per gotcha #4) or confirm the
+  lost points are all sub-surface and irrelevant. Reproduce by running the
+  viewer's `?tab=stats` deep scan, or straight from its `/stats.csv`
+  `z_min` column.
+- **Decide what to do with the 15 genuinely degenerate cap tiles.** The
+  statistics tab now identifies them by name (`degenerate` chip, or
+  `effective_over_raw` in `/stats.csv`). They cost full load/decompress
+  time for ~4k usable points each.
 - **`carlasim_map.py`'s `ann_file_train` is currently stale/inconsistent.**
   It points at `data/carla/carla_map_infos_train.pkl` (someone — the user
   or a linter — changed this after the session's initial push away from
