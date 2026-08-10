@@ -1,25 +1,48 @@
 """Convert the CARLA road-polyline tile dataset into MapTR's map-annotation
 pkl format.
 
-Unlike the nuScenes/AV2 converters, CARLA tiles are static 25m x 25m patches
+Unlike the nuScenes/AV2 converters, CARLA tiles are static square patches
 (not per-timestamp driving-log frames), so there is no ego pose/SE3 transform
-and no need to clip polylines against a moving patch -- each tile's
-reference-line polylines are already tile-local; this script only needs to
-subtract the tile center to get tile-relative coordinates (matching the
-`offset` convention `LoadCarlaPointsFromFile` already uses for point clouds).
+and no need to clip polylines against a moving patch -- this script only
+needs to shift each tile's world-frame reference-line polylines into the
+same frame as its point cloud, by subtracting the block's own `offset` (the
+frame `LoadCarlaPointsFromFile` reads, and NOT the same as `tile_center` --
+see the comment on the np.load call below).
 
-Expected input layout (see projects/mmdet3d_plugin/datasets/carla_utils.py)::
+Nothing here assumes a particular tile size. The exporter has produced at
+least 25m tiles (`tile_radius` 12.5) and 60m ones (`tile_radius` 30.0), and
+both layouts it writes are accepted::
 
-    <data_root>/<split>/manifest.json
-    <data_root>/<split>/blocks/<tile_name>.npz
-    <data_root>/<split>/reference_lines/<tile_name>_reference_lines.json
+    <data_root>/<split>/manifest.json            # split export
+    <data_root>/<split>/blocks/<tile>.npz
+    <data_root>/<split>/reference_lines/<tile>_reference_lines.json
+
+    <data_root>/grid_manifest.json               # single-town grid export
+    <data_root>/blocks/<tile>.npz                # (no <split> level, and
+    <data_root>/reference_lines/<tile>_...json   #  tile names carry no town)
+
+Where a directory holds both files, `manifest.json` wins and
+`grid_manifest.json` only backfills keys it lacks -- the same rule
+`tools/maptrv2/dataset_viewer.py` uses. `manifest.json` is written by a
+later packaging step and is the *curated* view: in the Town10HD grid export
+it lists 30 tiles where grid_manifest.json lists 33, and the 3 it omits
+contain only sidewalk_edge polylines and no driving centerline at all
+(`gt_source: driving_lanes`). Its dataset-level *counts* are still not
+trustworthy -- the same file reports `n_tiles: 4103` while listing 30 -- so
+everything here is derived from the tile entries, never from those counts.
+
+Note the reference-lines json on disk is not filtered to match: it still
+holds every class, so a class-carrying export converts all of them unless
+--classes says otherwise.
 
 Each tile's LiDAR block is also scanned for points that would actually
 survive the training pipeline's filters (``z <= --z-max`` and inside
 ``--lidar-point-cloud-range``). Tiles with fewer than ``--min-lidar-points``
 such points would voxelize to *zero* voxels and crash ``extract_lidar_feat``,
 so they are dropped from the pkl and listed in a sidecar report. Every kept
-sample records its own count so the dataset can re-check cheaply.
+sample records its own count so the dataset can re-check cheaply. The
+default range is derived from the manifest's own tile size rather than
+hardcoded, so the scan describes the tiles being converted.
 
 Usage::
 
@@ -34,13 +57,25 @@ import os
 import mmcv
 import numpy as np
 
-# Must match the training config's LiDAR branch geometry:
-# `lidar_point_cloud_range` in projects/configs/maptrv2/
-# maptrv2_carla_r50_24ep_lidar.py and `z_max` in
-# projects/configs/carla/carlasim_map.py. Recorded into the pkl so the
-# dataset can warn if the two ever drift apart.
-DEFAULT_LIDAR_PC_RANGE = [-12.5, -12.5, -72.0, 12.5, 12.5, 96.0]
+# z half of the range the training config's LiDAR branch uses
+# (`lidar_point_cloud_range` in projects/configs/maptrv2/
+# maptrv2_carla_r50_24ep_lidar.py) and `z_max` from
+# projects/configs/carla/carlasim_map.py. The xy half is NOT a constant:
+# it follows the tile size read from the manifest (see default_pc_range),
+# because a range narrower than the tile silently crops it and a wider one
+# just wastes BEV cells. The whole range is recorded into the pkl so the
+# dataset can warn if config and pkl ever drift apart.
+DEFAULT_Z_RANGE = (-72.0, 96.0)
 DEFAULT_Z_MAX = 96.0
+# Only used when a manifest carries no tile geometry at all; matches the
+# original 25m export this converter was written against.
+FALLBACK_TILE_RADIUS = 12.5
+# Slack allowed before a polyline is reported as leaving its own tile. The
+# exporter samples arcs at a fixed arc_gap, so a vertex can land slightly
+# past the boundary without anything being wrong.
+BOUNDS_MARGIN = 1.0
+
+MANIFEST_NAMES = ('manifest.json', 'grid_manifest.json')
 
 
 def parse_args():
@@ -50,7 +85,8 @@ def parse_args():
         '--data-root',
         type=str,
         required=True,
-        help='root of the CARLA tile dataset (contains <split>/manifest.json)')
+        help='root of the CARLA tile dataset (contains <split>/manifest.json, '
+        'or a manifest.json/grid_manifest.json directly)')
     parser.add_argument(
         '--out-dir',
         type=str,
@@ -61,23 +97,37 @@ def parse_args():
         type=str,
         default='test',
         help='split subdirectory under --data-root to convert; also used as '
-        'the label in the output filename')
+        'the label in the output filename. If no such subdirectory exists, '
+        '--data-root itself is read and this is only the output label')
     parser.add_argument(
-        '--lane-types',
-        type=int,
+        '--classes',
+        type=str,
         nargs='+',
         default=None,
-        help='optional subset of lane_type_lookup ids to keep as divider '
-        'instances (default: keep all types)')
+        metavar='CLASS',
+        help="optional subset of polyline classes to keep as divider "
+        "instances, as class_lookup ids or names (e.g. `0` or "
+        "`driving_centerline`). Default: keep every polyline. Only exports "
+        "whose polylines carry a class can be filtered")
+    parser.add_argument(
+        '--lane-types',
+        type=str,
+        nargs='+',
+        default=None,
+        metavar='CLASS',
+        help='deprecated alias for --classes (it never matched anything: it '
+        "compared lane_type_lookup ids against each polyline's `type`, which "
+        "holds a geometry kind such as 'arc'/'straight')")
     parser.add_argument(
         '--lidar-point-cloud-range',
         type=float,
         nargs=6,
-        default=DEFAULT_LIDAR_PC_RANGE,
+        default=None,
         metavar=('X_MIN', 'Y_MIN', 'Z_MIN', 'X_MAX', 'Y_MAX', 'Z_MAX'),
         help='range the LiDAR voxelizer will use; points outside it are '
         'dropped before voxelization, so a tile with none inside produces '
-        'zero voxels (default: matches the training config)')
+        'zero voxels. Default: +/-tile_radius in xy (read from the manifest) '
+        f'and {DEFAULT_Z_RANGE[0]}..{DEFAULT_Z_RANGE[1]} in z')
     parser.add_argument(
         '--z-max',
         type=float,
@@ -96,6 +146,147 @@ def parse_args():
         help='skip the per-tile LiDAR scan entirely (faster, but no tile is '
         'dropped and no point counts are recorded)')
     return parser.parse_args()
+
+
+def load_manifest(data_root, split):
+    """Locate and load the manifest describing one set of tiles.
+
+    Accepts either export layout: ``<data_root>/<split>/`` (the split
+    export) or ``<data_root>`` itself (a grid export, which has no split
+    level). Returns ``(tile_dir, manifest)``; `tile_dir` is where `blocks/`
+    and `reference_lines/` live.
+    """
+    for candidate in ([os.path.join(data_root, split)] if split else
+                      []) + [data_root]:
+        present = [
+            n for n in MANIFEST_NAMES
+            if os.path.isfile(os.path.join(candidate, n))
+        ]
+        if not present:
+            continue
+        manifest = {}
+        # reversed so the preferred name (first in MANIFEST_NAMES) is applied
+        # last and its keys win, while the other only backfills. A null value
+        # never overwrites a real one -- grid_manifest.json spells absent
+        # options as `null` rather than omitting them.
+        for name in reversed(present):
+            with open(os.path.join(candidate, name), encoding='utf-8') as f:
+                loaded = json.load(f)
+            manifest.update({
+                k: v
+                for k, v in loaded.items()
+                if v is not None or k not in manifest
+            })
+        if not manifest.get('tiles'):
+            raise ValueError(
+                f'{candidate}: manifest lists no tiles')
+        return candidate, manifest
+    raise FileNotFoundError(
+        f'no {" or ".join(MANIFEST_NAMES)} under {data_root!r}'
+        f'{f" or {os.path.join(data_root, split)!r}" if split else ""}')
+
+
+def manifest_tile_radius(manifest):
+    """Half a tile's side, in metres, from whichever key the export used.
+
+    `tile_radius` (25m export) and `tile_side` (some grid manifests) are
+    dataset-level; failing both, the widest per-tile `bounds` gives the same
+    answer for a uniform grid and an upper bound otherwise, which is the
+    safe direction for sizing a point-cloud range. Returns None only when an
+    export states its geometry nowhere -- the per-tile bounds check can
+    still fall back to each reference-lines json, so that is not fatal.
+    """
+    if manifest.get('tile_radius') is not None:
+        return float(manifest['tile_radius'])
+    if manifest.get('tile_side') is not None:
+        return float(manifest['tile_side']) / 2.0
+    radii = []
+    for tile in manifest.get('tiles', []):
+        bounds = tile.get('bounds')
+        if bounds is None:
+            continue
+        bounds = np.asarray(bounds, dtype=np.float64)
+        if bounds.size == 4:
+            radii.append(np.max(bounds[2:] - bounds[:2]) / 2.0)
+        elif bounds.size == 6:
+            radii.append(np.max(bounds[3:5] - bounds[:2]) / 2.0)
+    return float(max(radii)) if radii else None
+
+
+def tile_footprint(tile, ref, tile_radius):
+    """World-frame xy footprint of one tile, as ``(lo, hi)`` arrays.
+
+    Prefers the tile's own `bounds` (exact, and the only source that would
+    describe a non-square tile), then its centre plus the export's tile
+    radius. The reference-lines json repeats all three keys, so it backs up
+    a manifest whose tile entries are sparse. Returns None when nothing
+    supplies a footprint, which only disables the bounds warning below.
+    """
+    bounds = tile.get('bounds') or ref.get('tile_bounds')
+    if bounds is not None:
+        bounds = np.asarray(bounds, dtype=np.float64)
+        if bounds.size == 4:  # [x_min, y_min, x_max, y_max]
+            return bounds[:2], bounds[2:]
+        if bounds.size == 6:  # [x_min, y_min, z_min, x_max, y_max, z_max]
+            return bounds[:2], bounds[3:5]
+
+    center = tile.get('center') or ref.get('tile_center')
+    radius = ref.get('tile_radius')
+    radius = float(radius) if radius is not None else tile_radius
+    if center is None or radius is None:
+        return None
+    center = np.asarray(center, dtype=np.float64)[:2]
+    return center - radius, center + radius
+
+
+def default_pc_range(tile_radius):
+    """The range a training config for this tile size would use: square in
+    xy, matching the tile, with the config's z span."""
+    radius = tile_radius if tile_radius is not None else FALLBACK_TILE_RADIUS
+    z_min, z_max = DEFAULT_Z_RANGE
+    return [-radius, -radius, z_min, radius, radius, z_max]
+
+
+def resolve_classes(selected, manifest):
+    """Map ``--classes`` entries (ids or names) onto class_lookup ids.
+
+    Returns a set of int ids, or None for "keep everything". Raises if the
+    export has no class taxonomy or a name/id is not in it -- silently
+    keeping nothing is how the old --lane-types flag behaved, and it
+    produced an empty pkl with no indication why.
+    """
+    if not selected:
+        return None
+    lookup = manifest.get('class_lookup') or {}
+    if not lookup:
+        raise ValueError(
+            'this export has no `class_lookup`, so its polylines carry no '
+            'class and cannot be filtered; re-run without --classes')
+    by_name = {name: int(cid) for cid, name in lookup.items()}
+    out = set()
+    for entry in selected:
+        entry = str(entry)
+        if entry in by_name:
+            out.add(by_name[entry])
+        elif entry.lstrip('-').isdigit() and str(int(entry)) in lookup:
+            out.add(int(entry))
+        else:
+            known = ', '.join(
+                f'{cid}={name}' for cid, name in sorted(lookup.items()))
+            raise ValueError(
+                f'unknown class {entry!r}; this export has: {known}')
+    return out
+
+
+def polyline_class_id(poly):
+    """The polyline's class_lookup id, or None on a class-free export.
+
+    Deliberately does not fall back to `type`: that key exists in every
+    export and holds a geometry kind ('arc'/'straight'), not a class.
+    """
+    if poly.get('class_id') is not None:
+        return int(poly['class_id'])
+    return None
 
 
 def count_points_in_range(lidar_path, pc_range, z_max):
@@ -128,20 +319,28 @@ def count_points_in_range(lidar_path, pc_range, z_max):
 
 def convert_carla_tiles(data_root,
                         split,
-                        lane_types=None,
+                        classes=None,
                         pc_range=None,
                         z_max=DEFAULT_Z_MAX,
                         min_lidar_points=1,
                         lidar_check=True):
-    split_dir = os.path.join(data_root, split)
-    with open(os.path.join(split_dir, 'manifest.json'), encoding='utf-8') as f:
-        manifest = json.load(f)
-    tile_radius = float(manifest.get('tile_radius', 12.5))
+    tile_dir, manifest = load_manifest(data_root, split)
+    tile_radius = manifest_tile_radius(manifest)
+    keep_classes = resolve_classes(classes, manifest)
     if pc_range is None:
-        pc_range = DEFAULT_LIDAR_PC_RANGE
+        pc_range = default_pc_range(tile_radius)
+        if tile_radius is None:
+            print(f'[warn] this export states no tile size; assuming '
+                  f'tile_radius={FALLBACK_TILE_RADIUS}m for the point-cloud '
+                  'range. Pass --lidar-point-cloud-range if that is wrong')
+    print(f'{tile_dir}: {len(manifest["tiles"])} tiles, tile_radius='
+          f'{tile_radius if tile_radius is not None else "unknown"}, '
+          f'pc_range={[round(v, 2) for v in pc_range]}')
 
     samples = []
     dropped = []
+    out_of_bounds = []
+    coverage = []
     total_instances = 0
     prog_bar = mmcv.ProgressBar(len(manifest['tiles']))
     for idx, tile in enumerate(manifest['tiles']):
@@ -149,7 +348,7 @@ def convert_carla_tiles(data_root,
         name = tile['name']
 
         lidar_path = os.path.abspath(
-            os.path.join(split_dir, 'blocks', f'{name}.npz'))
+            os.path.join(tile_dir, 'blocks', f'{name}.npz'))
         if not os.path.isfile(lidar_path):
             raise FileNotFoundError(lidar_path)
 
@@ -159,12 +358,14 @@ def convert_carla_tiles(data_root,
         # LoadCarlaPointsFromFile reads `features[:, 0:3]`, and
         # `points - offset == features[:, :3]` holds exactly, while
         # tile_center differs from offset by a mean of ~2.4m (max >7m)
-        # across the train split. Measured against real driving-surface
-        # returns (label == 0), `- offset` puts polylines a median 0.038m
-        # from the road vs 0.388m for `- tile_center`. Using tile_center
-        # here (as this converter originally did) misaligns every GT
-        # polyline against its own point cloud, which matters a lot given
-        # chamfer eval thresholds of 0.5/1.0/1.5m.
+        # across the 25m train split -- and by up to ~17m on the 60m grid
+        # export, where the displacement scales with tile size. Measured
+        # against real driving-surface returns (label == 0), `- offset`
+        # puts polylines a median 0.038m from the road vs 0.388m for
+        # `- tile_center`. Using tile_center here (as this converter
+        # originally did) misaligns every GT polyline against its own point
+        # cloud, which matters a lot given chamfer eval thresholds of
+        # 0.5/1.0/1.5m.
         #
         # np.load is lazy, so this reads only the small `offset` array --
         # it does not pull the full point cloud into memory. (The separate
@@ -190,15 +391,18 @@ def convert_carla_tiles(data_root,
                         n_points=n_raw,
                         n_points_in_range=n_in_range))
                 continue
+            if n_raw:
+                coverage.append((n_in_range / n_raw, name))
 
-        ref_path = os.path.join(split_dir, 'reference_lines',
+        ref_path = os.path.join(tile_dir, 'reference_lines',
                                 f'{name}_reference_lines.json')
         with open(ref_path, encoding='utf-8') as f:
             ref = json.load(f)
 
         divider = []
         for poly in ref['polylines']:
-            if lane_types is not None and poly['type'] not in lane_types:
+            if keep_classes is not None and \
+                    polyline_class_id(poly) not in keep_classes:
                 continue
             pts = np.array(poly['points'], dtype=np.float32)
             if pts.shape[0] < 2:
@@ -207,14 +411,24 @@ def convert_carla_tiles(data_root,
             total_instances += 1
 
         # Sanity check only (tiles are asserted to already be the patch, so
-        # no clipping is applied) -- warn, don't crash, if this ever fires.
-        margin = 1.0
-        for pts in divider:
-            if np.any(np.abs(pts[:, :2]) > tile_radius + margin):
-                print(f'[warn] {name}: polyline point(s) outside tile '
-                      f'radius ({tile_radius}+{margin}m margin), max abs xy '
-                      f'= {np.abs(pts[:, :2]).max():.2f}')
-                break
+        # no clipping is applied) -- collect, don't crash, if this fires.
+        #
+        # Compared against the tile's own world-frame footprint shifted into
+        # the offset frame, NOT against +/-tile_radius around zero: `origin`
+        # is the block's `offset`, which is not the tile centre, so in this
+        # frame the tile sits at `footprint - origin`. Testing |xy| against a
+        # bare radius therefore fired on most tiles of the 25m export (where
+        # the displacement is ~1-2m) and on essentially all of the 60m one
+        # (up to ~17m) -- pure noise that buried any real out-of-bounds tile.
+        footprint = tile_footprint(tile, ref, tile_radius)
+        if footprint is not None and divider:
+            lo, hi = (footprint[0] - origin[:2] - BOUNDS_MARGIN,
+                      footprint[1] - origin[:2] + BOUNDS_MARGIN)
+            pts = np.concatenate([p[:, :2] for p in divider])
+            overshoot = float(
+                np.max(np.maximum(lo - pts, pts - hi), initial=0.0))
+            if overshoot > 0:
+                out_of_bounds.append(dict(name=name, overshoot=overshoot))
 
         samples.append(
             dict(
@@ -254,20 +468,71 @@ def convert_carla_tiles(data_root,
         print(f'{split}: {len(samples)} tiles, {total_instances} divider '
               f'instances ({total_instances / n:.1f} per tile) '
               '[LiDAR check skipped]')
-    return samples, dropped
+    report_coverage(coverage, pc_range)
+    report_out_of_bounds(out_of_bounds)
+    return samples, dropped, dict(
+        tile_dir=tile_dir,
+        tile_radius=tile_radius,
+        tile_side=manifest.get('tile_side'),
+        pc_range=list(pc_range),
+        class_lookup=manifest.get('class_lookup') or {},
+        classes_kept=sorted(keep_classes) if keep_classes else None,
+        n_out_of_bounds=len(out_of_bounds))
+
+
+def report_coverage(coverage, pc_range):
+    """How much of each tile the configured range actually keeps.
+
+    A range narrower than the tile crops it, and because the frame's origin
+    is the block `offset` rather than the tile centre, a square range around
+    zero is offset from the tile by an amount that grows with tile size --
+    so this is the check that catches a range copied from a smaller export.
+    """
+    if not coverage:
+        return
+    fracs = np.array([c for c, _ in coverage])
+    worst_frac, worst_name = min(coverage)
+    poor = int((fracs < 0.9).sum())
+    print(f'  [range] median {np.median(fracs):.1%} of raw points fall inside '
+          f'{[round(v, 2) for v in pc_range]}; worst tile {worst_name} '
+          f'{worst_frac:.1%}')
+    if poor:
+        print(f'  [range] {poor}/{len(fracs)} tiles keep <90% of their points '
+              '-- check the range covers the tile in the `offset` frame')
+
+
+def report_out_of_bounds(out_of_bounds):
+    if not out_of_bounds:
+        return
+    print(f'  [warn] {len(out_of_bounds)} tile(s) have polyline points '
+          f'outside their own tile bounds (+{BOUNDS_MARGIN}m margin):')
+    for entry in sorted(
+            out_of_bounds, key=lambda e: -e['overshoot'])[:10]:
+        print(f'  [warn]   {entry["name"]}: {entry["overshoot"]:.2f}m past '
+              'the boundary')
+    if len(out_of_bounds) > 10:
+        print(f'  [warn]   ... and {len(out_of_bounds) - 10} more')
 
 
 def main():
     args = parse_args()
     lidar_check = not args.no_lidar_check
-    samples, dropped = convert_carla_tiles(
+    classes = args.classes
+    if args.lane_types:
+        print('[warn] --lane-types is deprecated and never matched anything; '
+              'treating it as --classes (matched against class_lookup)')
+        classes = (classes or []) + args.lane_types
+    samples, dropped, meta = convert_carla_tiles(
         args.data_root,
         args.split,
-        args.lane_types,
+        classes,
         pc_range=args.lidar_point_cloud_range,
         z_max=args.z_max,
         min_lidar_points=args.min_lidar_points,
         lidar_check=lidar_check)
+    # Derived from the manifest's tile size inside convert_carla_tiles when
+    # not given on the CLI, so read it back rather than re-deriving it here.
+    pc_range = meta['pc_range']
     mmcv.mkdir_or_exist(args.out_dir)
     out_path = os.path.join(args.out_dir, f'carla_map_infos_{args.split}.pkl')
     mmcv.dump(
@@ -275,12 +540,21 @@ def main():
             samples=samples,
             split=args.split,
             data_root=args.data_root,
+            # The tile geometry these samples were built from, so a later
+            # reader can tell a 25m export from a 60m one without reopening
+            # the source manifest.
+            tile_geometry=dict(
+                tile_dir=meta['tile_dir'],
+                tile_radius=meta['tile_radius'],
+                tile_side=meta['tile_side']),
+            class_lookup=meta['class_lookup'],
+            classes_kept=meta['classes_kept'],
             # Records the geometry the per-sample counts were measured
             # against, so CustomCarlaLocalMapDataset can warn if the config
             # it is running under no longer matches.
             lidar_check=dict(
                 enabled=lidar_check,
-                point_cloud_range=list(args.lidar_point_cloud_range),
+                point_cloud_range=list(pc_range),
                 z_max=args.z_max,
                 min_lidar_points=args.min_lidar_points),
             dropped_tiles=dropped),
@@ -297,7 +571,8 @@ def main():
                 dict(
                     split=args.split,
                     data_root=args.data_root,
-                    point_cloud_range=list(args.lidar_point_cloud_range),
+                    tile_radius=meta['tile_radius'],
+                    point_cloud_range=list(pc_range),
                     z_max=args.z_max,
                     min_lidar_points=args.min_lidar_points,
                     n_kept=len(samples),

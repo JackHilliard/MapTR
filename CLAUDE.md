@@ -759,6 +759,83 @@ otherwise silently score against the old tile set. This was already true
 after the 2026-08-03 GT-frame fix; tile dropping is a second way to
 trigger it.
 
+## The converter is now tile-size agnostic (2026-08-10)
+
+`tools/maptrv2/custom_carla_map_converter.py` had three hardcoded
+assumptions from the original 25 m export. All are gone; verified against
+the 25 m split export (259-tile test, 4103-tile train) *and* the 60 m grid
+export at `/gel/usr/johil9/Documents/carla/Town10HD/grid_tiles`, plus
+synthetic exports for the edge cases.
+
+1. **The out-of-bounds warning was measuring against the wrong origin, and
+   fired on nearly every tile.** It tested `|xy| > tile_radius + 1m`, but
+   polylines are in the **`offset`** frame, where the tile is *not* centred
+   on the origin — the centre sits at `tile_center - offset`, which is
+   1–2 m on 25 m tiles and up to **~17 m** on 60 m ones (the same fact the
+   viewer hit in its axis-cropping bug, 2026-08-05). Measured on real data,
+   the old check fired on **117/259** test tiles, **1750/4103** train tiles
+   and **31/33** grid tiles — pure noise, and it scaled with tile size, so
+   it would have been ~100% on anything larger. GeMap's copy
+   (`~/Documents/Code/GeMap/tools/gemap/custom_carla_map_converter.py`)
+   already loosened the bound to `tile_radius + |tile_center - origin|`;
+   the version here goes further and compares against the tile's **own
+   `bounds`** shifted into the offset frame, which is exact, needs no slack
+   term, and would also handle a non-square tile. It now fires on **0**
+   tiles across all three real datasets, and a synthetic tile with a
+   polyline 5 m past its edge is still reported (as 4.00 m, after the 1 m
+   margin) — i.e. it is quiet, not dead. Findings are collected and printed
+   as one ranked summary instead of a line per tile.
+2. **Only `<data_root>/<split>/manifest.json` could be opened.** The grid
+   export has no split level and names its manifest `grid_manifest.json`,
+   so it could not be converted at all. `load_manifest()` now accepts
+   either name at `<data_root>/<split>` or `<data_root>` itself, merging
+   both files when present with the viewer's rule (`manifest.json` wins,
+   `grid_manifest.json` backfills). Note **`manifest.json` is the curated
+   view, not just a repackaging**: in Town10HD it lists 30 tiles vs
+   grid_manifest's 33, and the 3 it omits contain only `sidewalk_edge`
+   polylines and no driving centerline. Preferring it is therefore correct
+   — but its dataset-level *counts* still are not (`n_tiles: 4103` while
+   listing 30), so nothing is read from them.
+3. **`--lidar-point-cloud-range` defaulted to a hardcoded ±12.5 xy.** On a
+   60 m export that silently measured the in-range point counts against a
+   quarter of the tile. The default is now derived from the manifest's own
+   `tile_radius`/`tile_side` (or the widest per-tile `bounds`), so the 25 m
+   export still gets exactly the old ±12.5 and the 60 m one gets ±30. z is
+   unchanged. An explicit flag still overrides, and the resolved range is
+   printed and recorded in the pkl.
+
+Two additions that fell out of the above:
+
+* **A range-coverage diagnostic.** It already counts each tile's in-range
+  points, so it now reports the median fraction kept and flags tiles under
+  90%. This is the check that catches a range copied from a smaller export
+  — and it immediately showed something real: **46/259 test, 651/4103 train
+  and 8/30 grid tiles keep <90% of their points** under a range centred on
+  the origin, because the range is square around `offset` while the tile is
+  displaced from it. Worst observed: 69.3% (town04_tile_01206). Nothing is
+  broken by this — it is the existing config's geometry, not a regression —
+  but it is a measurable argument for centring the range on
+  `tile_center - offset` (or re-centring the point cloud at load time).
+* **`--lane-types` never worked, and now there is `--classes` that does.**
+  It compared `lane_type_lookup` *ids* against each polyline's `type` key,
+  which holds a geometry kind (`'arc'`/`'straight'`) — so any use of it
+  matched nothing and silently produced an **empty pkl**. The real
+  per-polyline taxonomy is `class_id`/`class` against the manifest's
+  `class_lookup` (driving_centerline / curb / road_edge / …), and only the
+  newer exports carry it. `--classes` takes ids or names, and raises a
+  clear error on a class-free export instead of silently emptying the
+  output. Cross-checked: `--classes driving_centerline` on the grid export
+  yields **299** instances, exactly the manifest's own
+  `polyline_counts_by_class`. `--lane-types` remains as a deprecated alias
+  that warns and maps to the same thing.
+
+The pkl gains `tile_geometry` (tile_dir/tile_radius/tile_side),
+`class_lookup` and `classes_kept`; every existing key is unchanged and
+`CustomCarlaLocalMapDataset` loads the new pkls as-is (verified: 259
+samples, per-sample counts and `get_data_info` intact). Both real datasets
+reproduce their known instance totals exactly — **test 1210, train
+15810, 0 dropped** — so this is a no-op on existing outputs.
+
 ## Open items / next steps
 
 - **`lidar_point_cloud_range`'s z lower bound is still too high.** The
@@ -806,9 +883,10 @@ trigger it.
   (driving/curb/sidewalk/border/restricted/parking/shoulder/stop/other
   all collapsed into one `divider` class) — this was a deliberate choice
   to maximize GT density on the tiny local test set. Before a real
-  training run, revisit whether to filter to just `driving`-type lanes
-  via the converter's `--lane-types` flag (see
-  `tools/maptrv2/custom_carla_map_converter.py`).
+  training run, revisit whether to filter to just driving lanes via the
+  converter's `--classes` flag (e.g. `--classes driving_centerline`; see
+  `tools/maptrv2/custom_carla_map_converter.py` and the 2026-08-10 section
+  above — the older `--lane-types` flag never matched anything).
 - **`sparse_shape`/`lidar_bev_proj.in_channels` were measured empirically**
   for the *current* `lidar_point_cloud_range`/`lidar_voxel_size` in
   `maptrv2_carla_r50_24ep_lidar.py` (sparse_shape=[251,251,71],
