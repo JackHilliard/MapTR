@@ -234,9 +234,9 @@ A tile that voxelizes to zero voxels would take an unattended run down via
 gotcha #13. Dropped in three places:
 
 1. **Converter** counts per tile the points surviving both `z <= --z-max`
-   and `--lidar-point-cloud-range` (defaults match the config;
-   `GridSamplePoints` only *clamps* grid coords so it can't change this
-   count). Tiles below `--min-lidar-points` (default 1) are dropped and
+   and `--lidar-point-cloud-range` (whose xy default is now derived from
+   tile geometry — see 2026-08-10 below; `GridSamplePoints` only *clamps*
+   grid coords so it can't change this count). Tiles below `--min-lidar-points` (default 1) are dropped and
    listed in `carla_map_infos_<split>_dropped.json`; kept samples record
    `num_lidar_points` / `num_lidar_points_in_range`, and the pkl gains a
    `lidar_check` block recording the geometry used. `--no-lidar-check`
@@ -261,6 +261,69 @@ gotcha #13. Dropped in three places:
 instances) with 0 tiles dropped under the current range; re-running train
 with the *old* narrow z-range (`-10..18`) drops exactly the 6 town03
 overpass tiles, confirming the criterion picks the right tiles.
+
+## The converter is tile-size agnostic (2026-08-10)
+
+`custom_carla_map_converter.py` had three hardcoded assumptions from the
+original 25 m export. All gone, verified against the 25 m split export
+(259 test / 4103 train), the 60 m grid export, and synthetic edge cases.
+The pkl gains `tile_geometry` (tile_dir/tile_radius/tile_side),
+`class_lookup` and `classes_kept`; every existing key is unchanged and
+`CustomCarlaLocalMapDataset` loads new pkls as-is (259 samples,
+`get_data_info` intact). Both real datasets reproduce their totals exactly
+(test 1210, train 15810, 0 dropped) — a no-op on existing outputs.
+
+1. **The out-of-bounds warning measured against the wrong origin** and
+   fired on nearly every tile: it tested `|xy| > tile_radius + 1m`, but
+   polylines are in the `offset` frame, where the tile centre sits at
+   `tile_center - offset` — 1-2 m on 25 m tiles, **~17 m** on 60 m ones
+   (the same fact behind the viewer's 2026-08-05 axis-cropping bug). It
+   fired on 117/259 test, 1750/4103 train, 31/33 grid tiles, and scaled
+   with tile size, so it would be ~100% on anything larger. Now compares
+   against the tile's **own `bounds`** shifted into the offset frame:
+   exact, no slack term, handles non-square tiles. (GeMap's copy at
+   `~/Documents/Code/GeMap/tools/gemap/custom_carla_map_converter.py` only
+   loosened the bound to `tile_radius + |tile_center - origin|`.) Fires on
+   **0** tiles across all three real datasets, while a synthetic polyline
+   5 m past the edge is still reported (as 4.00 m, after the 1 m margin) —
+   quiet, not dead. Findings print as one ranked summary.
+2. **Only `<data_root>/<split>/manifest.json` could be opened**, so the
+   grid export (no split level, `grid_manifest.json`) couldn't be converted
+   at all. `load_manifest()` now accepts either name at
+   `<data_root>/<split>` or `<data_root>`, merging both with the viewer's
+   rule (`manifest.json` wins, `grid_manifest.json` backfills).
+   **`manifest.json` is the curated view, not a repackaging**: in Town10HD
+   it lists 30 tiles vs grid_manifest's 33, and the 3 omitted have only
+   `sidewalk_edge` polylines and no driving centerline — so preferring it
+   is correct. Its dataset-level *counts* still aren't (`n_tiles: 4103`
+   while listing 30), so nothing reads them.
+3. **`--lidar-point-cloud-range` defaulted to a hardcoded ±12.5 xy**, which
+   on a 60 m export silently measured in-range counts against a quarter of
+   the tile. Now derived from the manifest's `tile_radius`/`tile_side` (or
+   the widest per-tile `bounds`): the 25 m export still gets ±12.5, the
+   60 m one ±30. z unchanged. An explicit flag overrides; the resolved
+   range is printed and recorded in the pkl.
+
+Two things that fell out:
+
+- **Range-coverage diagnostic** — reports the median fraction of points
+  kept and flags tiles under 90%, catching a range copied from a smaller
+  export. It immediately showed something real: **46/259 test, 651/4103
+  train and 8/30 grid tiles keep <90%** of their points, because the range
+  is square around `offset` while the tile is displaced from it. Worst:
+  69.3% (`town04_tile_01206`). Not a regression — it's the existing
+  config's geometry — but a measurable argument for centring the range on
+  `tile_center - offset`, or re-centring the cloud at load time.
+- **`--lane-types` never worked; use `--classes`.** It compared
+  `lane_type_lookup` *ids* against each polyline's `type` key, which holds
+  a geometry kind (`'arc'`/`'straight'`), so any use of it matched nothing
+  and silently produced an **empty pkl**. The real per-polyline taxonomy is
+  `class_id`/`class` against the manifest's `class_lookup`, and only newer
+  exports carry it. `--classes` takes ids or names and raises a clear error
+  on a class-free export instead of silently emptying the output.
+  Cross-checked: `--classes driving_centerline` on the grid export yields
+  **299** instances, exactly the manifest's `polyline_counts_by_class`.
+  `--lane-types` survives as a deprecated alias that warns.
 
 ## LiDAR voxelization was slow AND silently wrong (2026-07-30)
 
@@ -512,8 +575,9 @@ for flagged points) rather than colouring by town.
 - **Class taxonomy is divider-only**, collapsing *all* CARLA lane types
   (driving/curb/sidewalk/border/restricted/parking/shoulder/stop/other)
   into one `divider` class — deliberate, to maximise GT density on the tiny
-  local set. Revisit filtering to `driving` lanes via the converter's
-  `--lane-types` flag before a real run.
+  local set. Revisit filtering to driving lanes before a real run via the
+  converter's `--classes` flag (e.g. `--classes driving_centerline`); the
+  older `--lane-types` never matched anything — see the 2026-08-10 section.
 - **`sparse_shape`/`lidar_bev_proj.in_channels` were measured empirically**
   for the *current* range/resolution (`[251,251,71]` and `384`). If either
   changes, re-measure with a dummy `extract_lidar_feat()` call rather than
