@@ -759,6 +759,62 @@ otherwise silently score against the old tile set. This was already true
 after the 2026-08-03 GT-frame fix; tile dropping is a second way to
 trigger it.
 
+## The polyline geometry losses are tile-size parameterised (2026-08-10)
+
+`maptrv2_carla_r50_24ep_lidar_HM.py` (the `PolylineGeomLoss`/`PolylineGeomCost`
+config) no longer hardcodes its geometry constants. It declares a `tile_size`,
+derived from its own `point_cloud_range`, and every tile-dependent knob is
+computed from it. This matters because the tile size is genuinely not fixed —
+the 25 m tiles and the 60 m `grid_tiles` export both exist.
+
+**Why anything depends on it at all**: `loss_pts`/`pts_cost` see NORMALISED
+coordinates (`normalize_2d_pts` divides by the pc_range extent), so a physical
+error of d metres arrives as `d / tile_size`. Nothing warns you about this;
+the loss just quietly means something different on a different tile.
+
+**The part that is easy to get wrong** — the primitives do not share one
+homogeneity degree, so a single common factor does not carry them across:
+
+| quantity | degree | scaling applied |
+|---|---|---|
+| `exact_emd_loss`, all `pgf_*` terms | 1 | `loss_weight *= tile_scale` |
+| CW-OT position (`squared=True`) | **2** | `cwot_w_pos *= tile_scale**(2-1)` |
+| CW-OT direction (unit tangents) | **0** | `cwot_w_dir /= tile_scale` |
+| `cwot_eps` | units of the **cost**, so 2 when squared | `/= tile_scale**degree` |
+
+`cwot_eps` is the subtlest: it regularises against the transport cost
+(`log_K = -cost/eps`), so scaling it as if it were a length leaves `cost/eps`
+— the only thing Sinkhorn sees — drifting with tile size. Note also that
+`PolylineGeomLoss` and `PolylineGeomCost` ship *different* `cwot_squared`
+defaults (True vs False), hence different degrees; the config now states the
+flag explicitly on both sides rather than relying on those defaults.
+
+**Verified**: with the derivations in place, a fixed physical error costs
+*exactly* the same at 25/60/100 m tiles in all three modes (0.00% spread,
+driven through the real config file with only its `point_cloud_range` line
+rewritten). With the old hardcoded constants the same error came out 4x
+cheaper at 100 m. At the 25 m reference tile every derived value reproduces
+its old constant bit-for-bit (2.0 / 0.05 / 1.0 / 0.5 / 1.0), so this changes
+nothing for the current dataset — it only starts acting on a resized one.
+
+**Separately, `pc_range` is now an optional arg on both classes** (default
+`None` = off). It undoes the anisotropy that per-axis normalisation
+introduces: `normalize_2d_pts` divides x and y by their *own* extents, so on a
+NON-SQUARE pc_range every `torch.cdist` here measures in a stretched space and
+over-weights error along the shorter axis. No config scalar can express that.
+It is an exact no-op for CARLA's square tiles (verified bit-identical), and
+only bites if a future export is rectangular. If you set it, set it on **both**
+the loss and the cost — otherwise matching and supervision disagree about
+what "close" means.
+
+**Caveat**: the config restates `point_cloud_range` locally (mmcv evaluates
+each config file in isolation, same reason `fixed_ptsnum_per_line` is
+repeated). It must stay equal to the base's — everything else derived from it
+(`bev_h_`/`bev_w_`, the coder, the assigner's pc_range, the LiDAR geometry) is
+bound in the base's namespace and will NOT follow a change made in the HM
+file. Actually resizing tiles means editing the base config, and re-measuring
+`sparse_shape`/`lidar_bev_proj.in_channels` per gotcha #4.
+
 ## Open items / next steps
 
 - **`lidar_point_cloud_range`'s z lower bound is still too high.** The
