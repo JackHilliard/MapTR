@@ -373,11 +373,42 @@ Against the full 4103-tile train set, fp16, real training steps
 **Memory numbers are extrapolated, not verified on H100 MIG; throughput
 numbers don't transfer across architectures at all.** Recommendation:
 `samples_per_gpu=4-5`, `workers_per_gpu=4-8`, `--shm-size=8g`, and a
-10-20 iter dry run on the real MIG partition first. Note `lr=6e-4` and
-`warmup_iters=500` were implicitly tuned for `samples_per_gpu=1`
-(inherited from the nuScenes/AV2 bases) — scale LR linearly
-(`new_lr ≈ 6e-4 × batch`) and reconsider `warmup_iters`, which becomes a
-much larger fraction of an epoch as `4103/samples_per_gpu` shrinks.
+10-20 iter dry run on the real MIG partition first.
+
+### `lr=6e-4`'s reference batch is 32, not 1 (corrected 2026-08-11)
+
+This section previously claimed `lr=6e-4` was tuned for `samples_per_gpu=1`
+and that you should scale it as `6e-4 × batch`. **That is wrong and
+dangerous** — it reads the *per-GPU* batch as the total. Every MapTR and
+MapTRv2 config in this repo pairs `lr=6e-4` with `samples_per_gpu=4`, and
+`README.md:58` states all experiments ran on **8 GPUs**: the tuned LR
+corresponds to an **effective batch of 32**. The old rule over-scales by
+32× (batch 22 → 1.3e-2 instead of ~5e-4) and would diverge immediately.
+
+Scale from 32, in whichever direction batch moves:
+
+- linear (`lr ∝ batch`, Goyal et al. 2017): `6e-4 × batch/32`
+- sqrt (`lr ∝ √batch`, the variant usually argued for adaptive optimizers
+  — this repo uses AdamW): `6e-4 × √(batch/32)`
+
+Prefer **sqrt**; it's better motivated for AdamW and stays closer to a
+known-good setting. The two agree closely near the reference batch
+(batch 22 → 4.1e-4 linear vs 5.0e-4 sqrt) and only diverge far from it.
+Both are heuristics — the linear rule was derived for SGD+momentum on
+ImageNet and was never validated for AdamW. It does hold *internally*
+here, which is weak corroboration: `maptr_nano_r18_110e.py` uses
+`lr=4e-3` at `samples_per_gpu=24` (batch 192), and linear scaling from
+6e-4/32 predicts 3.6e-3.
+
+`warmup_iters=500` is inherited from the same bases and **is** an
+implicit `samples_per_gpu`-dependent number, since it's counted in
+iterations while `total_epochs` is counted in epochs. Larger batch →
+fewer iters/epoch → warmup eats a larger fraction of the run. Upstream
+nuScenes (~28k samples at batch 32, ~880 iters/epoch) spent ~0.6 of an
+epoch warming up. On the 4103-tile CARLA train set at batch 22 that's
+~187 iters/epoch, so an unchanged 500 spans ~2.7 of 24 epochs — set
+`warmup_iters ≈ 110` to match the upstream fraction. General form:
+`warmup_iters ≈ 0.6 × 4103/samples_per_gpu`.
 
 ## Resuming with an extended `total_epochs` shocks the LR schedule
 
