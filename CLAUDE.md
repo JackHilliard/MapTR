@@ -633,6 +633,57 @@ bound in the base's namespace and will NOT follow a change made in the HM
 file. Actually resizing tiles means editing the base config, and re-measuring
 `sparse_shape`/`lidar_bev_proj.in_channels` per gotcha #4.
 
+## The GT order axis is 89.5% padding — and it broke EMD matching (2026-08-12)
+
+Chasing low GPU utilisation on the HM configs turned up one structural fact
+with two consequences, one a large speedup and one a real correctness bug.
+
+**The fact.** `gt_shift_pts_pattern='v2'` (what all the CARLA configs use)
+builds the GT order axis as `fixed_num - 1 = 19` slots. For a *closed*
+polygon it fills them with cyclic shifts, but for an **open** polyline — which
+every CARLA divider is — it emits exactly **2** real orders, forward and
+flipped, and pads the other **17 with `padding_value = -10000`**
+(`av2_offlinemap_dataset.py:290`, `shift_fixed_num_sampled_points_v2`). So
+89.5% of the (gt, order) pairs the matching cost evaluates are padding.
+Measured directly on real samples, not inferred.
+
+**Consequence 1 — the cost was ~19x redundant.** `PolylineGeomCost` costed
+every one of those pairs. Two exact redundancies:
+* the 17 padding slices are identical to each other, so 1 suffices; and
+* **EMD cannot distinguish the 2 real orders.** `exact_emd_loss` solves a
+  balanced assignment over point *sets*, and forward/flipped are permutations
+  of each other — verified bit-identical (spread 0.000e+00) on real GT.
+
+`PolylineGeomCost(dedup_gt_slices=True)` (the default now) costs each
+*distinct* slice once and scatters back: **bit-identical output**, 9.6x on the
+cost alone, and **10-17 → 0.6-0.9 s/iter** end to end. `cost_mode='emd'` is
+now about as cheap as `'pgf'`, which removes the main reason
+`..._HM_pgfcost.py` existed. Note the permutation half applies to **EMD only**
+— CW-OT reads tangents and PGF takes finite differences, so both see the
+sequence and only the exact-duplicate (padding) collapse is valid there.
+
+**Consequence 2 — `normalize_median` was normalising against garbage.** It
+divided by the median of the *whole* cost matrix, which is 89.5% distances to
+the `-10000` sentinel. The median therefore landed in the padding population
+(measured: **565.7**), scaling real geometry costs down to **~0.0007** against
+a `cls_cost` of weight 1.0. In `cost_mode='emd'`/`'cwot'` the assigner was
+effectively matching on **classification score alone**, with geometry
+contributing ~1/1400th — while paying 10-17 s/iter to compute it. The median
+now ignores padding columns and real costs sit at ~1.0.
+
+This changes matching behaviour, so **HM checkpoints trained before this are
+not comparable** — geometry genuinely participates in assignment now.
+`..._HM_pgfcost.py` was never affected: `pgf` is not median-normalised.
+
+Padding is detected structurally — "every point in the slice is identical" —
+rather than by comparing to -10000, because the cost sees *normalised*
+coordinates and would otherwise need `pc_range` to reconstruct the sentinel.
+
+**Still open**: the loss side is untouched (it runs on matched pairs, no order
+axis, ~50 solves — not worth it). If `cwot` is ever wanted as a cost, it needs
+a different fix: batching Sinkhorn over the pair axis on GPU, since its
+per-pair Python loop is what makes it unusable, not the order axis.
+
 ## Open items / next steps
 
 - **`lidar_point_cloud_range`'s z lower bound is too high.** 98 tiles have

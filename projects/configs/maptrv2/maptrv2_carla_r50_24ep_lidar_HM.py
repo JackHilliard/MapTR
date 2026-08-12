@@ -33,16 +33,27 @@ plugin_dir = 'projects/mmdet3d_plugin/'
 #     loss_mode   cost_mode   s/iter    note
 #     pgf         pgf         ~0.7      baseline
 #     emd         pgf         ~0.6      EMD is ~free as a loss
-#     emd         emd         10-17     ~20x slower
+#     emd         emd         0.6-0.9   was 10-17 before the dedup fix
 #     cwot        pgf         10-17     ~20x slower
 #     cwot        cwot        --        never completed 10 iters in 52 min
 #
-# The pattern: the *matching cost* is the bottleneck, not the loss. It is
-# evaluated for every (query x gt x order) combination, and MapTRv2's
-# one2many branch (300 queries x k_one2many=6) makes that ~18,000 pairs per
-# assigner call vs ~500 for one2one. Per-pair Python solves don't survive
-# that. Keep cost_mode='pgf' (vectorised) and put the expensive geometry in
-# the loss. PolylineGeomCost warns at construction if you set it otherwise.
+# The pattern WAS that the matching cost is the bottleneck: it is evaluated
+# for every (query x gt x order) combination, and MapTRv2's one2many branch
+# (300 queries x k_one2many=6) makes that ~18,000 pairs per assigner call vs
+# ~500 for one2one, each a CPU Hungarian solve.
+#
+# For 'emd' that is now largely fixed in PolylineGeomCost itself
+# (`dedup_gt_slices`, on by default), which costs each DISTINCT (gt, order)
+# slice once. Two exact redundancies make that ~19x: 17 of the 19 order
+# slots are padding for an open polyline, and EMD -- being a balanced
+# assignment over point SETS -- cannot distinguish the 2 real orders
+# (forward/flipped are permutations of each other). Measured 9.6x on the
+# cost alone and 10-17 -> 0.6-0.9 s/iter end to end, i.e. cost_mode='emd'
+# is now roughly as cheap as 'pgf'.
+#
+# 'cwot' does NOT get the same relief: its direction term reads tangents, so
+# it is blind only to exact duplicates (the padding), not to permutations,
+# and still solves 2 orders per gt. It remains the expensive option.
 #
 # All three loss_mode values train stably (loss decreasing, no NaN).
 #

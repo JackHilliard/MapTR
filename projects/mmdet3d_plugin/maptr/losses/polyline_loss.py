@@ -274,6 +274,66 @@ def exact_emd_loss(pred, gt):
 # ---------------------------------------------------------------------------
 
 
+def gt_slice_padding_mask(gt_flat):
+    """Which (gt, order) slices are MapTR padding rather than real geometry?
+
+    ``shift_fixed_num_sampled_points_v2`` emits 2 real orders for an OPEN
+    polyline (forward + flipped) and pads the remaining ``fixed_num - 1 - 2``
+    order slots with ``padding_value`` (-10000 by default). For CARLA's
+    divider-only, 20-point setup that is 17 of 19 slices -- 89.5% of every
+    (gt, order) pair the matching cost is asked to evaluate.
+
+    Detected structurally, as "every point in the slice is identical", rather
+    than by comparing against a padding value: the cost sees NORMALISED
+    coordinates, so the sentinel is no longer -10000 by the time it arrives
+    here, and it would otherwise have to know pc_range to reconstruct it. A
+    real polyline collapsing to a single repeated point would be a zero-length
+    degenerate the converter already drops.
+    """
+    if gt_flat.shape[1] < 2:
+        return torch.zeros(gt_flat.shape[0], dtype=torch.bool,
+                           device=gt_flat.device)
+    return (gt_flat.amax(dim=1) == gt_flat.amin(dim=1)).all(dim=-1)
+
+
+def gt_slice_groups(gt_flat, permutation_invariant):
+    """Group identical (gt, order) slices so each is costed only once.
+
+    Returns ``(index, inverse)``: ``index`` selects one representative slice
+    per group, ``inverse`` scatters a per-group result back to all M slices.
+
+    Two levels, because the modes differ in what they are blind to:
+
+    * Always, exact duplicates collapse. That alone folds the 17 identical
+      padding slices above into 1.
+    * With ``permutation_invariant`` (EMD only), slices that are permutations
+      of each other collapse too, keyed on their lexicographically sorted
+      points. ``exact_emd_loss`` solves a balanced assignment over point SETS,
+      so it cannot distinguish them -- verified bit-identical on real CARLA
+      GT. This folds the forward/flipped pair into 1, taking the total to 1
+      representative per gt instead of 19.
+
+      NOT valid for 'cwot' or 'pgf': CW-OT's direction term is built from
+      tangents and PGF's velocity/acceleration terms are finite differences,
+      so both see the sequence, and flipping changes them.
+    """
+    arr = gt_flat.detach().cpu().numpy()
+    M, P, C = arr.shape
+    if permutation_invariant and P > 1:
+        keys = np.empty((M, P * C), dtype=arr.dtype)
+        for m in range(M):
+            pts = arr[m]
+            keys[m] = pts[np.lexsort(tuple(pts[:, c] for c in
+                                            reversed(range(C))))].reshape(-1)
+    else:
+        keys = arr.reshape(M, P * C)
+    _, index, inverse = np.unique(keys, axis=0, return_index=True,
+                                  return_inverse=True)
+    dev = gt_flat.device
+    return (torch.as_tensor(index, device=dev, dtype=torch.long),
+            torch.as_tensor(inverse.reshape(-1), device=dev, dtype=torch.long))
+
+
 def tile_size_from_pc_range(pc_range):
     """Tile size in metres: the larger of the two in-plane pc_range extents.
 
@@ -498,20 +558,25 @@ class PolylineGeomCost(object):
                  pgf_wc=0.5,
                  normalize_median=True,
                  max_cost_elems=64_000_000,
-                 pc_range=None):
+                 pc_range=None,
+                 dedup_gt_slices=True):
         if mode not in _MODES:
             raise ValueError(f'mode must be one of {_MODES}, got {mode!r}')
-        if mode in ('cwot', 'emd'):
-            # Loud on purpose: measured ~20x slower ('emd') to effectively
-            # hung ('cwot') on this repo's one2many query count. Easy to
-            # mistake for a stall rather than a config choice.
+        if mode in ('cwot', 'emd') and not dedup_gt_slices:
+            # Only warned about with dedup OFF now. With it on, the per-pair
+            # solve count drops from ~18k to ~1 per gt for 'emd' (9.6x
+            # measured end to end), which takes it from "unusable" to merely
+            # "slower than pgf". 'cwot' benefits far less: it is blind only
+            # to exact duplicates, not to permutations, so it still solves
+            # 2 orders per gt and remains the expensive option.
             warnings.warn(
-                f"PolylineGeomCost(mode='{mode}') evaluates a per-pair solve "
-                f'for every query x gt x order combination (~18k pairs per '
-                f'assigner call with MapTRv2 one2many). Measured ~20x slower '
-                f"than mode='pgf' for 'emd'; 'cwot' did not complete 10 "
-                f'iterations in 52 minutes. Prefer mode=\'pgf\' for the '
-                f'matching cost and put expensive geometry in loss_pts.',
+                f"PolylineGeomCost(mode='{mode}', dedup_gt_slices=False) "
+                f'evaluates a per-pair solve for every query x gt x order '
+                f'combination (~18k per assigner call with MapTRv2 '
+                f"one2many), ~89.5% of which are padding. Measured ~20x "
+                f"slower than mode='pgf'; 'cwot' did not complete 10 "
+                f'iterations in 52 minutes. Leave dedup_gt_slices=True '
+                f'unless you are reproducing pre-fix numbers.',
                 RuntimeWarning)
         self.mode = mode
         self.weight = weight
@@ -526,6 +591,9 @@ class PolylineGeomCost(object):
         # Kept, since MapTR likewise sums cls/reg/iou/pts costs unweighted
         # beyond their configured weights.
         self.normalize_median = normalize_median
+        # Cost each distinct (gt, order) slice once. Exact -- see
+        # gt_slice_groups. Turn off only to reproduce pre-fix numbers.
+        self.dedup_gt_slices = dedup_gt_slices
         # Peak-element budget for the chunked 'emd' cdist (64M float32 ~
         # 256 MB). Lower it if the assigner still OOMs on a small card.
         self.max_cost_elems = max_cost_elems
@@ -584,8 +652,24 @@ class PolylineGeomCost(object):
         pts_pred = _apply_axis_scale(pts_pred, self.axis_scale)
         gt_flat = _apply_axis_scale(gt_flat, self.axis_scale)
 
+        # Cost each DISTINCT slice once and scatter the result back. For the
+        # per-pair-solve modes this is the difference between ~18k Hungarian
+        # solves per assigner call and ~1 per gt; see gt_slice_groups. Exact,
+        # not an approximation -- the collapsed slices are ones the active
+        # mode provably cannot tell apart.
+        pad_mask = gt_slice_padding_mask(gt_flat)
+        if self.dedup_gt_slices and self.mode in ('cwot', 'emd'):
+            keep, inverse = gt_slice_groups(gt_flat,
+                                            permutation_invariant=(
+                                                self.mode == 'emd'))
+            gt_work = gt_flat[keep]
+        else:
+            keep = inverse = None
+            gt_work = gt_flat
+        M_work = gt_work.shape[0]
+
         if self.mode == 'pgf':
-            cost = self._pgf_cost_vectorised(pts_pred, gt_flat)
+            cost = self._pgf_cost_vectorised(pts_pred, gt_work)
         elif self.mode == 'emd':
             # Batched cdist -> single GPU->CPU transfer -> exact per-pair
             # Hungarian on CPU, as in the source. CHUNKED over queries: the
@@ -596,31 +680,47 @@ class PolylineGeomCost(object):
             # unchunked version asked for 2.3 GiB in one allocation and OOM'd
             # an 8 GB card. Chunking is numerically identical -- same cdist,
             # same assignments -- just bounded in peak memory.
-            elems_per_query = M * num_pts * num_pts
+            elems_per_query = M_work * num_pts * num_pts
             chunk = max(1, int(self.max_cost_elems // max(elems_per_query, 1)))
-            cost_np = np.zeros((Q, M), dtype=np.float32)
+            cost_np = np.zeros((Q, M_work), dtype=np.float32)
             for lo in range(0, Q, chunk):
                 hi = min(lo + chunk, Q)
                 q = hi - lo
                 d_np = torch.cdist(
-                    pts_pred[lo:hi, None].expand(q, M, num_pts, num_coords),
-                    gt_flat[None].expand(q, M, num_pts, num_coords),
+                    pts_pred[lo:hi, None].expand(q, M_work, num_pts,
+                                                 num_coords),
+                    gt_work[None].expand(q, M_work, num_pts, num_coords),
                     p=2).cpu().numpy()
                 for i in range(q):
-                    for j in range(M):
+                    for j in range(M_work):
                         ri, ci = linear_sum_assignment(d_np[i, j])
                         cost_np[lo + i, j] = d_np[i, j][ri, ci].mean()
             cost = pts_pred.new_tensor(cost_np)
         else:  # cwot
-            cost = pts_pred.new_zeros((Q, M))
+            cost = pts_pred.new_zeros((Q, M_work))
             for i in range(Q):
-                for j in range(M):
-                    cost[i, j] = curve_ot_loss(pts_pred[i], gt_flat[j],
+                for j in range(M_work):
+                    cost[i, j] = curve_ot_loss(pts_pred[i], gt_work[j],
                                                 **self.cwot_kwargs)
 
         if self.normalize_median and self.mode in ('cwot', 'emd'):
-            finite = cost[torch.isfinite(cost)]
+            # Normalise against REAL geometry only. The cost matrix is
+            # ~89.5% padding columns here (gt_slice_padding_mask), and their
+            # cost is a distance to the -10000 sentinel -- enormous. Taking
+            # the median over all entries therefore lands in the padding
+            # population, not the geometry one, and divides the real costs
+            # down to ~1e-3 against a cls_cost of weight 1.0. Measured on
+            # real CARLA GT: median 565.7, real costs ~0.0007 afterwards,
+            # i.e. geometry contributed ~1/1400th of the matching decision
+            # and the assigner ran on classification score alone.
+            ref = cost[:, ~pad_mask[keep]] if keep is not None else cost
+            finite = ref[torch.isfinite(ref)]
+            if finite.numel() == 0:                 # every slice was padding
+                finite = cost[torch.isfinite(cost)]
             if finite.numel() > 0:
                 cost = cost / finite.median().clamp(min=1e-6)
+
+        if inverse is not None:
+            cost = cost[:, inverse]
         cost = torch.nan_to_num(cost, nan=0.0, posinf=0.0, neginf=0.0)
         return cost * self.weight

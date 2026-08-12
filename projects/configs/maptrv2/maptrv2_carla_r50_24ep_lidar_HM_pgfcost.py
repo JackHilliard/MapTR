@@ -11,8 +11,24 @@ _base_ = [
 # sibling in kind: that one duplicates because it changes GEOMETRY, this one
 # inherits because it changes SETTINGS.
 #
-#   1. cost_mode 'emd' -> 'pgf'      (~20x faster; see below)
+#   1. cost_mode 'emd' -> 'pgf'      (see the SUPERSEDED note below)
 #   2. loss_dir weight 0.0 -> tunable (EMD supervises no ordering at all)
+#
+# SUPERSEDED, read this first: change (1) was worth ~20x when this file was
+# written, because cost_mode='emd' ran at 10-17 s/iter. PolylineGeomCost's
+# `dedup_gt_slices` fix has since brought that to 0.6-0.9 s/iter -- about the
+# same as 'pgf'. So (1) is now close to a wash on speed, and the honest
+# reason to prefer 'pgf' is gone: with EMD affordable on both sides, matching
+# and supervision measuring the SAME geometry is the better default, and that
+# is what the plain HM config now gives you.
+#
+# What remains genuinely useful here is (2), loss_dir. That is orthogonal to
+# the cost mode and applies just as well on top of the HM config -- consider
+# running the sweep below with --cfg-options against that config instead:
+#   python tools/train.py projects/configs/maptrv2/maptrv2_carla_r50_24ep_lidar_HM.py \
+#       --cfg-options model.pts_bbox_head.loss_dir.loss_weight=0.05
+# Keep this file for the A/B on matching geometry (pgf-matched vs
+# emd-matched, everything else equal), which is still a real experiment.
 #
 # `plugin`/`plugin_dir` must be repeated: mmcv executes each config file in
 # isolation before _base_ merging, so tools/train.py reads them from THIS
