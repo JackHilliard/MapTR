@@ -659,6 +659,34 @@ with the y=x diagonal, neither axis defined in terms of the other) reads
 **ρ = −0.10**. The pairing carries an inline warning pointing at the
 non-circular chart; don't quote the −0.84.
 
+**Tile elevation (`z_median` / `z_mean`) is recorded in WORLD z, and that is
+load-bearing.** `features` is stored relative to `offset`, and **`offset` is
+the point cloud's centroid** — verified directly: `mean(features)` is 0 on
+all three axes for every tile checked, to float32 rounding. So the
+centroid-relative *mean* z is identically ~0 (measured spread across the
+4103-tile train split: −0.07 to 0.17 m), and a chart against it would be a
+chart against rounding noise. Adding `offset[2]` back gives two real
+quantities: `z_mean` = elevation of the tile's centroid (≈ `offset[2]`),
+`z_median` = elevation of its road surface. Sanity check that the conversion
+is right: `z_median` clusters at exactly 0, which is CARLA's ground plane.
+
+Their **difference is the vertical skew** — how far the road sits below the
+centre of mass above it — and that difference is the only part of this the
+model can see, since its input is centroid-relative. It is in `results.csv`
+as `z_skew`; a trend against absolute `z_median` is about *where* a tile is,
+not its height as such.
+
+**`CACHE_VERSION` (in the viewer) must be bumped whenever `scan_tile()`
+records a new field.** Without it a warm cache from an older build loads
+happily, every tile looks already-scanned, and the charts needing the new
+field render empty — the same silent-staleness class as the `carla_map_gt.
+json` trap. A mismatch drops the cache and re-scans (~70 s for 4,362 tiles;
+adding the two z stats cost no measurable time). Currently v3: v1 original,
+v2 added z_median/z_mean, v3 moved them to world z. Relatedly, `/res.png`
+now returns an explanatory placeholder image rather than a 404 when a chart
+has nothing to draw, since the page has already emitted the `<img>` and a
+404 renders as a broken-image icon that reads like a bug.
+
 Scatters use **marker area ∝ coincident tile count**: several axis pairs are
 small integers (GT count vs TP count is a lattice) and a plain scatter drew
 259 tiles as ~40 visible dots, hiding its own distribution. Sizing by the

@@ -1331,8 +1331,29 @@ def scan_tile(t, grid):
             xyz = np.asarray(block['features'][:, :3], dtype=np.float32)
             rec['n_raw'] = int(xyz.shape[0])
             if rec['n_raw']:
-                rec['z_min'] = float(xyz[:, 2].min())
-                rec['z_max'] = float(xyz[:, 2].max())
+                z = xyz[:, 2]
+                rec['z_min'] = float(z.min())
+                rec['z_max'] = float(z.max())
+                # Recorded in WORLD z, by adding the tile's own origin back
+                # on, and this is not cosmetic.
+                #
+                # `features` is stored relative to `offset`, and `offset` is
+                # the cloud's CENTROID -- verified directly: mean(features)
+                # is 0 on all three axes for every tile checked, to float32
+                # rounding. So the centroid-relative mean z is identically
+                # ~0 (measured spread across the 4103-tile train split:
+                # -0.07 to 0.17 m, i.e. nothing), and plotting anything
+                # against it would be plotting against rounding noise.
+                #
+                # In world terms both are real: z_mean is the elevation of
+                # the tile's centroid, z_median the elevation of its road
+                # surface (most returns are ground). Their DIFFERENCE is the
+                # vertical skew -- how far the road sits below the centre of
+                # mass of everything above it -- and that difference is the
+                # only part of this the model can actually see, since its
+                # input is centroid-relative. Both are in results.csv.
+                rec['z_median'] = float(np.median(z)) + float(origin[2])
+                rec['z_mean'] = float(z.mean()) + float(origin[2])
                 rec['n_effective'] = unique_cells(xyz, grid)
                 rec['n_xy_cells'] = unique_cells(xyz[:, :2], grid)
             else:
@@ -1364,6 +1385,15 @@ def scan_tile(t, grid):
     except Exception as e:                        # noqa: BLE001 - see docstring
         rec['error'] = f'{type(e).__name__}: {e}'
     return uid, rec
+
+
+# Bump whenever scan_tile() starts recording a NEW field. Without this, a
+# warm cache from an older build is loaded happily, every tile looks
+# "already scanned", and the charts that need the new field render empty --
+# the silent-staleness failure this file keeps running into. A mismatch
+# drops the cache and re-scans, which is a minute for 4,362 tiles.
+#   1 -> original; 2 -> adds z_median / z_mean; 3 -> those in WORLD z
+CACHE_VERSION = 3
 
 
 def cache_path_for(ds):
@@ -1399,6 +1429,12 @@ def load_deep_cache():
                   f'{blob.get("grid")}, want {list(STATE["scan_grid"])}'
                   f' -- ignored')
             continue
+        # version 1 predates the key, hence the default
+        if int(blob.get('version', 1)) != CACHE_VERSION:
+            print(f'  [stats] {path}: cache schema v'
+                  f'{blob.get("version", 1)}, want v{CACHE_VERSION} '
+                  f'(newer fields missing) -- ignored, re-scan to rebuild')
+            continue
         for name, rec in (blob.get('tiles') or {}).items():
             uid = f'{ds}/{name}'
             if uid in STATE['tiles_by_uid']:
@@ -1424,7 +1460,7 @@ def save_deep_cache(ds):
     tmp = path + '.tmp'
     with open(tmp, 'w') as f:
         json.dump({'grid': list(STATE['scan_grid']), 'dir': ds_dir(ds),
-                    'tiles': recs}, f)
+                    'version': CACHE_VERSION, 'tiles': recs}, f)
     os.replace(tmp, path)
 
 
@@ -2900,7 +2936,8 @@ def evaluate_run(results_path, gt_path, score_thresh=0.0):
             row.update(m)
             row['token'] = token
             d = row.get('deep') or {}
-            row['n_effective'] = d.get('n_effective')
+            for k in DEEP_FIELDS:
+                row[k] = d.get(k)
             rows.append(row)
 
         glob = global_ap(rows)
@@ -3001,6 +3038,23 @@ RX_VARS = {
                          note='What the model actually sees, after '
                               'GridSamplePoints. The honest version of '
                               '"how much LiDAR did this tile have".'),
+    'z_median': dict(label='tile median z, world (m)', log=False, deep=True,
+                      note='Elevation of the tile\'s road surface &mdash; the '
+                           'median is robust, and most returns are ground. '
+                           'Against AP this asks whether hilly parts of a '
+                           'town are harder. Note the model cannot see '
+                           'absolute elevation (its input is '
+                           'centroid-relative), so a trend here is about '
+                           '<i>where</i> the tile is, not its height as '
+                           'such.'),
+    'z_mean': dict(label='tile mean z, world (m)', log=False, deep=True,
+                    note='Elevation of the tile\'s centroid. Because '
+                         '<code>offset</code> IS the centroid, this is very '
+                         'nearly <code>offset[2]</code> itself, and the '
+                         'centroid-relative mean is identically zero &mdash; '
+                         'which is why this is reported in world z. Its gap '
+                         'from the median is the vertical skew, and that gap '
+                         'is the only part of this the model actually sees.'),
     'count_error': dict(label='polyline count error (predicted − GT)',
                          log=False, deep=False,
                          note='Does getting the NUMBER of polylines right '
@@ -3009,6 +3063,12 @@ RX_VARS = {
                               'together; a flat line says the count is '
                               'independent of placement quality.'),
 }
+
+
+# Deep-scan fields copied onto each evaluated row so they can be plotted
+# against prediction quality. Keep in step with the deep=True entries in
+# RX_VARS (and with CACHE_VERSION, if a new one is added to scan_tile).
+DEEP_FIELDS = ('n_effective', 'z_median', 'z_mean')
 
 
 def r_metric(row, key):
@@ -3353,6 +3413,23 @@ RPLOTS['bygroup'] = dict(kind='bygroup', deep=False,
                           note='Whether one town is carrying the whole '
                                'number. Train and test are different towns '
                                'here, so this is not rhetorical.')
+
+
+def render_placeholder(spec, kind):
+    """An explicit 'no data' panel, in place of a broken image."""
+    with RENDER_LOCK:
+        fig, ax = stat_fig(height=3.2, width=6.2)
+        ax.axis('off')
+        why = ('this needs the deep scan on the dataset-statistics tab'
+               if spec.get('deep') else
+               'no tile has a value for it in this run')
+        ax.text(0.5, 0.5, f'Nothing to plot for “{kind}”.\n{why}.',
+                 transform=ax.transAxes, ha='center', va='center',
+                 color=TEXT_MUTED, fontsize=10, wrap=True)
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=110, facecolor=BG)
+        buf.seek(0)
+        return buf
 
 
 def render_res(*args, **kwargs):
@@ -3792,7 +3869,7 @@ def results_page():
                        f'annotation file. {alt}')),
             'predictions and GT share no tiles')
 
-    have_deep = any(r.get('n_effective') is not None for r in rows)
+    have_deep = any(r.get(k) is not None for r in rows for k in DEEP_FIELDS)
     cachebust = f'{time.time():.6f}'
     figs = []
     for kind, spec in RPLOTS.items():
@@ -3815,10 +3892,11 @@ def results_page():
         figs.append(
             f'<figure style="max-width:560px;width:540px"><figcaption '
             f'style="text-align:left;word-break:normal">Quality against '
-            f'<b>effective</b> point count &mdash; what survives grid '
-            f'sampling, as opposed to what the manifest claims &mdash; '
-            f'appears here once a <a href="/?tab=stats">deep scan</a> has '
-            f'run.</figcaption></figure>')
+            f'<b>effective point count</b> (what survives grid sampling, as '
+            f'opposed to what the manifest claims) and against the tile\'s '
+            f'<b>median</b> and <b>mean z</b> appears here once a '
+            f'<a href="/?tab=stats">deep scan</a> has run &mdash; all three '
+            f'need every tile\'s .npz read.</figcaption></figure>')
 
     ranked = rank_rows(rows, sort_key)
     hidden = ''.join(
@@ -3959,7 +4037,11 @@ def res_png():
                          _safe_float(request.args.get('score_thresh'), 0.0))
     buf = render_res(kind, rows, group_by, sort_key)
     if buf is None:
-        abort(404)
+        # A chart with nothing to draw (a deep-tier field not scanned yet,
+        # or a metric undefined for every tile) must not 404: the page has
+        # already emitted the <img>, so a 404 shows a broken-image icon and
+        # looks like a bug rather than an empty result.
+        buf = render_placeholder(RPLOTS[kind], kind)
     resp = send_file(buf, mimetype='image/png')
     resp.headers['Cache-Control'] = ('no-store, no-cache, must-revalidate, '
                                       'max-age=0')
@@ -3977,12 +4059,19 @@ def results_csv():
             'precision', 'chamfer', 'n_gt', 'n_pred', 'n_pred_kept',
             'count_error']
     w.writerow(['uid', 'name', 'dataset', 'split', 'town', 'n_points',
-                 'points_per_m2', 'n_effective'] + keys + ['flags'])
+                 'points_per_m2'] + list(DEEP_FIELDS) + ['z_skew'] + keys
+                + ['flags'])
     for r in rows:
+        # median - mean: how far the road sits below the centre of mass.
+        # The one z quantity the model's centroid-relative input encodes.
+        zmed, zmean = r.get('z_median'), r.get('z_mean')
+        skew = ('' if zmed is None or zmean is None
+                else f'{zmed - zmean:.4f}')
         w.writerow([r['uid'], r['name'], r['ds'], r['split'], r['town'],
-                     r['n_points'], f"{r['density']:.3f}",
-                     r.get('n_effective') if r.get('n_effective') is not None
-                     else '']
+                     r['n_points'], f"{r['density']:.3f}"]
+                    + [('' if r.get(k) is None else f'{r[k]:.6g}')
+                       for k in DEEP_FIELDS]
+                    + [skew]
                     + [('' if r_metric(r, k) is None
                         else f'{r_metric(r, k):.6g}') for k in keys]
                     + [' '.join(k for k, _v in tile_flags(r))])
