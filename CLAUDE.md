@@ -262,6 +262,48 @@ instances) with 0 tiles dropped under the current range; re-running train
 with the *old* narrow z-range (`-10..18`) drops exactly the 6 town03
 overpass tiles, confirming the criterion picks the right tiles.
 
+## GeMap-style `tile_center` frame (branch `worktree-carla-gt-frame-tile-center`, 2026-08-13)
+
+GeMap's copy of the converter centres tiles and polylines on `tile_center`,
+not `offset`. That is available here as an opt-in frame, wired on **both**
+sides so it cannot silently misalign the way the original `tile_center` bug
+did (see "CARLA data facts"):
+
+- `--gt-frame {offset,tile_center}` (default `offset`, a no-op). With
+  `tile_center` the polylines are shifted by `tile['center']` and each sample
+  records `lidar_recenter_shift = offset - tile_center`, plus `gt_frame` and
+  `lidar_offset`; the pkl gains a top-level `gt_frame`.
+- `LoadCarlaPointsFromFile(recenter=True)` adds that shift to the stored
+  points (which are always written in the `offset` frame), after the `z_max`
+  cut — that filter is defined on the stored z, and `count_points_in_range()`
+  in the converter applies the same order.
+- `get_data_info` threads `annotation_origin` / `gt_frame` /
+  `lidar_recenter_shift` into the pipeline. An old pkl without the shift
+  raises a clear error instead of loading misaligned.
+- `projects/configs/maptrv2/maptrv2_carla_r50_24ep_lidar_tilecenter.py` sets
+  both together, with its own `ann_file`s under `data/carla/tile_center/` and
+  its **own `map_ann_file`** — sharing one `carla_map_gt.json` between frames
+  would score one frame against the other's GT (`_format_gt()` never
+  regenerates).
+
+**The frames are equivalent up to a rigid shift, so this is not an accuracy
+fix** — verified: GT in the two pkls differs by exactly the recorded shift
+(max residual 0.0), and the median GT-vertex → driving-surface distance is
+bit-identical (0.0568 m) in both. What it does change:
+
+- **Range coverage goes from 46/259 tiles under 90% to median 100%.** The
+  square `lidar_point_cloud_range` is centred on the origin, so in the
+  `offset` frame it sits 1-2 m (25 m tiles) to ~17 m (60 m tiles) off the
+  actual tile and crops it. `tile_center` is the tile's own centre, so it
+  doesn't. This is the concrete argument the 2026-08-10 coverage diagnostic
+  was pointing at.
+- The model's input is re-centred, so **checkpoints are not comparable across
+  frames** — retrain.
+
+Verified on the 259-tile test split: 1210 instances / 0 dropped in both
+frames, and a full 1-epoch train+eval under the tile-centre config runs clean
+(mAP 0.0218 with train==val, so no accuracy conclusion).
+
 ## The converter is tile-size agnostic (2026-08-10)
 
 `custom_carla_map_converter.py` had three hardcoded assumptions from the

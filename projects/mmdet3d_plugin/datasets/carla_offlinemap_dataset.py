@@ -202,6 +202,16 @@ class CustomCarlaLocalMapDataset(Custom3DDataset):
             can_bus=np.zeros(18, dtype=np.float32),
             annotation=info['annotation'],
             ann_info=info['annotation'],
+            # Frame bookkeeping. `annotation_origin` is whatever the converter
+            # subtracted from the world-frame polylines; `lidar_recenter_shift`
+            # is what LoadCarlaPointsFromFile(recenter=True) must add to the
+            # stored points to reach that same frame (all-zero, hence inert,
+            # for the default `offset` frame). Absent from pkls generated
+            # before --gt-frame existed; the loader raises a clear error if it
+            # is asked to recentre without one.
+            annotation_origin=info.get('annotation_origin'),
+            gt_frame=info.get('gt_frame', 'offset'),
+            lidar_recenter_shift=info.get('lidar_recenter_shift'),
         )
 
     def vectormap_pipeline(self, example, input_dict):

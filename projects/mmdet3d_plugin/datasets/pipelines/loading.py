@@ -491,13 +491,26 @@ class LoadCarlaPointsFromFile(object):
         z_max (float | None): Drop points with ``z`` greater than this value
             (mirrors the Pointcept ``z <= 15.0`` filter). Set to ``None`` to
             disable. Defaults to 15.0.
+        recenter (bool): Shift the loaded points into the frame the GT
+            polylines are expressed in, by adding the sample's
+            ``lidar_recenter_shift`` (= ``offset - annotation_origin``,
+            written by the converter). The stored ``features`` are always
+            relative to the block's own ``offset``; with
+            ``--gt-frame tile_center`` the annotations are relative to the
+            tile centre instead, and the two frames differ by 1-2m on the
+            25m export and up to ~17m on the 60m one -- enough to misplace
+            every polyline against chamfer thresholds of 0.5/1.0/1.5m.
+            A missing/zero shift is a no-op, so this is safe to leave on;
+            it only errors if a pkl predating the field is used with a
+            ``tile_center`` config. Defaults to False.
     """
 
     def __init__(self,
                  coord_type='LIDAR',
                  load_dim=4,
                  use_dim=4,
-                 z_max=15.0):
+                 z_max=15.0,
+                 recenter=False):
         if isinstance(use_dim, int):
             use_dim = list(range(use_dim))
         assert max(use_dim) < load_dim, \
@@ -507,6 +520,7 @@ class LoadCarlaPointsFromFile(object):
         self.load_dim = load_dim
         self.use_dim = use_dim
         self.z_max = z_max
+        self.recenter = recenter
         # ITU-R BT.709 luma weights, as in the original Pointcept dataset.
         self._rgb2strength = np.array([0.2126, 0.7152, 0.0722],
                                       dtype=np.float32)
@@ -526,6 +540,16 @@ class LoadCarlaPointsFromFile(object):
     def __call__(self, results):
         pts_filename = results['pts_filename']
         points = self._load_points(pts_filename)
+        if self.recenter:
+            shift = results.get('lidar_recenter_shift')
+            if shift is None:
+                raise KeyError(
+                    'LoadCarlaPointsFromFile(recenter=True) needs a per-sample '
+                    '`lidar_recenter_shift`, which this pkl does not carry. '
+                    'Re-run custom_carla_map_converter.py (any --gt-frame) to '
+                    'regenerate it.')
+            # xyz only -- column 3 is strength.
+            points[:, :3] += np.asarray(shift, dtype=np.float32)[:3]
         points = points[:, self.use_dim]
 
         points_class = get_points_type(self.coord_type)
@@ -538,7 +562,7 @@ class LoadCarlaPointsFromFile(object):
         return (f'{self.__class__.__name__}('
                 f'coord_type={self.coord_type}, '
                 f'load_dim={self.load_dim}, use_dim={self.use_dim}, '
-                f'z_max={self.z_max})')
+                f'z_max={self.z_max}, recenter={self.recenter})')
 
 
 @PIPELINES.register_module()
