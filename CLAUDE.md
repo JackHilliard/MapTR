@@ -538,9 +538,39 @@ of tile geometry (7.3 m median on the healthy 60 m grid export).
 ### Training-results tab (2026-08-12)
 
 *`?tab=results`* — scores a run's predictions **per tile** and asks what the
-failures have in common. Needs `--work-dir` (for a `*result*.json`) plus the
-eval GT; `--gt-json` overrides the default search
-(`data/carla/carla_map_gt.json`, then any `*gt*.json` under the work-dir).
+failures have in common. Needs `--work-dir` (for a `*result*.json`) plus an
+eval GT.
+
+**The GT can come from the converter pkl, not just `carla_map_gt.json`.**
+This matters because `carla_map_gt.json` is *not shipped with a dataset* —
+`_format_gt()` writes it to the config's `map_ann_file` the first time an
+eval or `tools/test.py` runs, so a freshly converted dataset has none.
+`carla_map_infos_<split>.pkl` exists as soon as the converter has run, so it
+is searched first and auto-selected. `--gt-json` (alias `--gt`) takes either.
+
+The pkl path **reproduces** `_format_gt()` rather than approximating it,
+because that chain is almost an identity: `gen_vectorized_samples()` wraps
+each annotation array in a `LineString`, keeping it if it has ≥2 points and
+a class mapping to a label ≠ −1; `LiDARInstanceLines` stores that list
+untouched (`self.instance_list = instance_line_list`); `_format_gt` writes
+`np.array(list(gt_vec.coords))[:, :code_size]`. **No resampling, no clipping
+to pc_range, no reordering** — just the pkl's own arrays, filtered by point
+count and class, truncated to 2D. Verified against an existing
+`carla_map_gt.json`: 259 tiles, 1210 instances, every coordinate
+bit-identical, identical end-to-end mAP and TP total. The train pkl
+independently reproduces 4103 tiles / 15810 instances.
+
+The pkl is also the *safer* source when both exist: `_format_gt()` skips
+regeneration if the json is already there, so a stale json silently scores
+against the wrong GT (the warning at the top of this file), while the pkl is
+rewritten every converter run. Loading it needs only `pickle` + `numpy` —
+no mmcv, no mmdet3d — which is what keeps it host-side.
+
+**Which GT covers which predictions is decided by token overlap**, not file
+order: splits are disjoint tile sets and nothing in a results json records
+its split, so defaulting to the first candidate would score test predictions
+against the train pkl and report every tile as missing GT. A forced mismatch
+names the file that would have worked instead.
 
 **Why a per-tile score is even available.** `mean_ap.eval_map()` already
 calls `custom_tpfp_gen()` **once per tile** and only the AP *aggregation* is

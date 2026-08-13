@@ -116,7 +116,27 @@ split overlay shows whether train and test are even the same distribution
 
 `?tab=results` scores a training run's predictions per tile and asks what
 the failures have in common. Needs `--work-dir` (for a results json) and
-the eval GT (`data/carla/carla_map_gt.json`, or `--gt-json`).
+an eval GT, which can be EITHER of two files -- they give identical GT:
+
+  * `carla_map_infos_<split>.pkl`, the converter's output. Preferred and
+    auto-selected, because it exists as soon as the dataset is converted.
+  * `carla_map_gt.json`, written by `_format_gt()` to the config's
+    `map_ann_file` -- but only once an eval or tools/test.py run has
+    happened, so a freshly converted dataset does not have one at all.
+
+Building GT from the pkl reproduces `_format_gt()` rather than
+approximating it, because that chain is almost an identity:
+`gen_vectorized_samples()` wraps each annotation array in a LineString and
+keeps it if it has >=2 points and a class mapping to a label != -1;
+`LiDARInstanceLines` stores that list untouched; `_format_gt` writes
+`np.array(list(gt_vec.coords))[:, :code_size]`. No resampling, no clipping
+to pc_range, no reordering. Verified by reproducing an existing
+carla_map_gt.json exactly -- 259 tiles, 1210 instances, every coordinate
+bit-identical, and identical end-to-end mAP.
+
+Which GT covers which predictions is settled by token overlap, not by
+order: splits are disjoint sets of tiles, and nothing in a results json
+says which split it came from.
 
   * It reimplements the repo's chamfer matching in numpy, because this
     viewer runs on the HOST: no torch, no mmdet3d, and neither shapely nor
@@ -147,6 +167,7 @@ import io
 import json
 import os
 import os.path as osp
+import pickle
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -2604,19 +2625,42 @@ def ap_from_tpfp(tp, fp, scores, num_gts):
                               ctp / np.maximum(ctp + cfp, eps))
 
 
-def load_gt_json(path):
-    """Parse carla_map_gt.json into {sample_token: [(pts, type)]}.
+# CustomCarlaLocalMapDataset.MAPCLASSES, in order -- the index IS the
+# `type` written into the GT json, via VectorizedAV2LocalMap.CLASS2LABEL.
+# The CARLA taxonomy is divider-only today; if that widens, this has to
+# widen with it (and stay in the same order, or every type id shifts).
+MAPCLASSES = ('divider',)
 
-    This is the dataset's OWN eval GT, written by
-    CustomCarlaLocalMapDataset._format_gt() -- already class-filtered and
-    already in the tile-local `offset` frame, i.e. the same frame as the
-    predictions. Deliberately not rebuilt from reference_lines/*.json here:
-    that would re-derive class filtering and resampling and could silently
-    disagree with what the model was actually scored against.
+
+def load_gt(path):
+    """{sample_token: [(pts, type)]} from either GT source.
+
+    Two files can serve as eval GT, and they agree by construction:
+
+      * carla_map_gt.json -- what _format_gt() writes to the config's
+        `map_ann_file`. Only exists once an eval or tools/test.py run has
+        happened.
+      * carla_map_infos_<split>.pkl -- what the converter writes. Exists as
+        soon as the dataset has been converted, i.e. always, and long
+        before any training has run.
+
+    The pkl is preferred when both are offered because a fresh dataset has
+    no json yet, and because the json is the one that goes stale: _format_gt
+    skips regeneration if the file already exists, so a json left over from
+    a previous sample set or GT frame silently scores against the wrong GT.
     """
     cached = STATE['gt_cache'].get(path)
     if cached is not None:
         return cached
+    out = (load_gt_pkl(path) if path.endswith('.pkl')
+           else load_gt_json(path))
+    STATE['gt_cache'][path] = out
+    return out
+
+
+def load_gt_json(path):
+    """Parse carla_map_gt.json, as written by
+    CustomCarlaLocalMapDataset._format_gt()."""
     with open(path) as f:
         blob = json.load(f)
     out = {}
@@ -2628,24 +2672,84 @@ def load_gt_json(path):
                 continue
             vecs.append((pts[:, :2], int(v.get('type', 0))))
         out[entry.get('sample_token')] = vecs
-    STATE['gt_cache'][path] = out
     return out
 
 
-def discover_gt_json(work_dir=None):
-    """Where the eval GT might be, newest first.
+def load_gt_pkl(path):
+    """Build the same GT straight from the converter's annotation pkl.
 
-    _format_gt() writes it to the dataset's `map_ann_file`, which the CARLA
-    configs point at data/carla/carla_map_gt.json. A copy sometimes ends up
-    beside a results json, so look there too.
+    This reproduces _format_gt() rather than approximating it. That is
+    possible because the chain from pkl to GT json turns out to be almost
+    an identity:
+
+        gen_vectorized_samples() wraps each annotation array in a
+        LineString and keeps it if it has >= 2 points and its class maps to
+        a label other than -1; LiDARInstanceLines stores that list
+        untouched (`self.instance_list = instance_line_list`); and
+        _format_gt writes `np.array(list(gt_vec.coords))[:, :code_size]`.
+
+    So: no resampling, no clipping to pc_range, no reordering -- just the
+    pkl's own arrays, filtered by point count and class, truncated to 2D.
+    Verified by reproducing an existing carla_map_gt.json exactly (259
+    tiles, 1210 instances, every coordinate bit-identical).
+
+    Plain pickle + numpy: the pkl holds only dicts, strings and numpy
+    arrays, so this does NOT need mmcv or mmdet3d, which is what makes it
+    loadable on the host.
     """
-    cands = ['data/carla/carla_map_gt.json']
+    with open(path, 'rb') as f:
+        blob = pickle.load(f)
+    samples = blob.get('samples') if isinstance(blob, dict) else None
+    if samples is None:
+        raise ValueError(
+            f'{path} does not look like a CARLA annotation pkl (no '
+            f'"samples" key; found {list(blob)[:6] if isinstance(blob, dict) else type(blob).__name__})')
+    out = {}
+    for s in samples:
+        ann = s.get('annotation') or {}
+        vecs = []
+        for label, cls in enumerate(MAPCLASSES):
+            for inst in ann.get(cls, []):
+                pts = np.asarray(inst, dtype=np.float64)
+                # the <2-point filter is gen_vectorized_samples's own
+                if pts.ndim != 2 or pts.shape[0] < 2:
+                    continue
+                vecs.append((pts[:, :2], label))
+        out[s.get('sample_idx')] = vecs
+    return out
+
+
+def discover_gt(work_dir=None):
+    """Every usable eval GT, best first.
+
+    Annotation pkls come FIRST, deliberately. A freshly converted dataset
+    has no carla_map_gt.json at all -- that file only appears once an eval
+    or tools/test.py run has written it -- whereas the pkl is the
+    converter's own output and always exists. The pkl is also the safer of
+    the two when both are present: _format_gt() skips regeneration if the
+    json already exists, so a json left over from an earlier sample set or
+    GT frame silently scores against the wrong GT, while the pkl is
+    regenerated every time the converter runs.
+
+    Searched: data/carla (where the configs' ann_file / map_ann_file point),
+    and anything named like a GT under the work-dir.
+    """
+    cands = []
+    if osp.isdir('data/carla'):
+        cands.extend(osp.join('data/carla', fn)
+                      for fn in sorted(os.listdir('data/carla'))
+                      if fn.startswith('carla_map_infos')
+                      and fn.endswith('.pkl'))
+    cands.append('data/carla/carla_map_gt.json')
     for root in filter(None, [work_dir, osp.join('val', work_dir or '_')]):
         if not osp.isdir(root):
             continue
         for dirpath, _d, filenames in os.walk(root):
-            cands.extend(osp.join(dirpath, fn) for fn in filenames
-                          if fn.endswith('.json') and 'gt' in fn.lower())
+            for fn in filenames:
+                if fn.endswith('.pkl') and 'infos' in fn:
+                    cands.append(osp.join(dirpath, fn))
+                elif fn.endswith('.json') and 'gt' in fn.lower():
+                    cands.append(osp.join(dirpath, fn))
     seen, out = set(), []
     for c in cands:
         c = osp.abspath(c)
@@ -2653,6 +2757,30 @@ def discover_gt_json(work_dir=None):
             seen.add(c)
             out.append(c)
     return out
+
+
+def best_gt_for(results_path, gt_files):
+    """Pick the GT file that actually covers these predictions.
+
+    There is normally one annotation pkl per split, and nothing in a results
+    json says which split it came from. Defaulting to the first candidate
+    would happily score test predictions against the train pkl and report
+    every tile as missing GT, which reads like a broken tab rather than the
+    wrong dropdown entry. Token overlap settles it unambiguously: splits are
+    disjoint sets of tiles.
+    """
+    if len(gt_files) == 1:
+        return gt_files[0]
+    tokens = set(load_results(results_path))
+    best, best_n = gt_files[0], -1
+    for path in gt_files:
+        try:
+            n = len(tokens & set(load_gt(path)))
+        except Exception:  # noqa: BLE001 -- a broken candidate must not
+            continue      # take down the page; the others may be fine
+        if n > best_n:
+            best, best_n = path, n
+    return best
 
 
 def eval_tile(preds, gts):
@@ -2715,7 +2843,7 @@ def evaluate_run(results_path, gt_path):
         if REval['key'] == key:
             return REval['rows']
         preds_by_token = load_results(results_path)
-        gt_by_token = load_gt_json(gt_path)
+        gt_by_token = load_gt(gt_path)
         # A results json identifies a tile by bare `sample_idx`, which is
         # unique only WITHIN a dataset -- two grid exports both contain
         # tile_00000 (the reason the rest of this viewer keys by
@@ -3272,27 +3400,34 @@ NO_GT_NOTE = """
 <div class="note" style="background:{panel};border:1px solid {border};
      border-radius:6px;padding:1.2em;max-width:60em">
   <b style="color:{text}">No evaluation ground truth found.</b><br><br>
-  This tab scores predictions against <code>carla_map_gt.json</code> &mdash;
-  the dataset's own eval GT, written by
-  <code>CustomCarlaLocalMapDataset._format_gt()</code> to the config's
-  <code>map_ann_file</code> (<code>data/carla/carla_map_gt.json</code>). It is
-  used rather than the raw <code>reference_lines/*.json</code> on purpose:
-  it is already class-filtered and already in the tile-local frame, so the
-  numbers here are against exactly what the model was scored on.<br><br>
-  It appears as soon as any eval or <code>tools/test.py</code> run has
-  happened. Point at one explicitly with
-  <code>--gt-json &lt;path&gt;</code>.<br><br>
-  <b style="color:{text}">Note:</b> delete and regenerate it whenever the
-  sample set or GT frame changes &mdash; <code>_format_gt()</code> skips
-  regeneration if the file exists, so a stale file silently scores against
-  the wrong GT.
+  This tab scores predictions against either of two files, both of which
+  give identical GT:<br><br>
+  &bull; <code>data/carla/carla_map_infos_&lt;split&gt;.pkl</code> &mdash;
+  the converter's own output. <b style="color:{text}">Preferred</b>, because
+  it exists as soon as the dataset has been converted, and is regenerated
+  every time the converter runs.<br>
+  &bull; <code>data/carla/carla_map_gt.json</code> &mdash; written by
+  <code>_format_gt()</code> to the config's <code>map_ann_file</code>, but
+  only once an eval or <code>tools/test.py</code> run has happened, so a
+  freshly converted dataset does not have one yet.<br><br>
+  Neither was found. Point at one explicitly with
+  <code>--gt-json &lt;path&gt;</code> (it takes either format), or generate
+  the pkl:<br>
+  <code style="display:block;white-space:pre-wrap;margin-top:.4em">python3 tools/maptrv2/custom_carla_map_converter.py \\
+  --data-root &lt;path&gt; --out-dir data/carla/ --split &lt;split&gt;</code>
+  <br>
+  <b style="color:{text}">Note:</b> if you do use the json, delete and
+  regenerate it whenever the sample set or GT frame changes &mdash;
+  <code>_format_gt()</code> skips regeneration if the file exists, so a
+  stale one silently scores against the wrong GT. The pkl does not have
+  that failure mode.
 </div>
 """
 
 NO_PRED_NOTE = """
 <div class="note" style="background:{panel};border:1px solid {border};
      border-radius:6px;padding:1.2em;max-width:60em">
-  <b style="color:{text}">No predictions to score.</b><br><br>
+  <b style="color:{text}">{title}</b><br><br>
   {inner}
 </div>
 """
@@ -3353,7 +3488,7 @@ def results_summary_html(rows):
 def results_page():
     work_dir = STATE.get('work_dir')
     result_files = discover_results(work_dir) if work_dir else {}
-    gt_files = discover_gt_json(work_dir)
+    gt_files = discover_gt(work_dir)
     if STATE.get('gt_json'):
         gt_files = [STATE['gt_json']] + [g for g in gt_files
                                           if g != STATE['gt_json']]
@@ -3396,7 +3531,8 @@ def results_page():
                      f'which for a container run is usually not bind-mounted, '
                      f'so they were discarded.{howto}')
         return shell(NO_PRED_NOTE.format(panel=BG_PANEL, border=BORDER,
-                                          text=TEXT, inner=inner),
+                                          text=TEXT, inner=inner,
+                                          title='No predictions to score.'),
                       'no predictions found')
     if not gt_files:
         return shell(NO_GT_NOTE.format(panel=BG_PANEL, border=BORDER,
@@ -3405,9 +3541,9 @@ def results_page():
     results = request.args.get('results') or next(iter(result_files))
     if results not in result_files:
         results = next(iter(result_files))
-    gt = request.args.get('gt') or gt_files[0]
+    gt = request.args.get('gt')
     if gt not in gt_files:
-        gt = gt_files[0]
+        gt = best_gt_for(result_files[results], gt_files)
     sort_key = request.args.get('sort', 'ap')
     if sort_key not in RMETRICS:
         sort_key = 'ap'
@@ -3428,9 +3564,28 @@ def results_page():
 
     rows = evaluate_run(result_files[results], gt)
     if not rows:
-        return shell(NO_GT_NOTE.format(panel=BG_PANEL, border=BORDER,
-                                        text=TEXT),
-                      'predictions and GT share no tiles')
+        # Almost always a split mismatch (test predictions against the train
+        # pkl), not a missing file -- so say that, and say which candidate
+        # would have worked, rather than showing the how-to-generate-GT note.
+        best = best_gt_for(result_files[results], gt_files)
+        n_over = len(set(load_results(result_files[results]))
+                     & set(load_gt(best))) if best else 0
+        alt = (f'<code>{html.escape(osp.relpath(best))}</code> covers '
+               f'{n_over:,} of them &mdash; select it above.'
+               if best and best != gt and n_over else
+               'No other candidate covers them either, so the predictions '
+               'and this dataset are probably from different exports.')
+        return shell(
+            NO_PRED_NOTE.format(
+                panel=BG_PANEL, border=BORDER, text=TEXT,
+                title='This ground truth does not cover these predictions.',
+                inner=(f'<code>{html.escape(osp.relpath(gt))}</code> has no '
+                       f'ground truth for any of the '
+                       f'{len(load_results(result_files[results])):,} tiles '
+                       f'in these predictions. Splits are disjoint sets of '
+                       f'tiles, so this is normally the wrong split\'s '
+                       f'annotation file. {alt}')),
+            'predictions and GT share no tiles')
 
     have_deep = any(r.get('n_effective') is not None for r in rows)
     cachebust = f'{time.time():.6f}'
@@ -3586,7 +3741,7 @@ def res_png():
     gt = request.args.get('gt')
     # both reach us from a query string, so neither is trusted: results must
     # be one of the discovered labels and gt one of the discovered paths
-    if results not in result_files or gt not in discover_gt_json(work_dir) \
+    if results not in result_files or gt not in discover_gt(work_dir) \
             + ([STATE['gt_json']] if STATE.get('gt_json') else []):
         abort(404)
     group_by = request.args.get('group_by', 'town')
@@ -3678,14 +3833,16 @@ def parse_args():
                          'range -- NOT the old [-8, 15], which predates the '
                          'town03 overpass fix')
     # --- training-results tab ---
-    p.add_argument('--gt-json', default=None,
+    p.add_argument('--gt-json', '--gt', dest='gt_json', default=None,
+                    metavar='PATH',
                     help='the eval ground truth to score predictions '
-                         'against, i.e. the config\'s map_ann_file '
-                         '(default: look for data/carla/carla_map_gt.json '
-                         'and any *gt*.json under --work-dir). This is the '
-                         'dataset\'s own eval GT -- already class-filtered '
-                         'and in the tile-local frame -- so the numbers '
-                         'match what the model was actually scored on')
+                         'against. Takes EITHER a converter annotation pkl '
+                         '(carla_map_infos_<split>.pkl) or a _format_gt() '
+                         'json (carla_map_gt.json) -- they yield identical '
+                         'GT. Default: search data/carla and --work-dir, '
+                         'preferring a pkl, since a freshly converted '
+                         'dataset has no json yet and an existing json is '
+                         'never regenerated')
     p.add_argument('--num-pts-per-vec', type=int, default=20,
                     help='the model\'s fixed polyline resampling length, '
                          'marked on the vertices-per-polyline chart')
