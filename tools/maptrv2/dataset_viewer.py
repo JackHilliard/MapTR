@@ -82,7 +82,7 @@ to do) silently cropped the tile -- badly on the 30 m grid tiles, where
 that shift reaches 17 m, i.e. more than half the tile's own radius clipped
 off one side.
 
---- Two tabs ---
+--- Three tabs ---
 `?tab=browse` (the default) is the per-tile viewer described above.
 `?tab=stats` answers the other question -- what does the *dataset* look
 like -- in two tiers, because their costs differ by three orders of
@@ -113,6 +113,31 @@ that the converter subtracts `offset`); the per-class counts are what a
 decision to widen the divider-only taxonomy has to be made from; and the
 split overlay shows whether train and test are even the same distribution
 (they are different towns, so this is not rhetorical).
+
+`?tab=results` scores a training run's predictions per tile and asks what
+the failures have in common. Needs `--work-dir` (for a results json) and
+the eval GT (`data/carla/carla_map_gt.json`, or `--gt-json`).
+
+  * It reimplements the repo's chamfer matching in numpy, because this
+    viewer runs on the HOST: no torch, no mmdet3d, and neither shapely nor
+    scipy. Verified bit-exact against the real implementation -- identical
+    TP/FP vectors on all 259 test tiles, and an identical global mAP.
+  * The useful structural fact: mean_ap.eval_map() already calls
+    custom_tpfp_gen() once PER TILE, and only the AP aggregation is global.
+    So the per-tile TP/FP here IS the eval's; the only addition is running
+    the AP formula over one tile's detections.
+  * "Per-tile AP" is therefore a LOCAL score -- that tile's own ranking
+    against its own GT -- not its contribution to the global AP, which is
+    not a well-defined per-tile quantity (global ranking interleaves
+    detections from every tile). The global number is computed too, with
+    the real interleaved ranking, and shown in the header so it can be
+    checked against the training log's CarlaMap_chamfer/mAP.
+  * Tiles are ranked by any of a dozen metrics and sampled from the top,
+    middle and bottom 20% of that ranking. The sample is seeded, so it
+    survives a reload but re-rolls on demand; specific tiles can be pinned.
+  * The scatters mark tiles the statistics tab flags as suspect in the
+    status colour, which is what makes "are the bad tiles just the broken
+    ones?" answerable by looking.
 """
 import argparse
 import csv
@@ -517,7 +542,8 @@ def render_tile(*args, **kwargs):
 
 def _render_tile(name, mode, show_polylines,
                   point_size, max_points, log_density=True, ds=None,
-                  results_path=None, score_thresh=0.3, classes=None):
+                  results_path=None, score_thresh=0.3, classes=None,
+                  top_n=None):
     block = load_block(name, ds)
     if block is None:
         return None
@@ -647,6 +673,7 @@ def _render_tile(name, mode, show_polylines,
         # a class-free result set stays the original bright yellow.
         preds = load_results(results_path).get(name, [])
         pred_drawn = {}
+        kept = []
         for pts, score, cls in preds:
             if score < score_thresh:
                 continue
@@ -654,11 +681,29 @@ def _render_tile(name, mode, show_polylines,
             if classes is not None and cid is not None \
                     and class_key(cid) not in classes:
                 continue
+            kept.append((pts, score, cls, cid))
+        # Keep only the n highest-scoring predictions, if asked. An absolute
+        # score threshold cannot do this job on its own: the model emits a
+        # fixed num_vec predictions every time, and their calibration moves
+        # as training progresses (a 1-epoch checkpoint tops out around 0.17,
+        # so 0.3 hides everything while 0.1 draws all 50 and buries the GT).
+        # A count is stable across that; `top_n=len(GT)` in particular asks
+        # "the model's best few guesses, as many as there are real lines".
+        n_trimmed = 0
+        if top_n is not None and len(kept) > top_n:
+            kept.sort(key=lambda k: -k[1])
+            n_trimmed = len(kept) - top_n
+            kept = kept[:top_n]
+        for pts, score, cls, cid in kept:
             ax.plot(pts[:, 0], pts[:, 1],
                      color=class_color(cid, mode) if cid is not None else '#ffd60a',
                      linewidth=2.0, alpha=0.95, zorder=6, linestyle='--',
                      path_effects=outline)
             pred_drawn[(cid, cls)] = pred_drawn.get((cid, cls), 0) + 1
+        # The legend has to say what was hidden, or a trimmed view is
+        # indistinguishable from a model that only made a few predictions.
+        cut = (f', top {top_n} of {top_n + n_trimmed} by score'
+               if n_trimmed else '')
         if not pred_drawn:
             overlay_handles.append(
                 Line2D([], [], color='#ffd60a', linewidth=2.0, linestyle='--',
@@ -669,7 +714,8 @@ def _render_tile(name, mode, show_polylines,
                 Line2D([], [],
                         color=class_color(cid, mode) if cid is not None else '#ffd60a',
                         linewidth=2.0, linestyle='--',
-                        label=f'pred {cls} ({n} @ score≥{score_thresh:g})'))
+                        label=f'pred {cls} ({n} @ score≥{score_thresh:g}'
+                              f'{cut})'))
 
     if overlay_handles:
         # ax.legend() REPLACES any existing legend, so the label-mode class
@@ -770,7 +816,8 @@ STYLE_TMPL = """
 CSS = STYLE_TMPL.format(bg=BG, panel=BG_PANEL, border=BORDER, text=TEXT,
                         muted=TEXT_MUTED, accent=ACCENT)
 
-TABS = (('browse', 'Browse tiles'), ('stats', 'Dataset statistics'))
+TABS = (('browse', 'Browse tiles'), ('stats', 'Dataset statistics'),
+        ('results', 'Training results'))
 
 
 def nav_html(active):
@@ -925,6 +972,14 @@ def glob_pth(work_dir):
     return out
 
 
+def _safe_int(v, default=None):
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return default
+    return n if n > 0 else default
+
+
 def _safe_float(v, default):
     try:
         return float(v)
@@ -980,6 +1035,8 @@ def class_boxes_html(selected):
 def index():
     if request.args.get('tab') == 'stats':
         return stats_page()
+    if request.args.get('tab') == 'results':
+        return results_page()
     towns = list(STATE['groups'].keys())
     town = request.args.get('town', towns[0])
     if town not in STATE['groups']:
@@ -1135,6 +1192,7 @@ def tile_png():
         score_thresh=_safe_float(request.args.get('score_thresh'), 0.3),
         classes=(set(request.args.getlist('cls'))
                  if request.args.get('clsfilter') else None),
+        top_n=_safe_int(request.args.get('top_n')),
     )
     if buf is None:
         abort(404)
@@ -2382,6 +2440,1196 @@ def stats_csv():
     return resp
 
 
+# ----------------------------------------------------------- training results
+#
+# This tab answers "which tiles is the model bad at, and what do they have in
+# common?". That needs a PER-TILE quality score, which the repo's own eval
+# does not report -- it prints one dataset-wide mAP.
+#
+# The good news is that the split is natural: mean_ap.eval_map() calls
+# custom_tpfp_gen() once per tile and only the AP *aggregation* is global. So
+# every tile's TP/FP vector here is exactly the one the real eval computes;
+# the only thing this file adds is running the same AP formula over one
+# tile's detections instead of all of them.
+#
+# What "per-tile AP" therefore means, precisely: rank that tile's own
+# predictions by confidence, match them greedily against that tile's own GT,
+# and integrate the resulting PR curve against that tile's GT count. It is a
+# LOCAL score -- the tile's own AP, not its contribution to the global one,
+# which is not a well-defined per-tile quantity because global ranking
+# interleaves detections from every tile. The two agree on what a good tile
+# looks like, which is all this tab needs. The global number is computed too
+# (with the real interleaved ranking) and shown in the header, so it can be
+# checked against the training log's CarlaMap_chamfer/mAP.
+#
+# Reimplemented in numpy rather than imported because this viewer runs on the
+# HOST, outside the container: there is no torch, no mmdet3d, and neither
+# shapely nor scipy. Verified against the real implementation -- see
+# eval_matches()'s note on the buffer prefilter, and CLAUDE.md.
+
+# mean_ap.py's `thresholds` for metric='chamfer'.
+CHAMFER_THRESHOLDS = (0.5, 1.0, 1.5)
+# mean_ap.format_res_gt_by_classes()'s num_fixed_sample_pts: every GT line is
+# resampled to this many equally spaced points before matching. Predictions
+# are NOT resampled (eval_use_same_gt_sample_num_flag defaults False), so they
+# arrive at whatever fixed_ptsnum_per_pred_line the model emitted.
+GT_NUM_SAMPLE = 100
+# The threshold at which "correctly predicted polylines" is counted. 1.0 m is
+# the middle of the three, and the one whose AP tracks the mean most closely.
+TP_THRESHOLD = 1.0
+
+REval = {'key': None, 'rows': None}
+REVAL_LOCK = threading.Lock()
+
+
+def resample_line(pts, n=GT_NUM_SAMPLE):
+    """Resample a polyline to n equally spaced points along its arc length.
+
+    Equivalent to shapely's
+        [line.interpolate(d) for d in np.linspace(0, line.length, n)]
+    which is what get_cls_results() does to every GT line -- LineString
+    interpolation is linear between vertices, same as this.
+    """
+    pts = np.asarray(pts, dtype=np.float64)
+    seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    total = cum[-1]
+    if total <= 0:
+        # a degenerate all-identical-vertices line; shapely returns the same
+        # point n times here too
+        return np.repeat(pts[:1], n, axis=0)
+    want = np.linspace(0.0, total, n)
+    idx = np.clip(np.searchsorted(cum, want, side='right') - 1,
+                   0, len(seg) - 1)
+    frac = (want - cum[idx]) / np.maximum(seg[idx], 1e-12)
+    return pts[idx] + frac[:, None] * (pts[idx + 1] - pts[idx])
+
+
+def chamfer_score_matrix(preds, gts):
+    """(num_preds, num_gts) matrix of NEGATED symmetric chamfer distance.
+
+    Mirrors tpfp_chamfer.custom_polyline_score(metric='chamfer'):
+        ab = cdist(pred_pts, gt_pts).min(-1).mean()   # pred -> gt
+        ba = cdist(pred_pts, gt_pts).min(-2).mean()   # gt -> pred
+        score = -(ab + ba) / 2
+    Negated because the caller compares against -threshold, so "higher is
+    better" holds for both chamfer and iou.
+
+    The one deliberate difference: the real version prefilters pairs with an
+    STRtree, buffers each line by 2 m, and leaves non-intersecting pairs at
+    the sentinel -100; this computes every pair. That cannot change any
+    match. Two lines whose 2 m buffers do not intersect are more than 4 m
+    apart at every point, so both ab and ba exceed 4 and the score is below
+    -4 -- past even the loosest -1.5 threshold. Computing them outright just
+    avoids needing shapely on the host (and avoids gotcha #6, the shapely
+    2.0 STRtree API break, entirely).
+    """
+    n_p, n_g = len(preds), len(gts)
+    out = np.full((n_p, n_g), -100.0)
+    if not n_p or not n_g:
+        return out
+    gt_stack = np.asarray(gts, dtype=np.float64)          # (G, g, 2)
+    flat = gt_stack.reshape(-1, 2)                        # (G*g, 2)
+    g_pts = gt_stack.shape[1]
+    # One pred at a time: the full 4-D broadcast would be
+    # P*G*p*g floats, which on a dense tile is large enough to matter and
+    # buys nothing -- this is already vectorised over every GT.
+    for i, pred in enumerate(preds):
+        pred = np.asarray(pred, dtype=np.float64)
+        d = np.linalg.norm(pred[:, None, :] - flat[None, :, :], axis=-1)
+        d = d.reshape(pred.shape[0], n_g, g_pts)          # (p, G, g)
+        ab = d.min(axis=2).mean(axis=0)                   # (G,)
+        ba = d.min(axis=0).mean(axis=1)                   # (G,)
+        out[i] = -(ab + ba) / 2.0
+    return out
+
+
+def tpfp_from_matrix(matrix, scores, threshold):
+    """Per-tile TP/FP, mirroring tpfp.custom_tpfp_gen() line for line.
+
+    Greedy by descending confidence; each prediction takes its single
+    best-scoring GT (argmax over the row, chosen BEFORE any matching, exactly
+    as upstream does), and a GT already claimed by a higher-scoring
+    prediction turns the later one into a false positive rather than letting
+    it fall through to its second choice.
+    """
+    n_p, n_g = matrix.shape
+    tp = np.zeros(n_p, dtype=np.float64)
+    fp = np.zeros(n_p, dtype=np.float64)
+    if n_g == 0:
+        fp[...] = 1
+        return tp, fp, np.full(n_p, -1, dtype=int)
+    if n_p == 0:
+        return tp, fp, np.zeros(0, dtype=int)
+    thr = -abs(threshold)
+    row_max = matrix.max(axis=1)
+    row_argmax = matrix.argmax(axis=1)
+    matched = np.full(n_p, -1, dtype=int)
+    covered = np.zeros(n_g, dtype=bool)
+    for i in np.argsort(-scores):
+        if row_max[i] >= thr and not covered[row_argmax[i]]:
+            covered[row_argmax[i]] = True
+            tp[i] = 1
+            matched[i] = row_argmax[i]
+        else:
+            fp[i] = 1
+    return tp, fp, matched
+
+
+def average_precision(recalls, precisions):
+    """mean_ap.average_precision(mode='area'), for a single scale."""
+    mrec = np.concatenate([[0.0], recalls, [1.0]])
+    mpre = np.concatenate([[0.0], precisions, [0.0]])
+    for i in range(mpre.size - 1, 0, -1):
+        mpre[i - 1] = max(mpre[i - 1], mpre[i])
+    ind = np.where(mrec[1:] != mrec[:-1])[0]
+    return float(np.sum((mrec[ind + 1] - mrec[ind]) * mpre[ind + 1]))
+
+
+def ap_from_tpfp(tp, fp, scores, num_gts):
+    """Rank by score, accumulate, integrate. Used for both the per-tile AP
+    (one tile's detections) and the global one (every tile's, interleaved --
+    which is what eval_map does and what the training log reports)."""
+    if num_gts == 0:
+        # AP is undefined without GT: the recall denominator is zero. Upstream
+        # sidesteps this by only ever aggregating over the whole dataset.
+        return None
+    if len(tp) == 0:
+        return 0.0
+    order = np.argsort(-np.asarray(scores))
+    ctp = np.cumsum(np.asarray(tp)[order])
+    cfp = np.cumsum(np.asarray(fp)[order])
+    eps = np.finfo(np.float32).eps
+    return average_precision(ctp / max(num_gts, eps),
+                              ctp / np.maximum(ctp + cfp, eps))
+
+
+def load_gt_json(path):
+    """Parse carla_map_gt.json into {sample_token: [(pts, type)]}.
+
+    This is the dataset's OWN eval GT, written by
+    CustomCarlaLocalMapDataset._format_gt() -- already class-filtered and
+    already in the tile-local `offset` frame, i.e. the same frame as the
+    predictions. Deliberately not rebuilt from reference_lines/*.json here:
+    that would re-derive class filtering and resampling and could silently
+    disagree with what the model was actually scored against.
+    """
+    cached = STATE['gt_cache'].get(path)
+    if cached is not None:
+        return cached
+    with open(path) as f:
+        blob = json.load(f)
+    out = {}
+    for entry in blob.get('GTs', []):
+        vecs = []
+        for v in entry.get('vectors', []):
+            pts = np.asarray(v.get('pts', []), dtype=np.float64)
+            if pts.ndim != 2 or pts.shape[0] < 2:
+                continue
+            vecs.append((pts[:, :2], int(v.get('type', 0))))
+        out[entry.get('sample_token')] = vecs
+    STATE['gt_cache'][path] = out
+    return out
+
+
+def discover_gt_json(work_dir=None):
+    """Where the eval GT might be, newest first.
+
+    _format_gt() writes it to the dataset's `map_ann_file`, which the CARLA
+    configs point at data/carla/carla_map_gt.json. A copy sometimes ends up
+    beside a results json, so look there too.
+    """
+    cands = ['data/carla/carla_map_gt.json']
+    for root in filter(None, [work_dir, osp.join('val', work_dir or '_')]):
+        if not osp.isdir(root):
+            continue
+        for dirpath, _d, filenames in os.walk(root):
+            cands.extend(osp.join(dirpath, fn) for fn in filenames
+                          if fn.endswith('.json') and 'gt' in fn.lower())
+    seen, out = set(), []
+    for c in cands:
+        c = osp.abspath(c)
+        if c not in seen and osp.isfile(c):
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def eval_tile(preds, gts):
+    """Every per-tile number this tab can sort or plot by.
+
+    `preds` is [(pts, score, cls)] straight from load_results(); `gts` is
+    [(pts, type)] from load_gt_json(). Classes are not separated: the CARLA
+    taxonomy is divider-only, so class-conditional AP would be the same
+    number three times. If a real multi-class taxonomy lands, this is the
+    place that has to grow a per-class loop (mirroring eval_map's).
+    """
+    pred_pts = [p for p, _s, _c in preds]
+    scores = np.array([s for _p, s, _c in preds], dtype=np.float64)
+    gt_pts = [resample_line(g, GT_NUM_SAMPLE) for g, _t in gts]
+    n_gt, n_pred = len(gt_pts), len(pred_pts)
+
+    matrix = chamfer_score_matrix(pred_pts, gt_pts)
+    per_thr, tpfp = {}, {}
+    for thr in CHAMFER_THRESHOLDS:
+        tp, fp, matched = tpfp_from_matrix(matrix, scores, thr)
+        tpfp[thr] = (tp, fp, matched)
+        per_thr[thr] = ap_from_tpfp(tp, fp, scores, n_gt)
+
+    aps = [v for v in per_thr.values() if v is not None]
+    tp, fp, matched = tpfp[TP_THRESHOLD]
+    n_tp = int(tp.sum())
+    # Chamfer distance of the matched pairs -- how good the hits are, as
+    # opposed to how many there are. Sign flipped back to a real distance.
+    dists = [-matrix[i, m] for i, m in enumerate(matched) if m >= 0]
+
+    return {
+        'n_gt': n_gt, 'n_pred': n_pred, 'n_tp': n_tp,
+        'ap': float(np.mean(aps)) if aps else None,
+        'ap_thr': per_thr,
+        'recall': (n_tp / n_gt) if n_gt else None,
+        # Precision over ALL predictions, unthresholded, to stay consistent
+        # with AP -- which also integrates over every detection. The score
+        # threshold in this tab only ever affects what is DRAWN.
+        'precision': (n_tp / n_pred) if n_pred else None,
+        'chamfer': float(np.median(dists)) if dists else None,
+        # kept per threshold so global_ap() can pool them across tiles
+        'scores': scores,
+        'tp_thr': {t: (v[0], v[1]) for t, v in tpfp.items()},
+    }
+
+
+def eval_key(results_path, gt_path):
+    return (results_path, gt_path)
+
+
+def evaluate_run(results_path, gt_path):
+    """Per-tile metrics for one (results, GT) pair, cached in memory.
+
+    Serialised and cached because it is O(preds x gts x points) over every
+    tile -- fast (a few seconds for the 259-tile test split) but not
+    something to redo for each of a dozen images on one page load.
+    """
+    key = eval_key(results_path, gt_path)
+    with REVAL_LOCK:
+        if REval['key'] == key:
+            return REval['rows']
+        preds_by_token = load_results(results_path)
+        gt_by_token = load_gt_json(gt_path)
+        # A results json identifies a tile by bare `sample_idx`, which is
+        # unique only WITHIN a dataset -- two grid exports both contain
+        # tile_00000 (the reason the rest of this viewer keys by
+        # '<dataset>/<name>'). Nothing in the json says which export it came
+        # from, so an ambiguous name is resolved to the first match and
+        # counted, and the count is surfaced on the page rather than left to
+        # silently attach predictions to the wrong town's tile.
+        by_name = {}
+        for r in stat_rows():
+            by_name.setdefault(r['name'], []).append(r)
+        ambiguous = sum(1 for v in by_name.values() if len(v) > 1)
+
+        rows, missing_gt, missing_tile = [], 0, 0
+        t0 = time.time()
+        for token, preds in preds_by_token.items():
+            gts = gt_by_token.get(token)
+            if gts is None:
+                missing_gt += 1
+                continue
+            cands = by_name.get(token)
+            base = cands[0] if cands else None
+            if base is None:
+                # a results json from a different dataset than --data-root
+                missing_tile += 1
+                continue
+            m = eval_tile(preds, gts)
+            row = dict(base)
+            row.update(m)
+            row['token'] = token
+            d = row.get('deep') or {}
+            row['n_effective'] = d.get('n_effective')
+            rows.append(row)
+
+        glob = global_ap(rows)
+        REval.update(key=key, rows=rows, global_ap=glob, ambiguous=ambiguous,
+                      missing_gt=missing_gt, missing_tile=missing_tile,
+                      n_gt_total=sum(r['n_gt'] for r in rows),
+                      n_pred_total=sum(r['n_pred'] for r in rows),
+                      elapsed=time.time() - t0)
+        return rows
+
+
+def global_ap(rows):
+    """The real, interleaved-ranking AP -- every tile's detections pooled and
+    ranked together, exactly as eval_map does. Reported so this tab can be
+    checked against the training log rather than taken on faith."""
+    out = {}
+    n_gts = sum(r['n_gt'] for r in rows)
+    for thr in CHAMFER_THRESHOLDS:
+        tp = np.concatenate([r['tp_thr'][thr][0] for r in rows]) if rows \
+            else np.zeros(0)
+        fp = np.concatenate([r['tp_thr'][thr][1] for r in rows]) if rows \
+            else np.zeros(0)
+        sc = np.concatenate([r['scores'] for r in rows]) if rows \
+            else np.zeros(0)
+        out[thr] = ap_from_tpfp(tp, fp, sc, n_gts)
+    vals = [v for v in out.values() if v is not None]
+    out['mean'] = float(np.mean(vals)) if vals else None
+    return out
+
+
+# ---- what can be ranked, and what can be plotted against it ---------------
+#
+# `better` is what makes "Best / Median / Worst" meaningful for keys where
+# high is not good: chamfer distance is a distance, so its best tiles are its
+# smallest. Keys with better=None are descriptive (how big is this tile) and
+# are offered as sort keys anyway, because "show me the worst tiles by GT
+# count" is a legitimate thing to ask.
+RMETRICS = {
+    'ap': dict(label='AP (mean of 0.5/1.0/1.5 m)', fmt='{:.3f}',
+                better='high', axis='per-tile AP'),
+    'ap_0.5': dict(label='AP @ 0.5 m', fmt='{:.3f}', better='high',
+                    axis='per-tile AP @ 0.5 m'),
+    'ap_1.0': dict(label='AP @ 1.0 m', fmt='{:.3f}', better='high',
+                    axis='per-tile AP @ 1.0 m'),
+    'ap_1.5': dict(label='AP @ 1.5 m', fmt='{:.3f}', better='high',
+                    axis='per-tile AP @ 1.5 m'),
+    'n_tp': dict(label='correctly predicted polylines', fmt='{:.0f}',
+                  better='high', axis='correct polylines (TP @ 1.0 m)'),
+    'recall': dict(label='recall (TP / GT)', fmt='{:.3f}', better='high',
+                    axis='recall @ 1.0 m'),
+    'precision': dict(label='precision (TP / predictions)', fmt='{:.3f}',
+                       better='high', axis='precision @ 1.0 m'),
+    'chamfer': dict(label='median chamfer of matched pairs', fmt='{:.3f} m',
+                     better='low', axis='median matched chamfer (m)'),
+    'n_gt': dict(label='GT polylines', fmt='{:.0f}', better=None,
+                  axis='GT polylines'),
+    'n_pred': dict(label='predictions', fmt='{:.0f}', better=None,
+                    axis='predictions'),
+    'n_points': dict(label='raw points', fmt='{:,.0f}', better=None,
+                      axis='raw points'),
+    'density': dict(label='points / m²', fmt='{:,.1f}', better=None,
+                     axis='points / m²'),
+}
+
+# The two quality axes the scatters are drawn against. AP is the eval's own
+# summary; correct-polyline count is the one a human can check by eye against
+# a rendered tile, and unlike AP it does not collapse to 0 for a tile whose
+# single GT line was missed.
+RQUALITY = ('ap', 'n_tp')
+
+RX_VARS = {
+    'density': dict(label='points / m² of tile', log=True, deep=False,
+                     note='Sparse tiles are the ones with least evidence per '
+                          'metre of road. The comparable-across-exports '
+                          'version of raw point count.'),
+    'n_points': dict(label='raw points in tile', log=True, deep=False,
+                      note='Raw .npz count. The column at 5,000,000 is the '
+                           'export cap, and most of those tiles are '
+                           'degenerate -- see the effective-points version.'),
+    'n_gt': dict(label='GT polylines in tile', log=False, deep=False,
+                  note='Whether the model simply does worse where there is '
+                       'more map to get right. Also the denominator of '
+                       'recall, so a strong trend here can be an artefact of '
+                       'the metric rather than of the model.'),
+    'n_effective': dict(label='effective points (post grid-sampling)',
+                         log=True, deep=True,
+                         note='What the model actually sees, after '
+                              'GridSamplePoints. The honest version of '
+                              '"how much LiDAR did this tile have".'),
+}
+
+
+def r_metric(row, key):
+    """One metric off an evaluated row, or None where it is undefined."""
+    if key.startswith('ap_'):
+        return row['ap_thr'].get(float(key[3:]))
+    return row.get(key)
+
+
+def corr(x, y):
+    """(pearson, spearman, n) over the finite pairs.
+
+    Spearman is just Pearson on the ranks, which is worth having alongside:
+    these relationships are expected to be monotonic but not linear (AP is
+    bounded in [0,1] and point count spans three decades), and Pearson alone
+    would understate them.
+    """
+    x, y = np.asarray(x, dtype=np.float64), np.asarray(y, dtype=np.float64)
+    ok = np.isfinite(x) & np.isfinite(y)
+    x, y = x[ok], y[ok]
+    if len(x) < 3 or np.ptp(x) == 0 or np.ptp(y) == 0:
+        return None, None, len(x)
+    pear = float(np.corrcoef(x, y)[0, 1])
+    spear = float(np.corrcoef(rankdata(x), rankdata(y))[0, 1])
+    return pear, spear, len(x)
+
+
+def rankdata(a):
+    """Average-tie ranks -- scipy.stats.rankdata, which isn't available on
+    the host. Ties matter here: n_gt and n_tp are small integers with heavy
+    ties, and ordinal ranking would fabricate an ordering within them."""
+    a = np.asarray(a, dtype=np.float64)
+    order = np.argsort(a, kind='mergesort')
+    ranks = np.empty(len(a), dtype=np.float64)
+    ranks[order] = np.arange(1, len(a) + 1, dtype=np.float64)
+    srt = a[order]
+    i = 0
+    while i < len(srt):
+        j = i
+        while j + 1 < len(srt) and srt[j + 1] == srt[i]:
+            j += 1
+        if j > i:
+            ranks[order[i:j + 1]] = (i + j + 2) / 2.0
+        i = j + 1
+    return ranks
+
+
+def binned_median(x, y, nbins=10):
+    """Median y per x-quantile bin -- the trend line on the scatters.
+
+    Quantile bins rather than equal-width ones because every x here is
+    heavily skewed (point counts span three decades); equal-width bins would
+    put almost every tile in the first bin and draw a line through noise.
+    """
+    x, y = np.asarray(x, dtype=np.float64), np.asarray(y, dtype=np.float64)
+    ok = np.isfinite(x) & np.isfinite(y)
+    x, y = x[ok], y[ok]
+    if len(x) < 20:
+        return None, None
+    edges = np.unique(np.quantile(x, np.linspace(0, 1, nbins + 1)))
+    if len(edges) < 3:
+        return None, None
+    idx = np.clip(np.digitize(x, edges[1:-1]), 0, len(edges) - 2)
+    cx, cy = [], []
+    for b in range(len(edges) - 1):
+        sel = idx == b
+        if sel.sum() >= 3:
+            cx.append(float(np.median(x[sel])))
+            cy.append(float(np.median(y[sel])))
+    return (np.array(cx), np.array(cy)) if len(cx) >= 2 else (None, None)
+
+
+def coincident_counts(x, y):
+    """How many points share each (x, y), returned per point.
+
+    Exact equality is the right test: the axes where this matters
+    (GT count, TP count) are integers, and the continuous ones effectively
+    never collide, so this is a no-op there.
+    """
+    seen = {}
+    for xi, yi in zip(x, y):
+        seen[(xi, yi)] = seen.get((xi, yi), 0) + 1
+    return np.array([seen[(xi, yi)] for xi, yi in zip(x, y)],
+                     dtype=np.float64)
+
+
+def plot_scatter(rows, xkey, ykey):
+    """Quality against one tile property, one point per tile.
+
+    Emphasis rather than categorical colour: every tile is one muted hue,
+    and only the tiles the dataset-statistics tab already flags as suspect
+    are drawn in the status colour. That makes the question "are the bad
+    tiles the broken ones?" readable straight off the chart, which is the
+    whole reason this tab sits next to that one.
+    """
+    xs = RX_VARS[xkey]
+    ym = RMETRICS[ykey]
+    pts = [(r, r.get(xkey), r_metric(r, ykey)) for r in rows]
+    pts = [(r, x, y) for r, x, y in pts
+           if x is not None and y is not None and np.isfinite(x)
+           and np.isfinite(y) and (x > 0 or not xs['log'])]
+    if len(pts) < 3:
+        return None
+    x = np.array([p[1] for p in pts], dtype=np.float64)
+    y = np.array([p[2] for p in pts], dtype=np.float64)
+    flagged = np.array([bool(tile_flags(p[0])) for p in pts])
+
+    fig, ax = stat_fig(height=4.0, width=6.2)
+    # Marker AREA is proportional to how many tiles share that exact
+    # coordinate. Several of these axis pairs are small integers -- GT count
+    # against TP count is a lattice -- so a plain scatter drew 259 tiles as
+    # about 40 visible dots and hid its own distribution completely. Sizing
+    # by the coincident count is exact, unlike jitter, which would invent
+    # positions on an axis whose integer values are the whole point.
+    mult = coincident_counts(x, y)
+    sizes = 11.0 * mult
+    ax.scatter(x[~flagged], y[~flagged], s=sizes[~flagged], c=MUTED_MARK,
+                alpha=0.75, linewidths=0, zorder=3)
+    if flagged.any():
+        ax.scatter(x[flagged], y[flagged], s=sizes[flagged] * 1.4, c=CRITICAL,
+                    alpha=0.9, linewidths=0, zorder=4)
+    # Explicit fixed-size handles: the scatter's own would be drawn at
+    # whatever size the largest coincident stack happens to be, which turns
+    # the legend into a row of blobs and implies a meaning the swatch does
+    # not have.
+    handles = [Line2D([], [], marker='o', linestyle='', color=MUTED_MARK,
+                       markersize=4.5,
+                       label=f'tile ({int((~flagged).sum())})')]
+    if flagged.any():
+        handles.append(Line2D([], [], marker='o', linestyle='', color=CRITICAL,
+                               markersize=4.5,
+                               label=f'flagged by stats tab '
+                                     f'({int(flagged.sum())})'))
+    if mult.max() > 1:
+        handles.append(Line2D([], [], marker='o', linestyle='',
+                               color=MUTED_MARK, markersize=7.5,
+                               label=f'…{int(mult.max())} coincident tiles '
+                                     f'(area ∝ count)'))
+    bx, by = binned_median(x, y)
+    if bx is not None:
+        ax.plot(bx, by, color=ACCENT, linewidth=1.8, zorder=5,
+                 marker='o', markersize=3.2)
+        handles.append(Line2D([], [], color=ACCENT, linewidth=1.8, marker='o',
+                               markersize=3.2, label='median per decile'))
+    if xs['log']:
+        ax.set_xscale('log')
+    ax.set_ylabel(ym['axis'], color=TEXT_MUTED, fontsize=8)
+    pear, spear, n = corr(x, y)
+    stat = ('too few points' if pear is None else
+            f'Spearman ρ = {spear:+.2f}   Pearson r = {pear:+.2f}   n = {n:,}')
+    ax.set_title(f'{ym["axis"]} vs {xs["label"]}\n{stat}',
+                  color=TEXT, fontsize=9.5, loc='left', pad=9)
+    legend(ax, loc='best', handles=handles)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=110, facecolor=BG)
+    buf.seek(0)
+    return buf
+
+
+def plot_quality_by_group(rows, ykey, group_by):
+    """Per-tile quality distribution per town/split -- the check on whether a
+    single bad town is carrying the whole number."""
+    groups = group_rows(rows, group_by)
+    fig, ax = stat_fig(height=box_height(len(groups)))
+    ym = RMETRICS[ykey]
+    got = box_by_group(fig, ax, groups,
+                        lambda rs: [v for v in (r_metric(r, ykey) for r in rs)
+                                    if v is not None],
+                        fmt=ym['fmt'].replace(',', ''))
+    if got is None:
+        return None
+    return finish(fig, ax, f'{ym["axis"]}, by {group_by}', ym['axis'])
+
+
+def plot_pr_curve(rows):
+    """The GLOBAL precision-recall curve, one line per chamfer threshold.
+
+    Interleaved ranking across every tile -- i.e. the real eval, not the
+    per-tile approximation the rest of this tab sorts by. It is here as the
+    cross-check: the AP printed in its legend is directly comparable to the
+    training log's CarlaMap_chamfer/*_AP_thr_* entries.
+
+    Ordered scale (0.5 < 1.0 < 1.5 m), so it gets one hue in three steps
+    rather than three categorical colours.
+    """
+    n_gts = sum(r['n_gt'] for r in rows)
+    if not rows or not n_gts:
+        return None
+    # one hue in three steps, low->high threshold. The darkest step still has
+    # to clear the page background (#0d1117); a genuinely dark navy reads as
+    # an absent line here, which is why this ramp starts mid-hue rather than
+    # at the bottom of the scale.
+    shades = ['#1f6feb', ACCENT, '#a5d6ff']
+    fig, ax = stat_fig(height=4.0, width=6.2)
+    for i, thr in enumerate(CHAMFER_THRESHOLDS):
+        tp = np.concatenate([r['tp_thr'][thr][0] for r in rows])
+        fp = np.concatenate([r['tp_thr'][thr][1] for r in rows])
+        sc = np.concatenate([r['scores'] for r in rows])
+        order = np.argsort(-sc)
+        ctp, cfp = np.cumsum(tp[order]), np.cumsum(fp[order])
+        eps = np.finfo(np.float32).eps
+        rec = ctp / max(n_gts, eps)
+        prec = ctp / np.maximum(ctp + cfp, eps)
+        ap = ap_from_tpfp(tp, fp, sc, n_gts)
+        ax.plot(rec, prec, color=shades[i], linewidth=1.6,
+                 label=f'{thr:g} m — AP {ap:.4f}')
+    ax.set_xlim(0, max(0.05, ax.get_xlim()[1]))
+    ax.set_ylim(0, 1.02)
+    ax.set_ylabel('precision', color=TEXT_MUTED, fontsize=8)
+    legend(ax, loc='upper right')
+    return finish(fig, ax,
+                   'Global precision-recall (all tiles ranked together)',
+                   'recall', tight=True)
+
+
+def plot_quality_hist(rows, ykey):
+    """How per-tile quality is distributed. The mass at exactly zero is the
+    number this tab exists to explain: tiles where nothing was matched at
+    all."""
+    vals = [v for v in (r_metric(r, ykey) for r in rows) if v is not None]
+    if len(vals) < 3:
+        return None
+    ym = RMETRICS[ykey]
+    vals = np.asarray(vals, dtype=np.float64)
+    fig, ax = stat_fig(height=3.6, width=6.2)
+    n_zero = int((vals <= 0).sum())
+    ax.hist(vals, bins=30, color=BOX_HUE, alpha=0.85)
+    ax.set_ylabel('tiles', color=TEXT_MUTED, fontsize=8)
+    pct = 100.0 * n_zero / len(vals)
+    return finish(fig, ax,
+                   f'{ym["axis"]} across {len(vals):,} tiles — '
+                   f'{n_zero:,} at zero ({pct:.0f}%)',
+                   ym['axis'], tight=True)
+
+
+RPLOTS = {}
+for _yk in RQUALITY:
+    for _xk, _xs in RX_VARS.items():
+        RPLOTS[f'{_yk}__{_xk}'] = dict(
+            kind='scatter', x=_xk, y=_yk, deep=_xs['deep'],
+            note=_xs['note'])
+RPLOTS['pr'] = dict(kind='pr', deep=False,
+                     note='The cross-check on everything else here: this is '
+                          'the real interleaved-ranking eval, so its AP '
+                          'should match the training log.')
+for _yk in RQUALITY:
+    RPLOTS[f'hist__{_yk}'] = dict(kind='hist', y=_yk, deep=False,
+                                   note='')
+RPLOTS['bygroup'] = dict(kind='bygroup', deep=False,
+                          note='Whether one town is carrying the whole '
+                               'number. Train and test are different towns '
+                               'here, so this is not rhetorical.')
+
+
+def render_res(*args, **kwargs):
+    """Thread-safe wrapper -- same RENDER_LOCK as every other renderer."""
+    with RENDER_LOCK:
+        return _render_res(*args, **kwargs)
+
+
+def _render_res(kind, rows, group_by, ykey):
+    spec = RPLOTS[kind]
+    if spec['kind'] == 'scatter':
+        return plot_scatter(rows, spec['x'], spec['y'])
+    if spec['kind'] == 'pr':
+        return plot_pr_curve(rows)
+    if spec['kind'] == 'hist':
+        return plot_quality_hist(rows, spec['y'])
+    if spec['kind'] == 'bygroup':
+        return plot_quality_by_group(rows, ykey, group_by)
+    return None
+
+
+# ---- best / median / worst banding ---------------------------------------
+
+BANDS = (('best', 'Best'), ('median', 'Median'), ('worst', 'Worst'))
+BAND_FRAC = 0.2
+
+
+def rank_rows(rows, sort_key):
+    """Rows carrying a value for `sort_key`, best first."""
+    m = RMETRICS[sort_key]
+    scored = [(r, r_metric(r, sort_key)) for r in rows]
+    scored = [(r, v) for r, v in scored if v is not None]
+    reverse = m['better'] != 'low'
+    scored.sort(key=lambda rv: rv[1], reverse=reverse)
+    return [r for r, _v in scored]
+
+
+def band_rows(ranked, band):
+    """The candidate pool for one band.
+
+    Bands are the top/middle/bottom 20% of the ranking rather than single
+    extremes, so that "Best" is a sample of good tiles and not the same one
+    tile every time. With fewer than ~15 tiles the bands overlap; that is
+    fine and better than showing nothing.
+    """
+    n = len(ranked)
+    if not n:
+        return []
+    w = max(1, int(round(n * BAND_FRAC)))
+    if band == 'best':
+        return ranked[:w]
+    if band == 'worst':
+        return ranked[-w:]
+    mid = n // 2
+    lo = max(0, mid - w // 2)
+    return ranked[lo:lo + w]
+
+
+def pick_band(ranked, band, count, seed, pinned):
+    """Which tiles to actually render for a band.
+
+    Explicit picks win and keep their given order; the rest of the slots are
+    filled by a seeded random sample of the band, so the page is stable
+    across reloads (an unseeded sample would reshuffle every image request
+    and make the gallery disagree with its own captions) but re-rollable
+    with the Shuffle button.
+    """
+    pool = band_rows(ranked, band)
+    by_uid = {r['uid']: r for r in pool}
+    out = [by_uid[u] for u in pinned if u in by_uid]
+    rest = [r for r in pool if r['uid'] not in {r2['uid'] for r2 in out}]
+    need = max(0, count - len(out))
+    if need and rest:
+        # hashlib, not hash() -- str hashing is salted per process, so the
+        # built-in would reshuffle the gallery on every viewer restart
+        digest = hashlib.sha1(f'{seed}/{band}'.encode()).digest()
+        rng = np.random.default_rng(int.from_bytes(digest[:4], 'big'))
+        idx = rng.permutation(len(rest))[:need]
+        out.extend(rest[i] for i in sorted(idx))
+    return out[:count]
+
+
+# ---- the page ------------------------------------------------------------
+
+RESULTS_PAGE = """<!doctype html>
+<html><head>
+<title>CARLA training results</title>
+<style>{css}</style>
+</head><body>
+<h1>CARLA dataset viewer</h1>
+{nav}
+<div class="sub">{header}</div>
+
+{setup}
+</body></html>
+"""
+
+RESULTS_BODY = """
+<form method="get">
+  <input type="hidden" name="tab" value="results">
+  <fieldset>
+    <label class="top">Predictions</label>
+    <select name="results">{result_opts}</select>
+  </fieldset>
+  <fieldset>
+    <label class="top">Ground truth</label>
+    <select name="gt">{gt_opts}</select>
+  </fieldset>
+  <fieldset>
+    <label class="top">Rank tiles by</label>
+    <select name="sort">{sort_opts}</select>
+  </fieldset>
+  <fieldset>
+    <label class="top">Tiles per category</label>
+    <input type="number" name="count" value="{count}" min="1" max="12" step="1">
+  </fieldset>
+  <fieldset>
+    <label class="top">Group charts by</label>
+    <select name="group_by">{group_opts}</select>
+  </fieldset>
+  <fieldset>
+    <label class="top">Representation</label>
+    <select name="mode">{mode_opts}</select>
+  </fieldset>
+  <fieldset>
+    <label class="top">Draw preds with score &ge;</label>
+    <input type="number" name="score_thresh" value="{score_thresh}"
+           min="0" max="1" step="0.05">
+  </fieldset>
+  <fieldset>
+    <label class="top">Predictions drawn</label>
+    <select name="top_n">{topn_opts}</select>
+  </fieldset>
+  <input type="hidden" name="seed" value="{seed}">
+  <button type="submit">Apply</button>
+</form>
+
+<h2>Run summary</h2>
+{summary}
+
+<h2>What predicts prediction quality?</h2>
+<div class="note" style="margin-bottom:1em">One point per tile. The trend
+  line is the median per decile of the x axis, not a fit &mdash; these
+  relationships are monotonic at best, and a straight line through them
+  would imply more than the data supports. Tiles the
+  <a href="/?tab=stats">dataset-statistics</a> tab flags as suspect are drawn
+  in red, so a cluster of them at the bottom of a chart means the data, not
+  the model, is what is being measured there.</div>
+<div class="gallery">
+{gallery}
+</div>
+
+<h2>Tile browser &mdash; ranked by {sort_label}</h2>
+<div class="note" style="margin-bottom:1em">Each category samples the
+  top / middle / bottom {band_pct:.0f}% of the {n_ranked:,} ranked tiles.
+  The selection is random but seeded, so it survives a reload; use
+  <b>Shuffle</b> for a new draw, or pin specific tiles per category below.
+  GT is solid red, predictions dashed yellow.</div>
+{bands}
+"""
+
+BAND_BLOCK = """
+<h2 style="margin-top:1.6em">{title} &mdash; {label}</h2>
+<form method="get" style="margin-bottom:0.8em">
+{hidden}
+  <fieldset>
+    <label class="top">Pin tiles (ctrl-click for several, empty = random)</label>
+    <select name="pick_{band}" multiple size="6"
+            style="min-width:26em">{options}</select>
+  </fieldset>
+  <button type="submit">Show pinned</button>
+  <button type="submit" name="seed" value="{next_seed}" class="ghost">Shuffle</button>
+</form>
+<div class="gallery">
+{gallery}
+</div>
+"""
+
+NO_GT_NOTE = """
+<div class="note" style="background:{panel};border:1px solid {border};
+     border-radius:6px;padding:1.2em;max-width:60em">
+  <b style="color:{text}">No evaluation ground truth found.</b><br><br>
+  This tab scores predictions against <code>carla_map_gt.json</code> &mdash;
+  the dataset's own eval GT, written by
+  <code>CustomCarlaLocalMapDataset._format_gt()</code> to the config's
+  <code>map_ann_file</code> (<code>data/carla/carla_map_gt.json</code>). It is
+  used rather than the raw <code>reference_lines/*.json</code> on purpose:
+  it is already class-filtered and already in the tile-local frame, so the
+  numbers here are against exactly what the model was scored on.<br><br>
+  It appears as soon as any eval or <code>tools/test.py</code> run has
+  happened. Point at one explicitly with
+  <code>--gt-json &lt;path&gt;</code>.<br><br>
+  <b style="color:{text}">Note:</b> delete and regenerate it whenever the
+  sample set or GT frame changes &mdash; <code>_format_gt()</code> skips
+  regeneration if the file exists, so a stale file silently scores against
+  the wrong GT.
+</div>
+"""
+
+NO_PRED_NOTE = """
+<div class="note" style="background:{panel};border:1px solid {border};
+     border-radius:6px;padding:1.2em;max-width:60em">
+  <b style="color:{text}">No predictions to score.</b><br><br>
+  {inner}
+</div>
+"""
+
+
+def results_summary_html(rows):
+    """Headline numbers, including the global AP -- the one directly
+    comparable to the training log."""
+    g = REval.get('global_ap') or {}
+    n_gt = sum(r['n_gt'] for r in rows)
+    n_pred = sum(r['n_pred'] for r in rows)
+    n_tp = sum(r['n_tp'] for r in rows)
+    aps = [r['ap'] for r in rows if r['ap'] is not None]
+    zero = sum(1 for r in rows if r['ap'] == 0)
+
+    cells = [
+        ('tiles scored', f'{len(rows):,}'),
+        ('GT polylines', f'{n_gt:,}'),
+        ('predictions', f'{n_pred:,}'),
+        ('correct @ 1.0 m', f'{n_tp:,}'),
+        ('recall @ 1.0 m', f'{n_tp / n_gt:.3f}' if n_gt else '&mdash;'),
+        ('global mAP', f'{g.get("mean"):.4f}' if g.get('mean') is not None
+         else '&mdash;'),
+    ]
+    for thr in CHAMFER_THRESHOLDS:
+        v = g.get(thr)
+        cells.append((f'global AP @ {thr:g} m',
+                       f'{v:.4f}' if v is not None else '&mdash;'))
+    cells.append(('median per-tile AP',
+                   f'{np.median(aps):.4f}' if aps else '&mdash;'))
+    cells.append(('tiles at AP 0', f'{zero:,}'))
+
+    head = ''.join(f'<th>{k}</th>' for k, _v in cells)
+    body = ''.join(f'<td>{v}</td>' for _k, v in cells)
+    note = ('<div class="note">Global AP pools every tile\'s detections and '
+            'ranks them together &mdash; the real eval, directly comparable '
+            'to the training log\'s <code>CarlaMap_chamfer/*</code>. The '
+            'per-tile AP everything below sorts by is a <i>local</i> score '
+            '(one tile\'s own ranking against its own GT); the two answer '
+            'different questions and will not be equal.</div>')
+    miss = []
+    if REval.get('missing_gt'):
+        miss.append(f'{REval["missing_gt"]:,} predicted tiles had no GT entry')
+    if REval.get('missing_tile'):
+        miss.append(f'{REval["missing_tile"]:,} had no matching tile under '
+                     f'--data-root')
+    if REval.get('ambiguous'):
+        miss.append(f'{REval["ambiguous"]:,} tile names exist in more than '
+                     f'one loaded dataset and were resolved to the first '
+                     f'(restrict with --split to disambiguate)')
+    if miss:
+        note += (f'<div class="note" style="color:{CRITICAL}">Skipped: '
+                 + '; '.join(miss) + '.</div>')
+    return (f'<table class="stats"><thead><tr>{head}</tr></thead>'
+            f'<tbody><tr>{body}</tr></tbody></table>{note}')
+
+
+def results_page():
+    work_dir = STATE.get('work_dir')
+    result_files = discover_results(work_dir) if work_dir else {}
+    gt_files = discover_gt_json(work_dir)
+    if STATE.get('gt_json'):
+        gt_files = [STATE['gt_json']] + [g for g in gt_files
+                                          if g != STATE['gt_json']]
+
+    def shell(setup, header):
+        page = RESULTS_PAGE.format(css=CSS, nav=nav_html('results'),
+                                    header=header, setup=setup)
+        resp = make_response(page)
+        resp.headers['Cache-Control'] = ('no-store, no-cache, '
+                                          'must-revalidate, max-age=0')
+        return resp
+
+    if not result_files:
+        if not work_dir:
+            inner = ('Start the viewer with <code>--work-dir &lt;dir&gt;</code> '
+                     'to point it at a training run.')
+        else:
+            # Same situation the browse tab explains, but that version is
+            # wrapped in a <fieldset> for its filter form, so the shared
+            # part is the how-to rather than the markup.
+            ckpts = sorted(glob_pth(work_dir))
+            cfgs = sorted(f for f in os.listdir(work_dir)
+                           if f.endswith('.py')) if osp.isdir(work_dir) else []
+            if ckpts:
+                ckpt = next((c for c in ckpts
+                              if osp.basename(c) == 'latest.pth'), None) \
+                    or ckpts[-1]
+                cfg = (osp.join(work_dir, cfgs[0]) if cfgs else
+                       'projects/configs/maptrv2/'
+                       'maptrv2_carla_r50_24ep_lidar.py')
+                howto = HOWTO_WITH_CKPT.format(config=cfg, ckpt=ckpt,
+                                                work_dir=work_dir)
+            else:
+                howto = HOWTO_NO_CKPT
+            inner = (f'Nothing matching <code>*result*.json</code> under '
+                     f'<code>{html.escape(work_dir)}</code>. Training writes '
+                     f'only checkpoints and logs there; its eval hook writes '
+                     f'predictions to <code>val/&lt;work_dir&gt;/&lt;timestamp'
+                     f'&gt;/</code> relative to the CWD training ran from, '
+                     f'which for a container run is usually not bind-mounted, '
+                     f'so they were discarded.{howto}')
+        return shell(NO_PRED_NOTE.format(panel=BG_PANEL, border=BORDER,
+                                          text=TEXT, inner=inner),
+                      'no predictions found')
+    if not gt_files:
+        return shell(NO_GT_NOTE.format(panel=BG_PANEL, border=BORDER,
+                                        text=TEXT), 'no eval GT found')
+
+    results = request.args.get('results') or next(iter(result_files))
+    if results not in result_files:
+        results = next(iter(result_files))
+    gt = request.args.get('gt') or gt_files[0]
+    if gt not in gt_files:
+        gt = gt_files[0]
+    sort_key = request.args.get('sort', 'ap')
+    if sort_key not in RMETRICS:
+        sort_key = 'ap'
+    group_by = request.args.get('group_by', 'town')
+    if group_by not in ('town', 'split'):
+        group_by = 'town'
+    mode = request.args.get('mode', 'points')
+    count = max(1, min(12, int(request.args.get('count', 3) or 3)))
+    seed = request.args.get('seed', '0')
+    score_thresh = request.args.get('score_thresh', '0.1')
+    # 'gt' -- draw as many predictions as the tile has GT lines -- is the
+    # default because the model emits a fixed num_vec every time (50 here)
+    # and drawing all of them buries the GT under a haystack of
+    # near-zero-confidence guesses. See the top_n note in _render_tile.
+    top_n = request.args.get('top_n', 'gt')
+    if top_n not in ('gt', 'all') and _safe_int(top_n) is None:
+        top_n = 'gt'
+
+    rows = evaluate_run(result_files[results], gt)
+    if not rows:
+        return shell(NO_GT_NOTE.format(panel=BG_PANEL, border=BORDER,
+                                        text=TEXT),
+                      'predictions and GT share no tiles')
+
+    have_deep = any(r.get('n_effective') is not None for r in rows)
+    cachebust = f'{time.time():.6f}'
+    figs = []
+    for kind, spec in RPLOTS.items():
+        if spec['deep'] and not have_deep:
+            continue
+        params = [('plot', kind), ('results', results), ('gt', gt),
+                   ('group_by', group_by), ('sort', sort_key),
+                   ('v', cachebust)]
+        # urlencode + html.escape is REQUIRED, not cosmetic -- see the long
+        # comment in index() about "&gt" being resolved as an entity
+        q = html.escape('?' + urlencode(params), quote=True)
+        cap = spec['note']
+        figs.append(
+            f'<figure style="max-width:560px">'
+            f'<a href="/res.png{q}" target="_blank">'
+            f'<img src="/res.png{q}" style="width:540px"></a>'
+            f'<figcaption style="text-align:left;word-break:normal">'
+            f'{cap}</figcaption></figure>')
+    if not have_deep:
+        figs.append(
+            f'<figure style="max-width:560px;width:540px"><figcaption '
+            f'style="text-align:left;word-break:normal">Quality against '
+            f'<b>effective</b> point count &mdash; what survives grid '
+            f'sampling, as opposed to what the manifest claims &mdash; '
+            f'appears here once a <a href="/?tab=stats">deep scan</a> has '
+            f'run.</figcaption></figure>')
+
+    ranked = rank_rows(rows, sort_key)
+    hidden = ''.join(
+        f'<input type="hidden" name="{k}" value="{html.escape(str(v), True)}">'
+        for k, v in [('tab', 'results'), ('results', results), ('gt', gt),
+                      ('sort', sort_key), ('count', count), ('mode', mode),
+                      ('group_by', group_by), ('top_n', top_n),
+                      ('score_thresh', score_thresh), ('seed', seed)])
+    bands = []
+    for band, title in BANDS:
+        pinned = request.args.getlist(f'pick_{band}')
+        chosen = pick_band(ranked, band, count, seed, pinned)
+        pool = band_rows(ranked, band)
+        opts = []
+        for r in pool[:200]:
+            v = r_metric(r, sort_key)
+            sel = ' selected' if r['uid'] in pinned else ''
+            opts.append(
+                f'<option value="{html.escape(r["uid"], True)}"{sel}>'
+                f'{html.escape(r["name"])} — '
+                f'{RMETRICS[sort_key]["fmt"].format(v)}</option>')
+        if len(pool) > 200:
+            opts.append('<option disabled>… '
+                         f'{len(pool) - 200:,} more (band is larger than this '
+                         'list)</option>')
+        bands.append(BAND_BLOCK.format(
+            title=title, band=band, hidden=hidden.replace(
+                f'name="seed" value="{seed}"',
+                f'name="seed" value="{seed}"'),
+            label=band_label(band, pool, sort_key),
+            options='\n'.join(opts) or '<option disabled>no tiles</option>',
+            next_seed=str(int(seed) + 1 if seed.isdigit() else 1),
+            gallery=tile_gallery(chosen, mode, results, score_thresh,
+                                  sort_key, cachebust, top_n)))
+
+    body = RESULTS_BODY.format(
+        result_opts=_opts(list(result_files), results),
+        gt_opts=_opts(gt_files, gt, [osp.relpath(g) for g in gt_files]),
+        sort_opts=_opts(list(RMETRICS), sort_key,
+                         [RMETRICS[k]['label'] for k in RMETRICS]),
+        group_opts=_opts(['town', 'split'], group_by,
+                          ['town', 'split (train vs test)']),
+        mode_opts=_opts(['points', 'rgb', 'label', 'density', 'intensity'],
+                         mode, ['top-down (flat colour)', 'true RGB colour',
+                                'lane label', 'density heat map',
+                                'intensity']),
+        count=count, seed=seed, score_thresh=score_thresh,
+        topn_opts=_opts(['gt', '1', '3', '5', '10', '20', 'all'], top_n,
+                         ['as many as GT lines', 'top 1 by score', 'top 3',
+                          'top 5', 'top 10', 'top 20', 'all predictions']),
+        summary=results_summary_html(rows),
+        gallery='\n'.join(figs),
+        sort_label=RMETRICS[sort_key]['label'],
+        band_pct=100 * BAND_FRAC, n_ranked=len(ranked),
+        bands='\n'.join(bands))
+
+    header = (f'{html.escape(results)} scored against '
+              f'<code>{html.escape(osp.relpath(gt))}</code> &mdash; '
+              f'{len(rows):,} tiles in {REval.get("elapsed", 0):.1f}s')
+    return shell(body, header)
+
+
+def band_label(band, pool, sort_key):
+    if not pool:
+        return 'no tiles'
+    fmt = RMETRICS[sort_key]['fmt']
+    vals = [r_metric(r, sort_key) for r in pool]
+    vals = [v for v in vals if v is not None]
+    if not vals:
+        return f'{len(pool):,} tiles'
+    return (f'{len(pool):,} tiles, {RMETRICS[sort_key]["label"]} '
+            f'{fmt.format(min(vals))} to {fmt.format(max(vals))}')
+
+
+def tile_gallery(chosen, mode, results, score_thresh, sort_key, cachebust,
+                  top_n='all'):
+    """Renders through the existing /tile.png route, so these tiles look
+    exactly like the browse tab's and the GT/pred overlay logic lives in one
+    place."""
+    figs = []
+    for r in chosen:
+        params = [('name', r['name']), ('ds', r['ds']), ('mode', mode),
+                   ('polylines', '1'), ('results', results),
+                   ('score_thresh', score_thresh), ('point_size', '1.5'),
+                   ('v', cachebust)]
+        # 'gt' resolves per tile, which is the point of it
+        n = r['n_gt'] if top_n == 'gt' else _safe_int(top_n)
+        if n:
+            params.append(('top_n', str(n)))
+        q = html.escape('?' + urlencode(params), quote=True)
+        bits = []
+        for k in (sort_key, 'ap', 'n_tp', 'n_gt', 'n_pred'):
+            if k in bits:
+                continue
+            v = r_metric(r, k)
+            if v is None:
+                continue
+            bits.append(f'{RMETRICS[k]["label"].split(" (")[0]} '
+                         f'<b>{RMETRICS[k]["fmt"].format(v)}</b>')
+        flags = ' '.join(f'<span class="chip" style="color:{CHIP_COLORS[k]}">'
+                          f'{k}</span>' for k, _t in tile_flags(r))
+        browse = html.escape(
+            '/?' + urlencode([('town', r['group']), ('start', r['gidx']),
+                               ('count', 1), ('mode', mode),
+                               ('polylines', '1')]), quote=True)
+        figs.append(
+            f'<figure><a href="/tile.png{q}" target="_blank">'
+            f'<img src="/tile.png{q}"></a>'
+            f'<figcaption style="text-align:left">'
+            f'<a href="{browse}">{html.escape(r["name"])}</a><br>'
+            + ' &middot; '.join(bits[:4]) + (f'<br>{flags}' if flags else '')
+            + '</figcaption></figure>')
+    return '\n'.join(figs) or (f'<p style="color:{TEXT_MUTED}">'
+                                f'no tiles in this band</p>')
+
+
+@app.route('/res.png')
+def res_png():
+    kind = request.args.get('plot')
+    if kind not in RPLOTS:
+        abort(404)
+    work_dir = STATE.get('work_dir')
+    result_files = discover_results(work_dir) if work_dir else {}
+    results = request.args.get('results')
+    gt = request.args.get('gt')
+    # both reach us from a query string, so neither is trusted: results must
+    # be one of the discovered labels and gt one of the discovered paths
+    if results not in result_files or gt not in discover_gt_json(work_dir) \
+            + ([STATE['gt_json']] if STATE.get('gt_json') else []):
+        abort(404)
+    group_by = request.args.get('group_by', 'town')
+    if group_by not in ('town', 'split'):
+        group_by = 'town'
+    sort_key = request.args.get('sort', 'ap')
+    if sort_key not in RMETRICS:
+        sort_key = 'ap'
+    rows = evaluate_run(result_files[results], gt)
+    buf = render_res(kind, rows, group_by, sort_key)
+    if buf is None:
+        abort(404)
+    resp = send_file(buf, mimetype='image/png')
+    resp.headers['Cache-Control'] = ('no-store, no-cache, must-revalidate, '
+                                      'max-age=0')
+    return resp
+
+
+@app.route('/results.csv')
+def results_csv():
+    if REval.get('rows') is None:
+        abort(404)
+    rows = REval['rows']
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    keys = ['ap', 'ap_0.5', 'ap_1.0', 'ap_1.5', 'n_tp', 'recall',
+            'precision', 'chamfer', 'n_gt', 'n_pred']
+    w.writerow(['uid', 'name', 'dataset', 'split', 'town', 'n_points',
+                 'points_per_m2', 'n_effective'] + keys + ['flags'])
+    for r in rows:
+        w.writerow([r['uid'], r['name'], r['ds'], r['split'], r['town'],
+                     r['n_points'], f"{r['density']:.3f}",
+                     r.get('n_effective') if r.get('n_effective') is not None
+                     else '']
+                    + [('' if r_metric(r, k) is None
+                        else f'{r_metric(r, k):.6g}') for k in keys]
+                    + [' '.join(k for k, _v in tile_flags(r))])
+    resp = make_response(buf.getvalue())
+    resp.headers['Content-Type'] = 'text/csv; charset=utf-8'
+    resp.headers['Content-Disposition'] = 'attachment; filename=results.csv'
+    return resp
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--data-root', required=True)
@@ -2429,6 +3677,15 @@ def parse_args():
                          'maptrv2_carla_r50_24ep_lidar.py\'s current, widened '
                          'range -- NOT the old [-8, 15], which predates the '
                          'town03 overpass fix')
+    # --- training-results tab ---
+    p.add_argument('--gt-json', default=None,
+                    help='the eval ground truth to score predictions '
+                         'against, i.e. the config\'s map_ann_file '
+                         '(default: look for data/carla/carla_map_gt.json '
+                         'and any *gt*.json under --work-dir). This is the '
+                         'dataset\'s own eval GT -- already class-filtered '
+                         'and in the tile-local frame -- so the numbers '
+                         'match what the model was actually scored on')
     p.add_argument('--num-pts-per-vec', type=int, default=20,
                     help='the model\'s fixed polyline resampling length, '
                          'marked on the vertices-per-polyline chart')
@@ -2441,6 +3698,10 @@ def main():
     STATE['max_points'] = args.max_points
     STATE['work_dir'] = args.work_dir
     STATE['results_cache'] = {}
+    STATE['gt_cache'] = {}
+    STATE['gt_json'] = osp.abspath(args.gt_json) if args.gt_json else None
+    if STATE['gt_json'] and not osp.isfile(STATE['gt_json']):
+        raise SystemExit(f'--gt-json is not a file: {args.gt_json}')
     STATE['deep'] = {}
     # one value broadcasts to all three axes, like GridSamplePoints' own
     # scalar grid_size handling

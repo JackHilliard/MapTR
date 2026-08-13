@@ -474,7 +474,7 @@ theme. Two things worth keeping:
   more recorded iterations, per epoch.
 
 **`tools/maptrv2/dataset_viewer.py`** — standalone CARLA browser (flask /
-matplotlib / numpy, no torch or GPU). Two tabs:
+matplotlib / numpy, no torch or GPU). Three tabs:
 
 *`?tab=browse`* — per-tile views: true RGB (`features[:, 3:6]`), lane
 label, flat top-down, 1 m² density heat map, intensity; polylines
@@ -534,6 +534,80 @@ gotcha #13 crash doesn't originate in the data. `|tile_center − offset|`
 medians are 1.2-2.3 m per town — a direct measure of the old GT-frame
 bug's cost, but deliberately *not* a suspect flag, since it's a property
 of tile geometry (7.3 m median on the healthy 60 m grid export).
+
+### Training-results tab (2026-08-12)
+
+*`?tab=results`* — scores a run's predictions **per tile** and asks what the
+failures have in common. Needs `--work-dir` (for a `*result*.json`) plus the
+eval GT; `--gt-json` overrides the default search
+(`data/carla/carla_map_gt.json`, then any `*gt*.json` under the work-dir).
+
+**Why a per-tile score is even available.** `mean_ap.eval_map()` already
+calls `custom_tpfp_gen()` **once per tile** and only the AP *aggregation* is
+global. So the per-tile TP/FP vectors here are exactly the eval's; the only
+thing added is running the AP formula over one tile's detections. That makes
+"per-tile AP" a **local** score — that tile's own ranking against its own GT
+— and *not* its contribution to the global AP, which isn't a well-defined
+per-tile quantity (global ranking interleaves detections from every tile).
+The global AP is computed too, with the real interleaved ranking, and shown
+in the header specifically so it can be checked against the training log's
+`CarlaMap_chamfer/*`. **The two will not be equal — that's not a bug.**
+
+**The eval is reimplemented in numpy** (`chamfer_score_matrix`,
+`tpfp_from_matrix`, `average_precision`) because the viewer runs on the
+**host**: no torch, no mmdet3d, and neither shapely nor scipy is installed
+there. Two deliberate deviations, both verified inert:
+- GT resampling to 100 points uses arc-length interpolation instead of
+  shapely's `LineString.interpolate` — identical, since shapely interpolates
+  linearly between vertices.
+- The STRtree 2 m-buffer prefilter is dropped and every pred×GT pair is
+  scored. It cannot change a match: lines whose 2 m buffers miss are >4 m
+  apart everywhere, so chamfer <-4, past even the -1.5 threshold. This also
+  sidesteps gotcha #6 (shapely 2.0's STRtree break) entirely.
+
+**Verified bit-exact against the real implementation**, not just
+approximately: identical TP/FP vectors on **all 259** test tiles (0
+mismatches), identical global AP at every threshold (0.00003 / 0.00311 /
+0.02569, mAP 0.00961) and identical TP total (189) versus
+`custom_tpfp_gen`/`eval_map` run inside the container on the same files.
+Re-run that comparison if the matching is ever touched.
+
+Note the training log's epoch-1 mAP (0.01551) does **not** match this
+results json (0.00961) — different prediction sets, not a discrepancy in the
+maths. The log's came from the training-time eval hook; the json came from a
+separate `tools/test.py` pass.
+
+**`top_n` on the tile renderer** (new, also available to the browse tab).
+The model emits a fixed `num_vec` (50) predictions *every* time, so drawing
+all of them buries the GT under near-zero-confidence guesses. An absolute
+score threshold can't fix this because calibration moves during training (a
+1-epoch checkpoint tops out ~0.17, so 0.3 shows nothing and 0.1 shows all
+50). The results tab defaults to `top_n = the tile's own GT count` — "the
+model's best few guesses, as many as there are real lines" — and the legend
+always states what was hidden (`top 9 of 50 by score`).
+
+Sort/rank by any of a dozen metrics (AP, AP per threshold, TP count, recall,
+precision, median matched chamfer, GT/pred counts, points, density); tiles
+are sampled from the top/middle/bottom 20% bands. The sample is **seeded**
+(`hashlib`, not `hash()` — the built-in is salted per process and would
+reshuffle on every restart), so it survives a reload but re-rolls via
+Shuffle, and specific tiles can be pinned per band. `better='low'` inverts
+the banding for chamfer distance.
+
+Scatters use **marker area ∝ coincident tile count**: several axis pairs are
+small integers (GT count vs TP count is a lattice) and a plain scatter drew
+259 tiles as ~40 visible dots, hiding its own distribution. Sizing by the
+exact count beats jitter, which would invent positions on an axis whose
+integer values are the whole point. Tiles the stats tab flags as suspect are
+drawn in `CRITICAL`, so "are the bad tiles just the broken ones?" is
+answerable by looking. Correlations are reported as **both** Spearman and
+Pearson (`rankdata` is hand-rolled, average-tie — scipy isn't on the host,
+and ties are heavy in these small-integer columns).
+
+First real finding: at the 1-epoch checkpoint **nothing predicts quality** —
+density, raw points, effective points and GT count all sit at |ρ| ≤ 0.05.
+That is a statement about a barely-trained model, not about the data; re-run
+it on a converged checkpoint before drawing any conclusion.
 
 Charting conventions if extending the stats tab: distributions compared
 across groups are horizontal box plots in a **single** hue (six towns is at
