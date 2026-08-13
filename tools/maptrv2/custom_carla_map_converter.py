@@ -141,6 +141,18 @@ def parse_args():
         help='drop tiles with fewer than this many in-range LiDAR points; '
         '1 drops only genuinely zero-voxel tiles (default: 1)')
     parser.add_argument(
+        '--gt-frame',
+        type=str,
+        default='offset',
+        choices=['offset', 'tile_center'],
+        help="origin every tile's polylines AND point cloud are expressed "
+        "relative to. 'offset' (default) is the block's own `offset` array, "
+        'the frame the raw `features` are already stored in. `tile_center` '
+        "reproduces GeMap's convention: the tile's nominal geometric centre, "
+        'which requires the loader to shift the points by `offset - '
+        'tile_center` at load time (LoadCarlaPointsFromFile(recenter=True), '
+        'wired via the pkl\'s per-sample `lidar_recenter_shift`)')
+    parser.add_argument(
         '--no-lidar-check',
         action='store_true',
         help='skip the per-tile LiDAR scan entirely (faster, but no tile is '
@@ -289,7 +301,7 @@ def polyline_class_id(poly):
     return None
 
 
-def count_points_in_range(lidar_path, pc_range, z_max):
+def count_points_in_range(lidar_path, pc_range, z_max, shift=None):
     """Count a block's points that would survive the training pipeline.
 
     Mirrors what the model actually sees: ``LoadCarlaPointsFromFile``'s
@@ -306,6 +318,10 @@ def count_points_in_range(lidar_path, pc_range, z_max):
     n_raw = int(xyz.shape[0])
     if z_max is not None:
         xyz = xyz[xyz[:, 2] <= z_max]
+    if shift is not None:
+        # Applied after the z_max cut, matching LoadCarlaPointsFromFile's
+        # order: that filter is defined on the stored (offset-frame) z.
+        xyz = xyz + np.asarray(shift, dtype=np.float32)
     lo = np.asarray(pc_range[:3], dtype=np.float32)
     hi = np.asarray(pc_range[3:], dtype=np.float32)
     # `>= lo` / `< hi` mirrors hard_voxelize's own
@@ -323,7 +339,9 @@ def convert_carla_tiles(data_root,
                         pc_range=None,
                         z_max=DEFAULT_Z_MAX,
                         min_lidar_points=1,
-                        lidar_check=True):
+                        lidar_check=True,
+                        gt_frame='offset'):
+    assert gt_frame in ('offset', 'tile_center')
     tile_dir, manifest = load_manifest(data_root, split)
     tile_radius = manifest_tile_radius(manifest)
     keep_classes = resolve_classes(classes, manifest)
@@ -373,12 +391,31 @@ def convert_carla_tiles(data_root,
         # array when --no-lidar-check is off; that is the expensive part of
         # this loop, ~14ms for a 110K-point tile.)
         with np.load(lidar_path) as block:
-            origin = np.asarray(block['offset'], dtype=np.float32)
+            block_offset = np.asarray(block['offset'], dtype=np.float32)
+
+        # --gt-frame tile_center reproduces GeMap's convention: everything --
+        # polylines AND the point cloud -- is expressed relative to the tile's
+        # nominal geometric centre instead of the block's `offset`. The two
+        # differ by 1-2m on the 25m export and up to ~17m on the 60m grid one,
+        # so this is not a cosmetic relabelling: the stored `features` are in
+        # the offset frame, so the loader has to add `shift = offset - origin`
+        # to every point for GT and points to stay aligned. That shift is
+        # recorded per sample below and applied by
+        # LoadCarlaPointsFromFile(recenter=True).
+        if gt_frame == 'tile_center':
+            origin = np.asarray(tile['center'], dtype=np.float32)[:3]
+        else:
+            origin = block_offset
+        shift = (block_offset - origin).astype(np.float32)
 
         n_raw = n_in_range = None
         if lidar_check:
-            n_raw, n_in_range = count_points_in_range(lidar_path, pc_range,
-                                                      z_max)
+            # Counted in the *same* frame the model will see, i.e. after the
+            # recentring shift -- otherwise a tile_center run would measure a
+            # square range against a cloud displaced from it, which is exactly
+            # the coverage problem this frame choice is meant to remove.
+            n_raw, n_in_range = count_points_in_range(
+                lidar_path, pc_range, z_max, shift=shift)
             if n_in_range < min_lidar_points:
                 # This tile would voxelize to zero (or near-zero) voxels and
                 # crash extract_lidar_feat mid-run. Drop it before its
@@ -442,6 +479,15 @@ def convert_carla_tiles(data_root,
                 # recorded explicitly so the frame isn't ambiguous when
                 # reading the pkl back (tile_center above is NOT it)
                 annotation_origin=origin.tolist(),
+                # which of the two origins the one above is
+                gt_frame=gt_frame,
+                # the block's own frame, kept regardless of gt_frame so the
+                # shift can be re-derived or undone later
+                lidar_offset=block_offset.tolist(),
+                # `offset - annotation_origin`: what LoadCarlaPointsFromFile
+                # must add to the stored features to land in the GT frame.
+                # All-zero when gt_frame == 'offset'.
+                lidar_recenter_shift=shift.tolist(),
                 tile_bounds=tile.get('bounds'),
                 # None when --no-lidar-check was passed; the dataset treats
                 # a missing count as "unknown" and keeps the sample.
@@ -475,6 +521,7 @@ def convert_carla_tiles(data_root,
         tile_radius=tile_radius,
         tile_side=manifest.get('tile_side'),
         pc_range=list(pc_range),
+        gt_frame=gt_frame,
         class_lookup=manifest.get('class_lookup') or {},
         classes_kept=sorted(keep_classes) if keep_classes else None,
         n_out_of_bounds=len(out_of_bounds))
@@ -529,7 +576,8 @@ def main():
         pc_range=args.lidar_point_cloud_range,
         z_max=args.z_max,
         min_lidar_points=args.min_lidar_points,
-        lidar_check=lidar_check)
+        lidar_check=lidar_check,
+        gt_frame=args.gt_frame)
     # Derived from the manifest's tile size inside convert_carla_tiles when
     # not given on the CLI, so read it back rather than re-deriving it here.
     pc_range = meta['pc_range']
@@ -547,6 +595,9 @@ def main():
                 tile_dir=meta['tile_dir'],
                 tile_radius=meta['tile_radius'],
                 tile_side=meta['tile_side']),
+            # The origin every sample's annotation (and, via
+            # lidar_recenter_shift, its point cloud) is relative to.
+            gt_frame=meta['gt_frame'],
             class_lookup=meta['class_lookup'],
             classes_kept=meta['classes_kept'],
             # Records the geometry the per-sample counts were measured
