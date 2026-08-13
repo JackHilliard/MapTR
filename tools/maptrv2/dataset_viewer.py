@@ -155,6 +155,13 @@ says which split it came from.
   * Tiles are ranked by any of a dozen metrics and sampled from the top,
     middle and bottom 20% of that ranking. The sample is seeded, so it
     survives a reload but re-rolls on demand; specific tiles can be pinned.
+  * Polyline COUNT error (predicted - GT, signed) is tracked separately
+    from matched-instance count: "did it find the right number of lines"
+    and "did it put them in the right place" are different failures. It
+    only exists relative to a score threshold, because the head emits a
+    fixed num_vec every tile -- so the threshold is an eval parameter here,
+    and count_health() says so out loud when no threshold can separate
+    anything (which is exactly what an undertrained checkpoint looks like).
   * The scatters mark tiles the statistics tab flags as suspect in the
     status colour, which is what makes "are the bad tiles just the broken
     ones?" answerable by looking.
@@ -2783,14 +2790,20 @@ def best_gt_for(results_path, gt_files):
     return best
 
 
-def eval_tile(preds, gts):
+def eval_tile(preds, gts, score_thresh=0.0):
     """Every per-tile number this tab can sort or plot by.
 
     `preds` is [(pts, score, cls)] straight from load_results(); `gts` is
-    [(pts, type)] from load_gt_json(). Classes are not separated: the CARLA
+    [(pts, type)] from load_gt(). Classes are not separated: the CARLA
     taxonomy is divider-only, so class-conditional AP would be the same
     number three times. If a real multi-class taxonomy lands, this is the
     place that has to grow a per-class loop (mirroring eval_map's).
+
+    `score_thresh` affects ONLY the count metrics (n_pred_kept,
+    count_error). AP, TP and recall deliberately ignore it, because AP
+    integrates over every detection at every operating point -- applying a
+    threshold first would silently redefine the metric and stop it matching
+    the training log.
     """
     pred_pts = [p for p, _s, _c in preds]
     scores = np.array([s for _p, s, _c in preds], dtype=np.float64)
@@ -2811,8 +2824,20 @@ def eval_tile(preds, gts):
     # opposed to how many there are. Sign flipped back to a real distance.
     dists = [-matrix[i, m] for i, m in enumerate(matched) if m >= 0]
 
+    # How many polylines the model actually claims exist here. The raw
+    # count is useless on its own -- the head emits a fixed num_vec every
+    # time, so n_pred is the same constant for every tile -- which is why
+    # this is the thresholded count, and why count_error moves with the
+    # score threshold. See count_health() for the case where no threshold
+    # separates anything.
+    n_kept = int((scores >= score_thresh).sum())
+
     return {
         'n_gt': n_gt, 'n_pred': n_pred, 'n_tp': n_tp,
+        'n_pred_kept': n_kept,
+        # Signed, so over- and under-prediction stay distinguishable:
+        # 0 = exactly right, -1 = one too few, +1 = one too many.
+        'count_error': n_kept - n_gt,
         'ap': float(np.mean(aps)) if aps else None,
         'ap_thr': per_thr,
         'recall': (n_tp / n_gt) if n_gt else None,
@@ -2827,18 +2852,19 @@ def eval_tile(preds, gts):
     }
 
 
-def eval_key(results_path, gt_path):
-    return (results_path, gt_path)
+def eval_key(results_path, gt_path, score_thresh):
+    # score_thresh is part of the key because it changes count_error
+    return (results_path, gt_path, round(float(score_thresh), 6))
 
 
-def evaluate_run(results_path, gt_path):
+def evaluate_run(results_path, gt_path, score_thresh=0.0):
     """Per-tile metrics for one (results, GT) pair, cached in memory.
 
     Serialised and cached because it is O(preds x gts x points) over every
     tile -- fast (a few seconds for the 259-tile test split) but not
     something to redo for each of a dozen images on one page load.
     """
-    key = eval_key(results_path, gt_path)
+    key = eval_key(results_path, gt_path, score_thresh)
     with REVAL_LOCK:
         if REval['key'] == key:
             return REval['rows']
@@ -2869,7 +2895,7 @@ def evaluate_run(results_path, gt_path):
                 # a results json from a different dataset than --data-root
                 missing_tile += 1
                 continue
-            m = eval_tile(preds, gts)
+            m = eval_tile(preds, gts, score_thresh)
             row = dict(base)
             row.update(m)
             row['token'] = token
@@ -2921,8 +2947,17 @@ RMETRICS = {
                     axis='per-tile AP @ 1.0 m'),
     'ap_1.5': dict(label='AP @ 1.5 m', fmt='{:.3f}', better='high',
                     axis='per-tile AP @ 1.5 m'),
-    'n_tp': dict(label='correctly predicted polylines', fmt='{:.0f}',
-                  better='high', axis='correct polylines (TP @ 1.0 m)'),
+    # Renamed from "correctly predicted polylines", which read as "did it
+    # predict the right NUMBER" -- a different question, now answered by
+    # count_error below.
+    'n_tp': dict(label='matched polylines (TP @ 1.0 m)', fmt='{:.0f}',
+                  better='high', axis='matched polylines (TP @ 1.0 m)'),
+    'count_error': dict(
+        label='polyline count error (pred − GT)', fmt='{:+.0f}',
+        better='zero', axis='count error (predicted − GT)'),
+    'n_pred_kept': dict(label='predictions above score threshold',
+                         fmt='{:.0f}', better=None,
+                         axis='predictions ≥ score threshold'),
     'recall': dict(label='recall (TP / GT)', fmt='{:.3f}', better='high',
                     axis='recall @ 1.0 m'),
     'precision': dict(label='precision (TP / predictions)', fmt='{:.3f}',
@@ -2931,19 +2966,21 @@ RMETRICS = {
                      better='low', axis='median matched chamfer (m)'),
     'n_gt': dict(label='GT polylines', fmt='{:.0f}', better=None,
                   axis='GT polylines'),
-    'n_pred': dict(label='predictions', fmt='{:.0f}', better=None,
-                    axis='predictions'),
+    'n_pred': dict(label='predictions (raw, = num_vec)', fmt='{:.0f}',
+                    better=None, axis='raw predictions'),
     'n_points': dict(label='raw points', fmt='{:,.0f}', better=None,
                       axis='raw points'),
     'density': dict(label='points / m²', fmt='{:,.1f}', better=None,
                      axis='points / m²'),
 }
 
-# The two quality axes the scatters are drawn against. AP is the eval's own
-# summary; correct-polyline count is the one a human can check by eye against
-# a rendered tile, and unlike AP it does not collapse to 0 for a tile whose
-# single GT line was missed.
-RQUALITY = ('ap', 'n_tp')
+# The quality axes the scatters are drawn against. AP is the eval's own
+# summary; matched-polyline count is the one a human can check by eye
+# against a rendered tile, and unlike AP it does not collapse to 0 for a
+# tile whose single GT line was missed; count error asks the separate
+# question of whether the model even knows HOW MANY lines are present,
+# independently of where it puts them.
+RQUALITY = ('ap', 'n_tp', 'count_error')
 
 RX_VARS = {
     'density': dict(label='points / m² of tile', log=True, deep=False,
@@ -2964,6 +3001,13 @@ RX_VARS = {
                          note='What the model actually sees, after '
                               'GridSamplePoints. The honest version of '
                               '"how much LiDAR did this tile have".'),
+    'count_error': dict(label='polyline count error (predicted − GT)',
+                         log=False, deep=False,
+                         note='Does getting the NUMBER of polylines right '
+                              'go with getting them in the right place? A '
+                              'peak at count error 0 would say the two go '
+                              'together; a flat line says the count is '
+                              'independent of placement quality.'),
 }
 
 
@@ -3111,12 +3155,69 @@ def plot_scatter(rows, xkey, ykey):
                                markersize=3.2, label='median per decile'))
     if xs['log']:
         ax.set_xscale('log')
+    # A signed error has a meaningful origin, so mark it -- "is the cloud
+    # centred on zero?" is the whole question for count error, and without
+    # the rule the eye has no reference to judge it against.
+    if RMETRICS.get(xkey, {}).get('better') == 'zero':
+        ax.axvline(0, color=TEXT_MUTED, linewidth=0.9, alpha=0.9, zorder=2)
+    if ym['better'] == 'zero':
+        ax.axhline(0, color=TEXT_MUTED, linewidth=0.9, alpha=0.9, zorder=2)
     ax.set_ylabel(ym['axis'], color=TEXT_MUTED, fontsize=8)
     pear, spear, n = corr(x, y)
     stat = ('too few points' if pear is None else
             f'Spearman ρ = {spear:+.2f}   Pearson r = {pear:+.2f}   n = {n:,}')
     ax.set_title(f'{ym["axis"]} vs {xs["label"]}\n{stat}',
                   color=TEXT, fontsize=9.5, loc='left', pad=9)
+    legend(ax, loc='best', handles=handles)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=110, facecolor=BG)
+    buf.seek(0)
+    return buf
+
+
+def plot_counts(rows):
+    """Predicted polyline count against GT count, with the identity line.
+
+    The honest counterpart to count_error-vs-GT-count: neither axis is
+    defined in terms of the other, so the correlation here is a real one.
+    Distance from the diagonal IS the count error, read vertically.
+    """
+    x = np.array([r['n_gt'] for r in rows], dtype=np.float64)
+    y = np.array([r['n_pred_kept'] for r in rows], dtype=np.float64)
+    if len(x) < 3:
+        return None
+    fig, ax = stat_fig(height=4.0, width=6.2)
+    mult = coincident_counts(x, y)
+    ax.scatter(x, y, s=11.0 * mult, c=MUTED_MARK, alpha=0.75, linewidths=0,
+                zorder=3)
+    hi = max(x.max(), y.max())
+    ax.plot([0, hi], [0, hi], color=ACCENT, linewidth=1.3, linestyle='--',
+             zorder=4)
+    bx, by = binned_median(x, y)
+    handles = [Line2D([], [], marker='o', linestyle='', color=MUTED_MARK,
+                       markersize=4.5, label=f'tile ({len(x):,})'),
+               Line2D([], [], color=ACCENT, linewidth=1.3, linestyle='--',
+                       label='exactly right (y = x)')]
+    if mult.max() > 1:
+        handles.insert(1, Line2D([], [], marker='o', linestyle='',
+                                  color=MUTED_MARK, markersize=7.5,
+                                  label=f'…{int(mult.max())} coincident '
+                                        f'tiles (area ∝ count)'))
+    if bx is not None:
+        ax.plot(bx, by, color='#f0883e', linewidth=1.8, marker='o',
+                 markersize=3.2, zorder=5)
+        handles.append(Line2D([], [], color='#f0883e', linewidth=1.8,
+                               marker='o', markersize=3.2,
+                               label='median per decile'))
+    exact = int((x == y).sum())
+    pear, spear, n = corr(x, y)
+    stat = ('too few points' if pear is None else
+            f'Spearman ρ = {spear:+.2f}   Pearson r = {pear:+.2f}   n = {n:,}')
+    ax.set_ylabel('predictions ≥ score threshold', color=TEXT_MUTED,
+                   fontsize=8)
+    ax.set_title(f'Predicted vs GT polyline count — {exact:,} exactly right\n'
+                  f'{stat}', color=TEXT, fontsize=9.5, loc='left', pad=9)
     legend(ax, loc='best', handles=handles)
     fig.tight_layout()
     buf = io.BytesIO()
@@ -3191,22 +3292,56 @@ def plot_quality_hist(rows, ykey):
     ym = RMETRICS[ykey]
     vals = np.asarray(vals, dtype=np.float64)
     fig, ax = stat_fig(height=3.6, width=6.2)
-    n_zero = int((vals <= 0).sum())
-    ax.hist(vals, bins=30, color=BOX_HUE, alpha=0.85)
+    if ym['better'] == 'zero':
+        # Integer counts: one bin per value, edges offset by a half so each
+        # bar is centred on its own integer. Shared bin edges would smear
+        # "exactly right" together with "one too many".
+        lo, hi = int(np.floor(vals.min())), int(np.ceil(vals.max()))
+        bins = np.arange(lo - 0.5, hi + 1.5, 1.0) if hi - lo <= 60 else 30
+        n_zero = int((vals == 0).sum())
+        label = 'exactly right'
+    else:
+        bins = 30
+        n_zero = int((vals <= 0).sum())
+        label = 'at zero'
+    ax.hist(vals, bins=bins, color=BOX_HUE, alpha=0.85)
+    if ym['better'] == 'zero':
+        ax.axvline(0, color=TEXT_MUTED, linewidth=0.9, alpha=0.9, zorder=4)
     ax.set_ylabel('tiles', color=TEXT_MUTED, fontsize=8)
     pct = 100.0 * n_zero / len(vals)
     return finish(fig, ax,
                    f'{ym["axis"]} across {len(vals):,} tiles — '
-                   f'{n_zero:,} at zero ({pct:.0f}%)',
+                   f'{n_zero:,} {label} ({pct:.0f}%)',
                    ym['axis'], tight=True)
 
 
 RPLOTS = {}
 for _yk in RQUALITY:
     for _xk, _xs in RX_VARS.items():
+        if _xk == _yk:
+            continue  # a metric against itself is a diagonal line
+        _note = _xs['note']
+        if {_xk, _yk} == {'n_gt', 'count_error'}:
+            # count_error is DEFINED as n_pred_kept - n_gt, so plotting it
+            # against n_gt has -n_gt on both axes and is negatively
+            # correlated by construction: if the kept count were constant,
+            # this would read exactly -1.00 while telling you nothing.
+            _note = (
+                'Careful: <b>partly circular</b>. count_error is defined as '
+                '(predicted &minus; GT), so it contains &minus;GT and this '
+                'correlation is negative by construction &mdash; a constant '
+                'predicted count alone would produce &rho; = &minus;1. Read '
+                'the predicted-vs-GT chart instead, where the diagonal is '
+                'the honest reference.')
         RPLOTS[f'{_yk}__{_xk}'] = dict(
-            kind='scatter', x=_xk, y=_yk, deep=_xs['deep'],
-            note=_xs['note'])
+            kind='scatter', x=_xk, y=_yk, deep=_xs['deep'], note=_note)
+RPLOTS['counts'] = dict(
+    kind='counts', deep=False,
+    note='Does the model know how many polylines a tile has? Points on the '
+         'diagonal got the count exactly right; below it under-predicts, '
+         'above it over-predicts. This is the non-circular version of count '
+         'error against GT count -- neither axis is defined in terms of the '
+         'other.')
 RPLOTS['pr'] = dict(kind='pr', deep=False,
                      note='The cross-check on everything else here: this is '
                           'the real interleaved-ranking eval, so its AP '
@@ -3230,6 +3365,8 @@ def _render_res(kind, rows, group_by, ykey):
     spec = RPLOTS[kind]
     if spec['kind'] == 'scatter':
         return plot_scatter(rows, spec['x'], spec['y'])
+    if spec['kind'] == 'counts':
+        return plot_counts(rows)
     if spec['kind'] == 'pr':
         return plot_pr_curve(rows)
     if spec['kind'] == 'hist':
@@ -3250,8 +3387,13 @@ def rank_rows(rows, sort_key):
     m = RMETRICS[sort_key]
     scored = [(r, r_metric(r, sort_key)) for r in rows]
     scored = [(r, v) for r, v in scored if v is not None]
-    reverse = m['better'] != 'low'
-    scored.sort(key=lambda rv: rv[1], reverse=reverse)
+    if m['better'] == 'zero':
+        # A signed error: best is nearest zero in either direction, worst is
+        # furthest. Sorting by the raw value would instead rank "20 too few"
+        # as the best tile on the page.
+        scored.sort(key=lambda rv: abs(rv[1]))
+    else:
+        scored.sort(key=lambda rv: rv[1], reverse=m['better'] != 'low')
     return [r for r, _v in scored]
 
 
@@ -3343,9 +3485,9 @@ RESULTS_BODY = """
     <select name="mode">{mode_opts}</select>
   </fieldset>
   <fieldset>
-    <label class="top">Draw preds with score &ge;</label>
+    <label class="top">Prediction counts&colon; score &ge;</label>
     <input type="number" name="score_thresh" value="{score_thresh}"
-           min="0" max="1" step="0.05">
+           min="0" max="1" step="0.01">
   </fieldset>
   <fieldset>
     <label class="top">Predictions drawn</label>
@@ -3459,6 +3601,11 @@ def results_summary_html(rows):
     cells.append(('median per-tile AP',
                    f'{np.median(aps):.4f}' if aps else '&mdash;'))
     cells.append(('tiles at AP 0', f'{zero:,}'))
+    errs = np.array([r['count_error'] for r in rows], dtype=np.float64)
+    exact = int((errs == 0).sum())
+    cells.append(('count exactly right',
+                   f'{exact:,} ({100.0 * exact / len(rows):.0f}%)'))
+    cells.append(('median count error', f'{np.median(errs):+.0f}'))
 
     head = ''.join(f'<th>{k}</th>' for k, _v in cells)
     body = ''.join(f'<td>{v}</td>' for _k, v in cells)
@@ -3481,8 +3628,65 @@ def results_summary_html(rows):
     if miss:
         note += (f'<div class="note" style="color:{CRITICAL}">Skipped: '
                  + '; '.join(miss) + '.</div>')
+    note += count_health(rows)
     return (f'<table class="stats"><thead><tr>{head}</tr></thead>'
             f'<tbody><tr>{body}</tr></tbody></table>{note}')
+
+
+def count_health(rows):
+    """Warn when the count metrics cannot mean anything at this threshold.
+
+    The detection head emits a fixed `num_vec` predictions for EVERY tile,
+    so the raw count carries no information and count_error is only as
+    meaningful as the score threshold that trims it. Two ways that fails,
+    both silent without this check:
+
+      * the threshold keeps all (or none) of the predictions on nearly
+        every tile, so count_error is just a constant minus n_gt;
+      * the scores barely differ across the whole run, in which case NO
+        threshold separates anything. That is what an undertrained
+        checkpoint looks like -- confidences collapse to almost one value
+        -- and it is a fact about the run, not about the tiles.
+
+    Reported rather than worked around: silently substituting some other
+    definition of "how many polylines" would make the number look
+    informative when it is not.
+    """
+    if not rows:
+        return ''
+    n_raw = np.array([r['n_pred'] for r in rows], dtype=np.float64)
+    n_kept = np.array([r['n_pred_kept'] for r in rows], dtype=np.float64)
+    scores = np.concatenate([r['scores'] for r in rows
+                              if len(r['scores'])]) if rows else np.zeros(0)
+    all_kept = float((n_kept == n_raw).mean())
+    none_kept = float((n_kept == 0).mean())
+    msgs = []
+    if all_kept > 0.95:
+        msgs.append(
+            f'the score threshold keeps <b>every</b> prediction on '
+            f'{all_kept * 100:.0f}% of tiles, so the count is the head\'s '
+            f'fixed num_vec and the count error is just that constant minus '
+            f'the GT count')
+    elif none_kept > 0.95:
+        msgs.append(
+            f'the score threshold discards <b>every</b> prediction on '
+            f'{none_kept * 100:.0f}% of tiles, so the count error is just '
+            f'&minus;(GT count)')
+    if len(scores) > 1:
+        spread = float(scores.max() - scores.min())
+        if spread < 0.05:
+            msgs.append(
+                f'every confidence in this run lies between '
+                f'{scores.min():.4f} and {scores.max():.4f} (a spread of '
+                f'{spread:.4f}), so <b>no</b> threshold separates confident '
+                f'predictions from unconfident ones &mdash; a sign of an '
+                f'undertrained checkpoint rather than of the data')
+    if not msgs:
+        return ''
+    return (f'<div class="note" style="color:{CRITICAL};max-width:60em">'
+            f'<b>Count metrics are not informative here:</b> '
+            + '; and '.join(msgs) + '. The AP, TP and recall columns are '
+            'unaffected &mdash; they ignore the threshold entirely.</div>')
 
 
 def results_page():
@@ -3562,7 +3766,8 @@ def results_page():
     if top_n not in ('gt', 'all') and _safe_int(top_n) is None:
         top_n = 'gt'
 
-    rows = evaluate_run(result_files[results], gt)
+    rows = evaluate_run(result_files[results], gt,
+                         _safe_float(score_thresh, 0.0))
     if not rows:
         # Almost always a split mismatch (test predictions against the train
         # pkl), not a missing file -- so say that, and say which candidate
@@ -3595,7 +3800,7 @@ def results_page():
             continue
         params = [('plot', kind), ('results', results), ('gt', gt),
                    ('group_by', group_by), ('sort', sort_key),
-                   ('v', cachebust)]
+                   ('score_thresh', score_thresh), ('v', cachebust)]
         # urlencode + html.escape is REQUIRED, not cosmetic -- see the long
         # comment in index() about "&gt" being resolved as an entity
         q = html.escape('?' + urlencode(params), quote=True)
@@ -3750,7 +3955,8 @@ def res_png():
     sort_key = request.args.get('sort', 'ap')
     if sort_key not in RMETRICS:
         sort_key = 'ap'
-    rows = evaluate_run(result_files[results], gt)
+    rows = evaluate_run(result_files[results], gt,
+                         _safe_float(request.args.get('score_thresh'), 0.0))
     buf = render_res(kind, rows, group_by, sort_key)
     if buf is None:
         abort(404)
@@ -3768,7 +3974,8 @@ def results_csv():
     buf = io.StringIO()
     w = csv.writer(buf)
     keys = ['ap', 'ap_0.5', 'ap_1.0', 'ap_1.5', 'n_tp', 'recall',
-            'precision', 'chamfer', 'n_gt', 'n_pred']
+            'precision', 'chamfer', 'n_gt', 'n_pred', 'n_pred_kept',
+            'count_error']
     w.writerow(['uid', 'name', 'dataset', 'split', 'town', 'n_points',
                  'points_per_m2', 'n_effective'] + keys + ['flags'])
     for r in rows:

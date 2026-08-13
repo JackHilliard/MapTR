@@ -624,6 +624,41 @@ reshuffle on every restart), so it survives a reload but re-rolls via
 Shuffle, and specific tiles can be pinned per band. `better='low'` inverts
 the banding for chamfer distance.
 
+**Polyline count error = `n_pred_kept − n_gt`**, signed (0 = exactly right,
+−1 = one too few, +1 = one too many), sorted by *distance from zero* so
+"Best" means closest to correct in either direction (`better='zero'` in
+`RMETRICS`, handled explicitly in `rank_rows`). Distinct from `n_tp`, which
+is chamfer-**matched** instances — the two answer different questions and
+both are kept. `n_tp`'s label was changed from "correctly predicted
+polylines" to "matched polylines", since the old wording read as a count.
+
+**The count only exists relative to a score threshold**, and this is not a
+detail: the detection head emits a fixed `num_vec` (50) predictions for
+*every* tile, so the raw count is a constant and `n_pred − n_gt` would be
+`50 − n_gt`. Hence the threshold is now an **eval** parameter (part of
+`eval_key`, so it invalidates the cache), not just a drawing one. AP, TP and
+recall deliberately ignore it — AP integrates over every detection at every
+operating point, and pre-thresholding would silently redefine it and stop it
+matching the training log.
+
+`count_health()` warns when the count metrics cannot mean anything: when the
+threshold keeps all (or none) of the predictions on >95% of tiles, or when
+the run's whole score range is narrower than 0.05. **The webviewer_demo
+checkpoint hits both** — every confidence lies in 0.1632–0.1743, a spread of
+0.011, so *no* threshold separates confident from unconfident predictions.
+That is what an undertrained checkpoint looks like (confidences collapse to
+one value); on a converged model the metric becomes meaningful. Reported
+rather than worked around, since substituting some other definition of "how
+many" would make the number look informative when it isn't.
+
+**`count_error` vs `n_gt` is partly circular** — `count_error` contains
+`−n_gt`, so it correlates negatively by construction (a constant predicted
+count alone gives ρ = −1). Measured on the demo run: the circular version
+reads **ρ = −0.84**, the honest predicted-vs-GT-count chart (`plot_counts`,
+with the y=x diagonal, neither axis defined in terms of the other) reads
+**ρ = −0.10**. The pairing carries an inline warning pointing at the
+non-circular chart; don't quote the −0.84.
+
 Scatters use **marker area ∝ coincident tile count**: several axis pairs are
 small integers (GT count vs TP count is a lattice) and a plain scatter drew
 259 tiles as ~40 visible dots, hiding its own distribution. Sizing by the
