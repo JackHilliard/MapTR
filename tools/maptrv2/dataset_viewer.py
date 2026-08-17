@@ -76,11 +76,24 @@ subtracts `offset` and records the origin it used as `annotation_origin`
 in each pkl sample.
 
 A consequence of rendering in the `offset` frame: the tile is NOT centred
-on (0, 0) there. The axes are therefore centred on `tile_center - offset`,
-not on the origin. Using +/-tile_radius around zero (what this viewer used
-to do) silently cropped the tile -- badly on the 30 m grid tiles, where
-that shift reaches 17 m, i.e. more than half the tile's own radius clipped
-off one side.
+on (0, 0) there, it sits `tile_center - offset` away from it (1-2 m on the
+25 m export, ~17 m on the 60 m grid one).
+
+The axes are nonetheless centred on (0, 0), because that origin is the one
+thing every layer of a rendered tile shares: the LiDAR points are stored
+relative to it, the GT is shifted into it, and the model's predictions come
+back in it -- the training `point_cloud_range` is a box around it too. An
+asymmetric axis (the "-13 to +17" a tile_center-centred view produces) then
+reads as a misalignment that isn't there, and makes distances off the plot
+hard to eyeball.
+
+What must NOT happen is cropping: +/-tile_radius around zero, which this
+viewer did originally, cut a slice off every tile (badly on the 30 m grid
+tiles, where the shift is more than half the tile's own radius). The view
+radius is therefore GROWN to `tile_radius + |tile_center - offset|`, so the
+whole tile fits inside a symmetric, origin-centred frame. The density heat
+map's 1 m^2 bins stay aligned to the tile itself, so its counts are
+unaffected by the wider view.
 
 --- Three tabs ---
 `?tab=browse` (the default) is the per-tile viewer described above.
@@ -165,6 +178,22 @@ says which split it came from.
   * The scatters mark tiles the statistics tab flags as suspect in the
     status colour, which is what makes "are the bad tiles just the broken
     ones?" answerable by looking.
+  * Curve-vs-line box plots split quality by how many ARC and how many
+    STRAIGHT GT polylines a tile holds. That tag lives only in
+    reference_lines/*.json (`type`), not in the converter pkl, so it is
+    read back per tile and only trusted when it accounts for exactly the
+    GT instances that were scored. Note what the split can and cannot say:
+    a tile's AP covers all its polylines, and tiles hold both kinds, so
+    these are "how does a tile CONTAINING this many curves score", not
+    per-instance accuracy by geometry kind.
+  * Per-tile AP = 1.000 is arithmetic, not a bug, and ap_health() says so
+    on the page. For a tile with G ground-truth lines it means the G
+    highest-scoring of the head's 50 detections all matched, at every
+    threshold including 0.5 m; the ~45 lower-scoring false positives after
+    them cost nothing because interpolated precision has already reached 1.
+    With G = 1 the score is quantised to 1/k (k = rank of the first match),
+    so a single-line tile can only score 1.000, 0.500, 0.333, ... or 0 --
+    it cannot express "mostly right". Those tiles are chipped "coarse AP".
 """
 import argparse
 import csv
@@ -203,6 +232,7 @@ from flask import Flask, abort, make_response, redirect, request, send_file
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
+from matplotlib.ticker import MultipleLocator
 
 app = Flask(__name__)
 STATE = {}
@@ -478,6 +508,60 @@ def load_polylines(name, origin, ds):
     return out
 
 
+def shape_counts(name, ds):
+    """(n_arc, n_straight) for one tile, or (None, None) if unavailable.
+
+    The export tags every polyline with a geometry kind -- `type` is
+    'arc' or 'straight' (and `is_arc` says the same thing) -- which is a
+    different axis from `class`/`class_id` and is NOT carried into the
+    converter's pkl. So it is read back from reference_lines/*.json here.
+
+    The filter has to be the converter's filter, or these counts do not add
+    up to the GT count they are plotted against: custom_carla_map_converter
+    keeps polylines in file order, dropping only those with fewer than 2
+    points, and load_gt_pkl() applies the same rule. Verified on the 259-tile
+    test split -- 0 tiles where n_arc + n_straight disagreed with the pkl's
+    instance count, 624 arc + 586 straight = the known 1210 instances.
+
+    Memoised because the results tab asks for every tile at once and these
+    are thousands of small files.
+    """
+    key = (ds, name)
+    cached = STATE['shape_cache'].get(key)
+    if cached is not None:
+        return cached
+    d = ds_dir(ds)
+    path = osp.join(d, 'reference_lines',
+                     f'{name}_reference_lines.json') if d else None
+    out = (None, None)
+    if path and osp.isfile(path):
+        try:
+            with open(path) as f:
+                polys = json.load(f).get('polylines') or []
+            n_arc = n_str = 0
+            for p in polys:
+                if len(p.get('points') or ()) < 2:
+                    continue
+                kind = p.get('type')
+                if kind is None and p.get('is_arc') is not None:
+                    kind = 'arc' if p['is_arc'] else 'straight'
+                if kind == 'arc':
+                    n_arc += 1
+                elif kind == 'straight':
+                    n_str += 1
+                else:
+                    # An export with no geometry kind at all. Give up on the
+                    # whole tile rather than report a partial split that
+                    # silently under-counts one side.
+                    n_arc = n_str = None
+                    break
+            out = (n_arc, n_str)
+        except Exception:                        # noqa: BLE001
+            out = (None, None)
+    STATE['shape_cache'][key] = out
+    return out
+
+
 def discover_results(work_dir):
     """Find every prediction-results json under a training work_dir.
 
@@ -552,7 +636,35 @@ def class_color(cid, mode='rgb'):
     return CLASS_COLORS.get(int(cid), CLASS_FALLBACK)
 
 
-def style_axes(ax, center, radius):
+# Draw order inside a rendered tile. The prediction must always land on top
+# of the GT it is being compared against -- a dashed yellow line half-buried
+# under a solid red one reads as a worse match than it is -- so the two are
+# named here rather than left as bare numbers next to each ax.plot call, and
+# they bracket the legend (which is pushed to 20) from below.
+GT_ZORDER = 5
+PRED_ZORDER = 7
+# The metric grid sits between the point cloud (2) and the polylines.
+GRID_ZORDER = 3
+GRID_COLOR = '#8b949e'
+
+
+def tick_steps(span):
+    """(major, minor) tick spacing in metres for a view `span` metres wide.
+
+    The 25 m tiles are the case that matters -- a 1 m minor grid there is
+    the whole point, since it is the ruler you read "how far is this
+    prediction from the GT" off, against chamfer thresholds of 0.5/1.0/1.5 m.
+    Bigger exports (the 60 m grid tiles, whose grown view span passes 90 m)
+    would turn that into ~100 gridlines of solid haze, so the ladder steps
+    up rather than drawing a 1 m grid at any size.
+    """
+    for limit, major, minor in ((40, 5, 1), (100, 10, 2), (250, 25, 5)):
+        if span <= limit:
+            return major, minor
+    return 50, 10
+
+
+def style_axes(ax, center, radius, grid=True):
     ax.set_facecolor(BG)
     ax.set_xlim(center[0] - radius, center[0] + radius)
     ax.set_ylim(center[1] - radius, center[1] + radius)
@@ -560,6 +672,32 @@ def style_axes(ax, center, radius):
     ax.tick_params(colors=TEXT_MUTED, labelsize=7)
     for spine in ax.spines.values():
         spine.set_color(BORDER)
+    if not grid:
+        return
+    major, minor = tick_steps(2 * radius)
+    for axis in (ax.xaxis, ax.yaxis):
+        axis.set_major_locator(MultipleLocator(major))
+        axis.set_minor_locator(MultipleLocator(minor))
+    ax.tick_params(which='minor', colors=TEXT_MUTED, length=2)
+    # Drawn by hand rather than with ax.grid(), for the zorder. The grid is
+    # a ruler for "how far is this prediction from the GT", and a dense tile
+    # is 90,000 points -- underneath them it is invisible, which is exactly
+    # the case where you want it. So it goes ABOVE the point cloud (2) and
+    # BELOW the polylines (GT_ZORDER, 5), faint enough not to compete with
+    # either. ax.grid()'s own zorder argument is not honoured reliably and
+    # set_axisbelow only offers "all the way under".
+    def ticks_along(c, step):
+        lo, hi = c - radius, c + radius
+        t = np.arange(np.ceil(lo / step) * step, hi + step * 0.5, step)
+        return t[(t > lo) & (t < hi)]
+
+    for step, width, alpha in ((minor, 0.5, 0.28), (major, 1.0, 0.55)):
+        style = dict(colors=GRID_COLOR, linewidths=width, alpha=alpha,
+                      zorder=GRID_ZORDER)
+        ax.vlines(ticks_along(center[0], step),
+                   center[1] - radius, center[1] + radius, **style)
+        ax.hlines(ticks_along(center[1], step),
+                   center[0] - radius, center[0] + radius, **style)
 
 
 def render_tile(*args, **kwargs):
@@ -586,17 +724,24 @@ def _render_tile(name, mode, show_polylines,
     # GT is built in too. `tile_center` is NOT interchangeable: it differs
     # by a mean of ~2.4m, which is what the old converter got wrong.
     origin = block['offset']
-    # ...which also means the tile is not centred on (0,0) here. Centre the
-    # view on where the tile centre actually lands in this frame, or the
-    # plot crops the tile (see the module docstring).
-    center = ((block['tile_center'][:2] - origin[:2])
-              if 'tile_center' in block else np.zeros(2, dtype=np.float32))
+    # ...which also means the tile is not centred on (0,0) here: it sits
+    # `center` away from the origin. The VIEW is still centred on (0,0) --
+    # the frame the points, the GT and the predictions all share -- and the
+    # radius is grown by that displacement so nothing is cropped. See the
+    # "Coordinate frames" section of the module docstring.
+    center = ((np.asarray(block['tile_center'][:2], dtype=np.float64)
+                - np.asarray(origin[:2], dtype=np.float64))
+              if 'tile_center' in block else np.zeros(2))
+    view_radius = radius + float(np.abs(center).max())
 
     fig = Figure(figsize=(6, 6))
     FigureCanvasAgg(fig)
     ax = fig.subplots()
     fig.patch.set_facecolor(BG)
-    style_axes(ax, center, radius)
+    # No grid over the density heat map: its cells are 1 m^2 too, but binned
+    # from the tile's own edge rather than from the origin, so the two rules
+    # sit a fraction of a metre apart and read as a rendering fault.
+    style_axes(ax, np.zeros(2), view_radius, grid=(mode != 'density'))
 
     n_raw = xy.shape[0]
     subsampled = False
@@ -630,7 +775,7 @@ def _render_tile(name, mode, show_polylines,
         im = ax.imshow(H.T, origin='lower',
                         extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
                         cmap=DENSITY_CMAP, aspect='equal', norm=norm,
-                        interpolation='nearest')
+                        interpolation='nearest', zorder=1)
         cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         cb.set_label('points / m²' + (' (log)' if norm is not None else ''),
                       color=TEXT, fontsize=8)
@@ -644,13 +789,13 @@ def _render_tile(name, mode, show_polylines,
         rgb = np.clip(feat[:, 3:6], 0.0, 1.0)
         rgb_plot = rgb[sel] if subsampled else rgb
         ax.scatter(xy_plot[:, 0], xy_plot[:, 1], c=rgb_plot, s=point_size,
-                    linewidths=0)
+                    linewidths=0, zorder=2)
         title_extra = 'true RGB colour'
     elif mode == 'intensity':
         strength = feat[:, 3:6] @ RGB2GRAY
         s_plot = strength[sel] if subsampled else strength
         ax.scatter(xy_plot[:, 0], xy_plot[:, 1], c=s_plot, s=point_size,
-                    cmap='cividis', linewidths=0, alpha=0.9)
+                    cmap='cividis', linewidths=0, alpha=0.9, zorder=2)
         title_extra = 'intensity (BT.709 luma of RGB)'
     elif mode == 'label' and labels_plot is not None:
         for lab in np.unique(labels_plot):
@@ -658,7 +803,7 @@ def _render_tile(name, mode, show_polylines,
             lname = STATE['lane_types'].get(str(int(lab)), 'unlabeled'
                                              if lab == -1 else str(lab))
             ax.scatter(xy_plot[msk, 0], xy_plot[msk, 1],
-                        s=point_size, linewidths=0, alpha=0.9,
+                        s=point_size, linewidths=0, alpha=0.9, zorder=2,
                         c=LABEL_COLORS.get(int(lab), '#8b949e'),
                         label=f'{lname} ({msk.sum():,})')
         leg = ax.legend(fontsize=6, loc='upper right', facecolor=BG_PANEL,
@@ -668,7 +813,7 @@ def _render_tile(name, mode, show_polylines,
         title_extra = 'coloured by lane label'
     else:  # 'points', and 'label' on a block with no labels array
         ax.scatter(xy_plot[:, 0], xy_plot[:, 1], s=point_size,
-                    c='#58a6ff', linewidths=0, alpha=0.6)
+                    c='#58a6ff', linewidths=0, alpha=0.6, zorder=2)
         title_extra = ('top-down' if mode != 'label'
                         else 'top-down (no labels in this block)')
 
@@ -683,7 +828,7 @@ def _render_tile(name, mode, show_polylines,
             if classes is not None and class_key(cid) not in classes:
                 continue
             ax.plot(pl[:, 0], pl[:, 1], color=class_color(cid, mode),
-                     linewidth=1.8, alpha=0.98, zorder=5,
+                     linewidth=1.8, alpha=0.98, zorder=GT_ZORDER,
                      path_effects=outline)
             drawn[(cid, cname)] = drawn.get((cid, cname), 0) + 1
         for (cid, cname), n in sorted(
@@ -725,8 +870,8 @@ def _render_tile(name, mode, show_polylines,
         for pts, score, cls, cid in kept:
             ax.plot(pts[:, 0], pts[:, 1],
                      color=class_color(cid, mode) if cid is not None else '#ffd60a',
-                     linewidth=2.0, alpha=0.95, zorder=6, linestyle='--',
-                     path_effects=outline)
+                     linewidth=2.0, alpha=1.0, zorder=PRED_ZORDER,
+                     linestyle='--', path_effects=outline)
             pred_drawn[(cid, cls)] = pred_drawn.get((cid, cls), 0) + 1
         # The legend has to say what was hidden, or a trimmed view is
         # indistinguishable from a model that only made a few predictions.
@@ -757,7 +902,7 @@ def _render_tile(name, mode, show_polylines,
                           facecolor=BG_PANEL, edgecolor=BORDER,
                           labelcolor=TEXT, framealpha=0.95)
         leg2.get_frame().set_linewidth(0.5)
-        # legends default to zorder 5, but predictions are drawn at 6 and
+        # legends default to zorder 5, but polylines are drawn at 5-7 and
         # would otherwise scribble straight over the legend box
         leg2.set_zorder(20)
 
@@ -2919,6 +3064,7 @@ def evaluate_run(results_path, gt_path, score_thresh=0.0):
         ambiguous = sum(1 for v in by_name.values() if len(v) > 1)
 
         rows, missing_gt, missing_tile = [], 0, 0
+        shape_mismatch = 0
         t0 = time.time()
         for token, preds in preds_by_token.items():
             gts = gt_by_token.get(token)
@@ -2938,11 +3084,25 @@ def evaluate_run(results_path, gt_path, score_thresh=0.0):
             d = row.get('deep') or {}
             for k in DEEP_FIELDS:
                 row[k] = d.get(k)
+            # Geometry kind, straight off reference_lines/*.json -- the pkl
+            # does not carry it. Only trusted when it accounts for exactly
+            # the GT instances that were just scored; a disagreement means
+            # the results were produced from a different filter (a
+            # --classes subset, say) and splitting AP by a count that does
+            # not match the GT would be quietly wrong.
+            n_arc, n_str = shape_counts(row['name'], row['ds'])
+            if n_arc is not None and n_arc + n_str == row['n_gt']:
+                row['n_arc'], row['n_straight'] = n_arc, n_str
+            else:
+                row['n_arc'] = row['n_straight'] = None
+                if n_arc is not None:
+                    shape_mismatch += 1
             rows.append(row)
 
         glob = global_ap(rows)
         REval.update(key=key, rows=rows, global_ap=glob, ambiguous=ambiguous,
                       missing_gt=missing_gt, missing_tile=missing_tile,
+                      shape_mismatch=shape_mismatch,
                       n_gt_total=sum(r['n_gt'] for r in rows),
                       n_pred_total=sum(r['n_pred'] for r in rows),
                       elapsed=time.time() - t0)
@@ -3301,6 +3461,83 @@ def plot_quality_by_group(rows, ykey, group_by):
     return finish(fig, ax, f'{ym["axis"]}, by {group_by}', ym['axis'])
 
 
+# The geometry-kind splits. `key` is the per-row count this bins on; the
+# 'all' entry falls back to n_gt, which is n_arc + n_straight by
+# construction (checked in evaluate_run before either is trusted).
+RSHAPES = {
+    'arc': dict(key='n_arc', noun='curved (arc)',
+                 by='number of curved (arc) GT polylines',
+                 xlabel='curved GT polylines in tile'),
+    'straight': dict(key='n_straight', noun='straight',
+                      by='number of straight GT polylines',
+                      xlabel='straight GT polylines in tile'),
+    'all': dict(key='n_gt', noun='curved and straight',
+                 by='total GT polylines, curved and straight',
+                 xlabel='GT polylines in tile (curved + straight)'),
+}
+# Below this many tiles a box is quartiles of almost nothing, so it is drawn
+# muted and the title says how many such columns there are.
+SHAPE_MIN_TILES = 5
+
+
+def plot_by_shape_count(rows, which, ykey):
+    """Quality distribution against how many GT polylines of one geometry
+    kind a tile holds -- one box per count, on a shared y axis.
+
+    The question it answers is whether the model struggles with curves as
+    such. Reading it needs one caveat kept in view: the three charts are not
+    independent slices of the same tiles. A tile with 4 curves usually also
+    has straights, and its AP is the AP of ALL its predictions, so the
+    'curved' chart is "how does a tile WITH this many curves score", not
+    "how well are curves predicted". Separating the second question would
+    need per-instance attribution, which needs the arc/straight tag to
+    survive into the matched pairs -- see the note in the caption.
+    """
+    spec = RSHAPES[which]
+    ym = RMETRICS[ykey]
+    per = {}
+    for r in rows:
+        n = r.get(spec['key'])
+        v = r_metric(r, ykey)
+        if n is None or v is None:
+            continue
+        per.setdefault(int(n), []).append(float(v))
+    if len(per) < 2:
+        return None
+    counts = sorted(per)
+    series = [np.asarray(per[c], dtype=np.float64) for c in counts]
+    thin = sum(1 for s in series if len(s) < SHAPE_MIN_TILES)
+
+    fig, ax = stat_fig(height=4.0, width=6.6)
+    pos = np.arange(len(counts), dtype=np.float64)
+    bp = ax.boxplot(
+        series, positions=pos, widths=0.6, patch_artist=True,
+        flierprops=dict(marker='.', markersize=2.5, alpha=0.45,
+                         markerfacecolor=MUTED_MARK, markeredgecolor='none'),
+        medianprops=dict(color=BG, linewidth=1.4),
+        whiskerprops=dict(color=BORDER, linewidth=1.0),
+        capprops=dict(color=BORDER, linewidth=1.0))
+    for patch, s in zip(bp['boxes'], series):
+        patch.set_facecolor(BOX_HUE if len(s) >= SHAPE_MIN_TILES
+                             else MUTED_MARK)
+        patch.set_edgecolor('none')
+    ax.set_xticks(pos)
+    # The tile count goes in the tick label rather than above each box: a
+    # box that is quartiles of 2 tiles looks exactly like one built from 60,
+    # and this is the only place that distinction can be read off.
+    ax.set_xticklabels([f'{c}\nn={len(s)}' for c, s in zip(counts, series)],
+                        fontsize=7.5, color=TEXT)
+    ax.set_xlim(-0.7, len(counts) - 0.3)
+    ax.set_ylabel(ym['axis'], color=TEXT_MUTED, fontsize=8)
+    ax.grid(False, axis='x')
+    # On its own line: this title is already at the width of the figure, and
+    # tight_layout does not wrap -- it just lets the tail run off the canvas.
+    extra = (f'\n{thin} column(s), drawn grey, hold fewer than '
+             f'{SHAPE_MIN_TILES} tiles' if thin else '')
+    return finish(fig, ax, f'{ym["axis"]} by {spec["by"]}{extra}',
+                   spec['xlabel'], tight=True)
+
+
 def plot_pr_curve(rows):
     """The GLOBAL precision-recall curve, one line per chamfer threshold.
 
@@ -3402,6 +3639,22 @@ RPLOTS['counts'] = dict(
          'above it over-predicts. This is the non-circular version of count '
          'error against GT count -- neither axis is defined in terms of the '
          'other.')
+for _sk, _ss in RSHAPES.items():
+    RPLOTS[f'shape__{_sk}'] = dict(
+        kind='shape', shape=_sk, deep=False,
+        note=(
+            'Does the model struggle with <b>curves</b>? One box per tile '
+            f'count of {_ss["noun"]} GT polylines; the y axis follows the '
+            'sort metric above. The geometry kind comes from each '
+            'polyline\'s <code>type</code> (arc / straight) in '
+            '<code>reference_lines/*.json</code> &mdash; the converter pkl '
+            'does not carry it.'
+            + ('' if _sk == 'all' else
+               ' <b>Read it as</b> "how does a tile <i>containing</i> this '
+               'many score", not "how well are these predicted": a tile\'s '
+               'AP covers all its polylines, and tiles hold both kinds. The '
+               'comparison worth making is this chart against its '
+               'counterpart, at equal counts.')))
 RPLOTS['pr'] = dict(kind='pr', deep=False,
                      note='The cross-check on everything else here: this is '
                           'the real interleaved-ranking eval, so its AP '
@@ -3420,9 +3673,13 @@ def render_placeholder(spec, kind):
     with RENDER_LOCK:
         fig, ax = stat_fig(height=3.2, width=6.2)
         ax.axis('off')
-        why = ('this needs the deep scan on the dataset-statistics tab'
-               if spec.get('deep') else
-               'no tile has a value for it in this run')
+        if spec.get('deep'):
+            why = 'this needs the deep scan on the dataset-statistics tab'
+        elif spec.get('shape'):
+            why = ('no tile has an arc/straight tag on its polylines\n'
+                   '(reference_lines/*.json carries no `type` field)')
+        else:
+            why = 'no tile has a value for it in this run'
         ax.text(0.5, 0.5, f'Nothing to plot for “{kind}”.\n{why}.',
                  transform=ax.transAxes, ha='center', va='center',
                  color=TEXT_MUTED, fontsize=10, wrap=True)
@@ -3450,6 +3707,13 @@ def _render_res(kind, rows, group_by, ykey):
         return plot_quality_hist(rows, spec['y'])
     if spec['kind'] == 'bygroup':
         return plot_quality_by_group(rows, ykey, group_by)
+    if spec['kind'] == 'shape':
+        # The sort selector doubles as the y axis here, as it does for
+        # 'bygroup' -- but only for the three quality metrics. Sorting by
+        # 'GT polylines' would otherwise draw the 'all' chart as a diagonal
+        # of its own x axis.
+        return plot_by_shape_count(
+            rows, spec['shape'], ykey if ykey in RQUALITY else 'ap')
     return None
 
 
@@ -3705,9 +3969,83 @@ def results_summary_html(rows):
     if miss:
         note += (f'<div class="note" style="color:{CRITICAL}">Skipped: '
                  + '; '.join(miss) + '.</div>')
+    if REval.get('shape_mismatch'):
+        note += (f'<div class="note" style="color:{CRITICAL}">'
+                 f'{REval["shape_mismatch"]:,} tile(s) have arc/straight tags '
+                 f'that do not add up to the GT count they were scored '
+                 f'against, so they are left out of the curve-vs-line charts '
+                 f'&mdash; the usual cause is a pkl converted with a '
+                 f'<code>--classes</code> subset.</div>')
+    note += ap_health(rows)
     note += count_health(rows)
     return (f'<table class="stats"><thead><tr>{head}</tr></thead>'
             f'<tbody><tr>{body}</tr></tbody></table>{note}')
+
+
+def ap_coarse(row):
+    """True when this tile has too little GT for its AP to be a grade.
+
+    Not a data problem and not a bug -- a property of the AP formula on a
+    tile with G ground-truth lines. See ap_health() for the full statement.
+    """
+    return bool(row.get('n_gt')) and row['n_gt'] <= 2
+
+
+def ap_health(rows):
+    """Explain per-tile AP = 1.000, which looks impossible on a run whose
+    global mAP is a few percent and is the single most-asked question of
+    this tab.
+
+    It is arithmetic, not a bug. AP here is mean_ap.average_precision's
+    'area' mode over ONE tile's detections, and for a tile with G GT lines:
+
+      * AP = 1.000 exactly when the G highest-scoring of the head's
+        num_vec (50) detections are all true positives -- at every one of
+        the three thresholds, so including the strictest, 0.5 m. The 40-odd
+        lower-scoring false positives after them cost nothing, because
+        max-interpolated precision is already 1 everywhere at that point.
+      * with G = 1 the score is quantised to 1/k, k being the rank of the
+        first matching detection: 1.000, 0.500, 0.333, ... and 0 for a miss.
+        There is no value between 0.5 and 1, so a single-line tile cannot
+        express "mostly right".
+
+    So 1.000 on a G = 1 tile is the weakest possible claim -- the top guess
+    out of 50 landed within 0.5 m -- while on a G = 8 tile it is a strong
+    one. Both are the same number, which is why the count is stated here and
+    the coarse tiles are marked in the gallery.
+    """
+    if not rows:
+        return ''
+    coarse = [r for r in rows if ap_coarse(r)]
+    perfect = [r for r in rows if r['ap'] is not None and r['ap'] > 0.999]
+    if not perfect and not coarse:
+        return ''
+    bits = []
+    if perfect:
+        gts = sorted(r['n_gt'] for r in perfect)
+        bits.append(
+            f'<b>{len(perfect):,} tile(s) score AP 1.000</b>, holding '
+            f'{gts[0]}&ndash;{gts[-1]} GT lines each. That means their '
+            f'top-scoring detections &mdash; as many as there are GT lines '
+            f'&mdash; all matched at <i>all three</i> thresholds, 0.5 m '
+            f'included. Every lower-scoring detection behind them &mdash; '
+            f'typically {int(np.median([r["n_pred"] for r in perfect]))} '
+            f'per tile, since the head emits a fixed num_vec &mdash; is a '
+            f'false positive and costs nothing, because interpolated '
+            f'precision has already reached 1')
+    if coarse:
+        bits.append(
+            f'{len(coarse):,} of {len(rows):,} tiles have only 1&ndash;2 GT '
+            f'lines, where AP is quantised (with 1 GT line it can only be '
+            f'1/k for the rank k of the first match: 1.000, 0.500, 0.333, '
+            f'&hellip;, or 0) &mdash; those are marked '
+            f'<span class="chip" style="color:{TEXT_MUTED}">coarse AP</span> '
+            f'in the gallery below')
+    return (f'<div class="note" style="max-width:60em">'
+            f'<b>Reading per-tile AP:</b> ' + '; '.join(bits)
+            + '. The global AP in the header is unaffected &mdash; it ranks '
+              'every tile\'s detections together, so a tile cannot buy a '
+              'perfect score off its own small GT set.</div>')
 
 
 def count_health(rows):
@@ -3870,10 +4208,13 @@ def results_page():
             'predictions and GT share no tiles')
 
     have_deep = any(r.get(k) is not None for r in rows for k in DEEP_FIELDS)
+    have_shape = any(r.get('n_arc') is not None for r in rows)
     cachebust = f'{time.time():.6f}'
     figs = []
     for kind, spec in RPLOTS.items():
         if spec['deep'] and not have_deep:
+            continue
+        if spec.get('shape') and not have_shape:
             continue
         params = [('plot', kind), ('results', results), ('gt', gt),
                    ('group_by', group_by), ('sort', sort_key),
@@ -3996,8 +4337,24 @@ def tile_gallery(chosen, mode, results, score_thresh, sort_key, cachebust,
                 continue
             bits.append(f'{RMETRICS[k]["label"].split(" (")[0]} '
                          f'<b>{RMETRICS[k]["fmt"].format(v)}</b>')
+        # The per-threshold breakdown is the answer to "how is this 1.000
+        # reasonable" -- an AP of 1.000 means 1.000 at 0.5 m too, and seeing
+        # the three side by side is what makes that legible.
+        thr_bits = []
+        for t in CHAMFER_THRESHOLDS:
+            v = r['ap_thr'].get(t)
+            thr_bits.append('&mdash;' if v is None else f'{v:.2f}')
+        extra = (f'AP@0.5/1.0/1.5 m <b>{" / ".join(thr_bits)}</b>')
+        if r.get('n_arc') is not None:
+            extra += (f' &middot; GT {r["n_arc"]} curved / '
+                       f'{r["n_straight"]} straight')
         flags = ' '.join(f'<span class="chip" style="color:{CHIP_COLORS[k]}">'
                           f'{k}</span>' for k, _t in tile_flags(r))
+        if ap_coarse(r):
+            flags = (f'<span class="chip" style="color:{TEXT_MUTED}" '
+                      f'title="only {r["n_gt"]} GT line(s): AP here is '
+                      f'quantised to 1/k and 1.000 just means the top guess '
+                      f'matched">coarse AP</span> ') + flags
         browse = html.escape(
             '/?' + urlencode([('town', r['group']), ('start', r['gidx']),
                                ('count', 1), ('mode', mode),
@@ -4007,7 +4364,9 @@ def tile_gallery(chosen, mode, results, score_thresh, sort_key, cachebust,
             f'<img src="/tile.png{q}"></a>'
             f'<figcaption style="text-align:left">'
             f'<a href="{browse}">{html.escape(r["name"])}</a><br>'
-            + ' &middot; '.join(bits[:4]) + (f'<br>{flags}' if flags else '')
+            + ' &middot; '.join(bits[:4])
+            + f'<br><span style="color:{TEXT_MUTED}">{extra}</span>'
+            + (f'<br>{flags}' if flags.strip() else '')
             + '</figcaption></figure>')
     return '\n'.join(figs) or (f'<p style="color:{TEXT_MUTED}">'
                                 f'no tiles in this band</p>')
@@ -4057,7 +4416,7 @@ def results_csv():
     w = csv.writer(buf)
     keys = ['ap', 'ap_0.5', 'ap_1.0', 'ap_1.5', 'n_tp', 'recall',
             'precision', 'chamfer', 'n_gt', 'n_pred', 'n_pred_kept',
-            'count_error']
+            'count_error', 'n_arc', 'n_straight']
     w.writerow(['uid', 'name', 'dataset', 'split', 'town', 'n_points',
                  'points_per_m2'] + list(DEEP_FIELDS) + ['z_skew'] + keys
                 + ['flags'])
@@ -4152,6 +4511,7 @@ def main():
     STATE['work_dir'] = args.work_dir
     STATE['results_cache'] = {}
     STATE['gt_cache'] = {}
+    STATE['shape_cache'] = {}
     STATE['gt_json'] = osp.abspath(args.gt_json) if args.gt_json else None
     if STATE['gt_json'] and not osp.isfile(STATE['gt_json']):
         raise SystemExit(f'--gt-json is not a file: {args.gt_json}')

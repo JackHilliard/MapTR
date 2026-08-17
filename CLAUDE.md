@@ -718,6 +718,67 @@ density, raw points, effective points and GT count all sit at |ρ| ≤ 0.05.
 That is a statement about a barely-trained model, not about the data; re-run
 it on a converged checkpoint before drawing any conclusion.
 
+### Curve-vs-line splits, and what per-tile AP = 1.000 means (2026-08-17)
+
+**The arc/straight tag lives only in `reference_lines/*.json`.** Each polyline
+carries `type` (`'arc'` / `'straight'`, plus a redundant `is_arc`), and the
+converter does **not** copy it into the pkl — `annotation['divider']` is bare
+coordinate arrays. So `shape_counts()` reads it back per tile, applying the
+converter's own filter (file order, drop `<2` points) so the counts add up to
+the GT instances actually scored. Verified across the 259-tile test split: **0
+tiles** where `n_arc + n_straight` disagreed with the pkl's instance count, and
+624 arc + 586 straight = the known 1210 instances. A tile whose counts don't
+reconcile is dropped from these charts and reported, rather than plotted
+against a GT it doesn't describe — the case that produces it is a pkl
+converted with a `--classes` subset.
+
+Three box plots (`shape__arc` / `shape__straight` / `shape__all`), one box per
+tile-count on the x axis, quality on the y — the one place in this file where
+boxes are **vertical**, because the x axis is the count and that was the ask.
+**They are not per-instance accuracy by geometry kind.** A tile's AP covers all
+its polylines and tiles hold both kinds, so the chart says "how does a tile
+*containing* n curves score". The comparison that is valid is arc against
+straight *at equal counts*.
+
+**Per-tile AP = 1.000 is arithmetic, not a bug** — the most-asked question of
+this tab, now answered on the page by `ap_health()`. For a tile with G GT
+lines, AP (mmdet's `'area'` mode over that tile's own detections) is 1.000
+exactly when the **G highest-scoring of the head's 50 detections are all TPs at
+every threshold**, 0.5 m included. The ~45 lower-scoring detections behind them
+are all false positives and cost nothing, because max-interpolated precision
+has already reached 1. With **G = 1** the score is quantised to `1/k` for k the
+rank of the first match — 1.000, 0.500, 0.333, … or 0 — so a single-line tile
+*cannot* express "mostly right". Measured on the 25m-V2 run: both AP-1.000
+tiles have G = 1 and a matched chamfer of 0.29-0.30 m, i.e. genuinely inside
+the strictest threshold. Tiles with G ≤ 2 are chipped `coarse AP` in the
+gallery and each tile's caption now prints the per-threshold breakdown, which
+is what makes the 1.000 legible. The global AP in the header is unaffected: its
+ranking interleaves every tile, so a tile can't buy a perfect score off a small
+GT set.
+
+### Example tiles are centred on the origin, with a metric grid (2026-08-17)
+
+Three changes to `_render_tile`, all about reading distance off a tile:
+
+- **The view is centred on (0, 0), not on `tile_center - offset`.** That origin
+  is the one frame the points, the GT and the predictions all share (and the
+  training `point_cloud_range` is a box around it), so an asymmetric axis —
+  the "−13 to +17" this used to produce — reads as a misalignment that isn't
+  there. The 2026-08-10 cropping bug is avoided by *growing* the view radius to
+  `tile_radius + |tile_center − offset|` instead of shifting the centre, so the
+  whole tile still fits. The density heat map's 1 m² bins stay aligned to the
+  tile, so its counts are untouched.
+- **A 5 m major / 1 m minor grid, drawn ABOVE the point cloud** (`GRID_ZORDER`
+  = 3, between the points at 2 and the polylines at 5). Under the points it is
+  invisible on a 90k-point tile, which is exactly when you want a ruler. Done
+  by hand with `vlines`/`hlines` because `ax.grid()`'s `zorder` isn't honoured
+  and `set_axisbelow` only offers "all the way under". Suppressed in density
+  mode, where a second 1 m rule phased off the origin instead of the tile edge
+  reads as a rendering fault. `tick_steps()` steps the spacing up on larger
+  exports so the 60 m grid tiles don't become 100 lines of haze.
+- **Predictions are named `PRED_ZORDER` (7) over `GT_ZORDER` (5)** rather than
+  bare numbers, so "pred always on top" survives future edits.
+
 Charting conventions if extending the stats tab: distributions compared
 across groups are horizontal box plots in a **single** hue (six towns is at
 the categorical cap, and axis labels carry identity); categorical colour is
