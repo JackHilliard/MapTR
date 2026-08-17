@@ -209,6 +209,20 @@ num_vec_one2one = 25
 # base config's convention (base: 50 one2one x k_one2many=6 = 300).
 num_vec_one2many = num_vec_one2one * 6
 
+# The decoder's `max_num` MUST be scaled down with it, or eval dies. The base
+# config pairs num_vec_one2one=50 with MapTRNMSFreeCoder(max_num=50), and
+# `decode_single` does `cls_scores.view(-1).topk(max_num)` over the ONE2ONE
+# branch only, whose flattened size is num_vec_one2one * num_map_classes.
+# CARLA has a single class, so that is 25 here and an inherited 50 raises
+#     RuntimeError: selected index k out of range
+# at the first validation, after a full epoch of training has already run.
+# Expressed as a min() so this stays correct if the taxonomy ever grows past
+# one class (where 50 would again be legal, and is the base's tuned value).
+# num_map_classes is restated because mmcv evaluates this file in isolation;
+# it must stay equal to len(map_classes) in the base.
+num_map_classes = 1
+max_num = min(50, num_vec_one2one * num_map_classes)
+
 # NOT mirrored: the Pointcept config uses num_points_per_polyline=40; this
 # stays at MapTRv2's inherited 20. Deliberate -- 40 is expensive here in a
 # way it is not there, for two compounding reasons:
@@ -236,6 +250,8 @@ model = dict(
         num_vec_one2many=num_vec_one2many,
         num_pts_per_vec=fixed_ptsnum_per_pred_line,
         num_pts_per_gt_vec=fixed_ptsnum_per_gt_line,
+        # Follows num_vec_one2one -- see the max_num note above.
+        bbox_coder=dict(max_num=max_num),
         loss_pts=dict(
             _delete_=True,
             type='PolylineGeomLoss',

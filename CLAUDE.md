@@ -190,6 +190,22 @@ the LiDAR-only path. Several are *silent* until a specific path executes
     Singularity/Apptainer typically shares the host `/dev/shm`, so this may
     not reproduce there — unverified; if it does, find the equivalent flag.
 
+15. **Changing `num_vec_one2one` without `bbox_coder.max_num` crashes at
+    the first validation**, not at build time:
+    `RuntimeError: selected index k out of range` from
+    `nms_free_coder.py`'s `decode_single`, which does
+    `cls_scores.view(-1).topk(max_num)`. `get_bboxes` decodes the
+    **one2one branch only**, so the tensor holds
+    `num_vec_one2one * num_map_classes` entries — with CARLA's single
+    class that is just `num_vec_one2one`. The base pairs 50 with
+    `max_num=50`; the HM configs cut queries to 25 and inherited the 50.
+    Nothing validates the pair, so a full epoch trains before it dies.
+    **Fix**: both HM configs derive
+    `max_num = min(50, num_vec_one2one * num_map_classes)` and pass it as
+    `pts_bbox_head.bbox_coder.max_num`. Note `max_num` also caps how many
+    instances eval can ever score, so raising queries is safe while
+    lowering them is not.
+
 ## CARLA data facts
 
 **GT frame is `offset`, not `tile_center`** (fixed 2026-08-03, `aaf4b46`).
