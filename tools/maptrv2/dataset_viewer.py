@@ -9,6 +9,7 @@ and no mmdet3d/torch import at all. Only needs `flask`, `matplotlib`,
 
 Usage (from the repo root):
   pip install flask matplotlib numpy
+  pip install open3d          # OPTIONAL, only for the 3D tab
   # split-structured dataset (<root>/{train,val,test}/manifest.json)
   python3 tools/maptrv2/dataset_viewer.py --data-root /path/to/carla
   # single-town grid export (<root>/<Town>/grid_tiles/grid_manifest.json)
@@ -124,7 +125,7 @@ whole tile fits inside a symmetric, origin-centred frame. The density heat
 map's 1 m^2 bins stay aligned to the tile itself, so its counts are
 unaffected by the wider view.
 
---- Three tabs ---
+--- Four tabs ---
 `?tab=browse` (the default) is the per-tile viewer described above.
 `?tab=stats` answers the other question -- what does the *dataset* look
 like -- in two tiers, because their costs differ by three orders of
@@ -207,6 +208,29 @@ says which split it came from.
   * The scatters mark tiles the statistics tab flags as suspect in the
     status colour, which is what makes "are the bad tiles just the broken
     ones?" answerable by looking.
+
+`?tab=view3d` opens one tile in an interactive Open3D window: pick the
+tile, the colour scheme (RGB / lane label / height / intensity / uniform),
+the frame, and which polyline classes and which of GT/predictions are
+drawn; a top-down preview and the tile's full metric table sit alongside.
+
+Open3D is an OPTIONAL dependency (`pip install open3d`) and is imported
+ONLY in the child process that opens the window -- never in the server.
+`draw_geometries()` runs its own blocking event loop and GUI toolkits
+require the main thread, which a threaded Flask worker is not; no lock can
+fix that (unlike matplotlib, see RENDER_LOCK). So a launch re-execs this
+file with `--o3d-spec <json>` and returns straight away. The scene itself is
+built by `build_o3d_scene()`, which is pure numpy and imports nothing --
+that is what keeps the geometry testable on a host without open3d.
+
+Predictions are 2D (the results json has no z), so they are drawn on the GT
+plane. Not a fudge: reference-line z is CARLA's ground plane (world z == 0),
+so in either frame GT and predictions both land at `-origin[2]`, the true
+height of the road surface relative to the cloud.
+
+Per-tile metrics come from `tile_metrics()` in three tiers -- manifest,
+deep scan, selected run -- and the SAME helper feeds the browse tab's
+captions, so the two cannot drift apart.
   * Curve-vs-line box plots PARTITION the tiles by what they hold --
     curves only, straight lines only, or both -- so each tile appears in
     exactly one chart and the curves-only chart really is measuring tiles
@@ -236,6 +260,8 @@ import json
 import os
 import os.path as osp
 import pickle
+import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -508,13 +534,20 @@ def load_block(name, ds):
     return np.load(path)
 
 
-def load_polylines(name, origin, ds):
-    """Returns list of (pts, class_id, class_name), where pts is an (N,2)
-    array in the same frame as the block's `features` xyz (given the origin
-    to subtract -- see module docstring).
+def load_polylines(name, origin, ds, ndim=2):
+    """Returns list of (pts, class_id, class_name), where pts is an
+    (N, ndim) array in the same frame as the block's `features` xyz (given
+    the origin to subtract -- see module docstring).
 
     class_id is None for older exports whose polylines carry no class
     field; those callers get a single unclassified set.
+
+    `ndim=3` keeps the z the export actually stores, which every 2D caller
+    throws away. It is not filler: reference-line z is CARLA's ground plane
+    (world z == 0), so in either tile frame the polylines land at
+    `-origin[2]` -- the real height of the road surface relative to the
+    point cloud. That is what makes the 3D view's GT sit ON the road rather
+    than at an arbitrary height.
     """
     d = ds_dir(ds)
     path = osp.join(d, 'reference_lines',
@@ -536,7 +569,13 @@ def load_polylines(name, origin, ds):
         cid = int(cid) if cid is not None else None
         cname = p.get('class') or lookup.get(str(cid)) or (
             'unclassified' if cid is None else f'class {cid}')
-        out.append((pts[:, :2] - origin[:2], cid, cname))
+        if pts.shape[1] < ndim:
+            # a 2D export asked for in 3D: put it on the road plane, which
+            # is where the 3D exports put it explicitly
+            pts = np.hstack([pts, np.zeros((pts.shape[0], ndim - pts.shape[1]),
+                                            dtype=np.float32)])
+        out.append((pts[:, :ndim] - np.asarray(origin, dtype=np.float32)[:ndim],
+                     cid, cname))
     return out
 
 
@@ -711,6 +750,351 @@ def resolve_frame(arg, gt_path=None):
     return 'offset'
 
 
+# ---- per-tile metrics, shared by the browse captions and the 3D tab -------
+#
+# One place that answers "what do we know about this tile", in three tiers
+# that mirror the rest of the viewer:
+#
+#   tile -- manifest only, always available, zero I/O
+#   scan -- needs the dataset-statistics deep scan (every .npz read)
+#   run  -- needs a results json AND a GT file, i.e. the results tab's eval
+#
+# Kept as (section, label, text) triples rather than pre-rendered HTML so
+# the two consumers can lay them out differently: the browse caption wants a
+# terse middot-separated line, the 3D tab a full table.
+
+
+def _fmt(v, spec='{:,.0f}', unit=''):
+    return '—' if v is None else spec.format(v) + unit
+
+
+def tile_metrics(uid, results_path=None, gt_path=None, score_thresh=0.0):
+    """Every metric this viewer can state about one tile, by section."""
+    row = next((r for r in stat_rows() if r['uid'] == uid), None)
+    if row is None:
+        return []
+    d = row['deep'] or {}
+    out = [
+        ('tile', 'raw points', _fmt(row['n_points'])),
+        ('tile', 'points / m²', _fmt(row['density'], '{:,.1f}')),
+        ('tile', 'GT polylines', _fmt(row['n_polylines'])),
+    ]
+    for cname, n in sorted(row['by_class'].items()):
+        out.append(('tile', f'  {cname}', _fmt(n)))
+
+    if d and not d.get('error'):
+        eff, raw = d.get('n_effective'), d.get('n_raw')
+        out.append(('scan', 'effective points', _fmt(eff)))
+        if eff is not None and raw:
+            out.append(('scan', 'effective / raw',
+                         _fmt(100.0 * eff / raw, '{:.1f}', '%')))
+        out.append(('scan', 'z min .. max',
+                     '—' if d.get('z_min') is None else
+                     f"{d['z_min']:.2f} .. {d['z_max']:.2f} m"))
+        # World z, per scan_tile's comment: `offset` IS the cloud's centroid,
+        # so the centroid-relative mean is identically ~0 and only the world
+        # value carries information.
+        out.append(('scan', 'z median (world)', _fmt(d.get('z_median'),
+                                                      '{:.2f}', ' m')))
+        out.append(('scan', 'z mean (world)', _fmt(d.get('z_mean'),
+                                                    '{:.2f}', ' m')))
+        if d.get('z_median') is not None and d.get('z_mean') is not None:
+            out.append(('scan', 'z skew (median − mean)',
+                         _fmt(d['z_median'] - d['z_mean'], '{:+.2f}', ' m')))
+        out.append(('scan', '|tile_center − offset|',
+                     _fmt(d.get('drift'), '{:.2f}', ' m')))
+        if d.get('gt_out'):
+            out.append(('scan', 'GT vertices outside tile',
+                         _fmt(d['gt_out'])))
+
+    ev = tile_eval_row(uid, results_path, gt_path, score_thresh)
+    if ev:
+        out.append(('run', 'AP (mean of 0.5/1.0/1.5 m)',
+                     _fmt(ev['ap'], '{:.3f}')))
+        for thr in CHAMFER_THRESHOLDS:
+            out.append(('run', f'  AP @ {thr:g} m',
+                         _fmt(ev['ap_thr'].get(thr), '{:.3f}')))
+        out.append(('run', 'matched polylines (TP @ 1.0 m)',
+                     _fmt(ev['n_tp'])))
+        out.append(('run', 'recall', _fmt(ev.get('recall'), '{:.3f}')))
+        out.append(('run', 'precision', _fmt(ev.get('precision'), '{:.3f}')))
+        out.append(('run', 'median matched chamfer',
+                     _fmt(ev.get('chamfer'), '{:.3f}', ' m')))
+        out.append(('run', f'predictions ≥ {score_thresh:g}',
+                     _fmt(ev['n_pred_kept'])))
+        out.append(('run', 'count error (pred − GT)',
+                     _fmt(ev['count_error'], '{:+.0f}')))
+        if ev.get('n_arc') is not None:
+            out.append(('run', 'GT curved / straight',
+                         f"{ev['n_arc']} / {ev['n_straight']}"))
+    return out
+
+
+def tile_eval_row(uid, results_path, gt_path=None, score_thresh=0.0):
+    """This tile's row out of the results-tab eval, or None.
+
+    Reuses evaluate_run()'s cache, so the browse tab pays the eval cost once
+    per (results, GT, threshold) and not once per tile drawn. The GT is
+    resolved the same way the results tab resolves it -- by token overlap,
+    not file order -- because splits are disjoint and picking the wrong one
+    reports every tile as missing GT.
+    """
+    if not results_path:
+        return None
+    if gt_path is None:
+        gt_files = discover_gt(STATE.get('work_dir'))
+        if STATE.get('gt_json'):
+            gt_files = [STATE['gt_json']] + [g for g in gt_files
+                                              if g != STATE['gt_json']]
+        gt_path = best_gt_for(results_path, gt_files) if gt_files else None
+    if not gt_path:
+        return None
+    try:
+        rows = evaluate_run(results_path, gt_path, score_thresh)
+    except Exception:                                # noqa: BLE001
+        return None
+    return next((r for r in rows if r['uid'] == uid), None)
+
+
+def metrics_caption(items, sections=('tile', 'scan', 'run')):
+    """The terse one-line-per-section form used under a browse tile."""
+    lines = []
+    for sec in sections:
+        bits = [f'{lab.strip()} <b>{val}</b>' for s, lab, val in items
+                if s == sec and not lab.startswith('  ')]
+        if bits:
+            lines.append(' &middot; '.join(bits))
+    return '<br>'.join(lines)
+
+
+def metrics_table(items):
+    """The full form used on the 3D tab."""
+    if not items:
+        return f'<p style="color:{TEXT_MUTED}">no metrics for this tile</p>'
+    titles = {'tile': 'From the manifest', 'scan': 'From the deep scan',
+              'run': 'From the selected run'}
+    out = []
+    for sec in ('tile', 'scan', 'run'):
+        rows = [(lab, val) for s, lab, val in items if s == sec]
+        if not rows:
+            continue
+        body = ''.join(
+            f'<tr><td class="l">{html.escape(lab)}</td><td>{val}</td></tr>'
+            for lab, val in rows)
+        out.append(f'<h2>{titles[sec]}</h2>'
+                    f'<table class="stats"><tbody>{body}</tbody></table>')
+    return '\n'.join(out)
+
+
+# ---- 3D view (Open3D) -----------------------------------------------------
+#
+# Open3D is an OPTIONAL dependency and is imported only inside the child
+# process that opens the window -- never in the Flask process. Two reasons,
+# both hard requirements rather than tidiness:
+#
+#  * `draw_geometries()` runs its own event loop and blocks until the window
+#    is closed. In-process that would hang the server for as long as the
+#    user looks at the tile.
+#  * GUI toolkits demand the main thread, and this server is threaded. It is
+#    the same class of problem as matplotlib (see RENDER_LOCK), except no
+#    lock can fix it -- Flask's worker threads are not the main thread.
+#
+# So a launch re-execs THIS file with --o3d-spec <json> and returns
+# immediately. The window is a separate process with its own lifetime; the
+# user can open several, and closing one does not touch the server.
+#
+# The scene is built by build_o3d_scene(), which is pure numpy and returns
+# plain arrays. Only o3d_show() touches open3d, which is what makes the
+# geometry testable on a host that does not have it installed.
+
+O3D_COLORS = {
+    'rgb': 'true RGB colour',
+    'label': 'lane label',
+    'height': 'height (z)',
+    'intensity': 'intensity (BT.709 luma)',
+    'uniform': 'single colour',
+}
+# Predictions are 2D -- the results json carries no z -- so they are drawn on
+# the GT plane. That is not a fudge: reference-line z is CARLA's ground plane
+# (world z == 0), so in either frame both GT and predictions land at
+# -origin[2], the true height of the road surface relative to the cloud.
+PRED_COLOR = (1.0, 0.84, 0.04)
+
+
+def _hex_rgb(h):
+    h = h.lstrip('#')
+    return tuple(int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+
+
+def build_o3d_scene(name, ds, frame='offset', color='rgb',
+                     max_points=400000, classes=None, results_path=None,
+                     score_thresh=0.0, top_n=None, show_gt=True,
+                     show_pred=True):
+    """Everything the 3D window draws, as plain numpy. No open3d here.
+
+    Returns None if the tile cannot be loaded, else a dict of
+    points/colors/lines/title/info.
+    """
+    block = load_block(name, ds)
+    if block is None:
+        return None
+    try:
+        feat = np.asarray(block['features'])
+        labels = (np.asarray(block['labels']).astype(np.int64).ravel()
+                  if 'labels' in block else None)
+        origin, shift, _center = tile_frame(block, frame)
+        radius = (float(block['tile_radius']) if 'tile_radius' in block
+                  else 12.5)
+    finally:
+        block.close()
+
+    xyz = feat[:, :3].astype(np.float64)
+    if shift.any():
+        xyz = xyz + shift
+    n_raw = xyz.shape[0]
+    # Seeded, so re-opening the same tile gives the same cloud rather than a
+    # different random half of it.
+    if n_raw > max_points:
+        sel = np.random.default_rng(0).choice(n_raw, max_points, replace=False)
+        xyz = xyz[sel]
+        rgb_src = feat[sel, 3:6]
+        labels = labels[sel] if labels is not None else None
+    else:
+        sel = None
+        rgb_src = feat[:, 3:6]
+
+    if color == 'rgb':
+        colors = np.clip(np.asarray(rgb_src, dtype=np.float64), 0.0, 1.0)
+    elif color == 'label' and labels is not None:
+        colors = np.tile(np.array(_hex_rgb('#8b949e')), (xyz.shape[0], 1))
+        for lab in np.unique(labels):
+            colors[labels == lab] = _hex_rgb(
+                LABEL_COLORS.get(int(lab), '#8b949e'))
+    elif color == 'intensity':
+        strength = np.asarray(rgb_src, dtype=np.float64) @ RGB2GRAY
+        colors = _cmap('cividis')(_unit(strength))[:, :3]
+    elif color == 'height':
+        colors = _cmap('viridis')(_unit(xyz[:, 2]))[:, :3]
+    else:                                            # 'uniform', and label
+        colors = np.tile(np.array(_hex_rgb('#58a6ff')), (xyz.shape[0], 1))
+
+    lines = []
+    if show_gt:
+        for pts, cid, cname in load_polylines(name, origin, ds, ndim=3):
+            if classes is not None and class_key(cid) not in classes:
+                continue
+            lines.append(dict(points=np.asarray(pts, dtype=np.float64),
+                               color=_hex_rgb(class_color(cid)),
+                               label=f'GT {cname}'))
+    n_pred = 0
+    if show_pred and results_path:
+        plane = -float(origin[2])
+        kept = []
+        for pts, score, cls in load_results(results_path).get(name, []):
+            if score < score_thresh:
+                continue
+            cid = STATE['class_ids'].get(cls)
+            if classes is not None and cid is not None \
+                    and class_key(cid) not in classes:
+                continue
+            kept.append((pts, score, cls, cid))
+        kept.sort(key=lambda k: -k[1])
+        if top_n:
+            kept = kept[:top_n]
+        for pts, _score, cls, cid in kept:
+            xy = np.asarray(pts, dtype=np.float64)[:, :2]
+            lines.append(dict(
+                points=np.hstack([xy, np.full((len(xy), 1), plane)]),
+                color=(_hex_rgb(class_color(cid)) if cid is not None
+                       else PRED_COLOR),
+                label=f'pred {cls}'))
+        n_pred = len(kept)
+
+    shown = xyz.shape[0]
+    return dict(
+        points=xyz, colors=colors, lines=lines, radius=radius,
+        title=f'{name} [{ds}] — {frame} frame — {O3D_COLORS.get(color, color)}',
+        info=(f'{n_raw:,} points'
+              + (f' (showing {shown:,})' if sel is not None else '')
+              + f', {sum(1 for l in lines if l["label"].startswith("GT"))} GT'
+              + (f', {n_pred} pred' if results_path and show_pred else '')))
+
+
+def _cmap(name):
+    """Colormap lookup that works either side of matplotlib 3.9.
+
+    `matplotlib.cm.get_cmap` is deprecated from 3.7 and REMOVED in 3.9,
+    while `matplotlib.colormaps` only exists from 3.5. The host this runs on
+    has 3.3.4 today, so both branches are live.
+    """
+    try:
+        return matplotlib.colormaps[name]
+    except AttributeError:
+        return matplotlib.cm.get_cmap(name)
+
+
+def _unit(v):
+    """Scale to 0..1 for a colormap; constant input maps to the middle
+    rather than to a divide-by-zero."""
+    v = np.asarray(v, dtype=np.float64)
+    lo, hi = float(v.min()), float(v.max())
+    return np.full(v.shape, 0.5) if hi <= lo else (v - lo) / (hi - lo)
+
+
+def o3d_show(scene):
+    """Open the window. The ONLY function here that imports open3d."""
+    import open3d as o3d                             # noqa: PLC0415
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(scene['points'])
+    pcd.colors = o3d.utility.Vector3dVector(scene['colors'])
+    geoms = [pcd]
+    for spec in scene['lines']:
+        pts = spec['points']
+        if len(pts) < 2:
+            continue
+        ls = o3d.geometry.LineSet()
+        ls.points = o3d.utility.Vector3dVector(pts)
+        idx = np.column_stack([np.arange(len(pts) - 1),
+                                np.arange(1, len(pts))])
+        ls.lines = o3d.utility.Vector2iVector(idx)
+        ls.colors = o3d.utility.Vector3dVector(
+            np.tile(np.asarray(spec['color']), (len(idx), 1)))
+        geoms.append(ls)
+    # A frame marker at the origin, which is the whole point of the frame
+    # picker: under 'tile_center' it sits at the tile's centre, under
+    # 'offset' it does not.
+    geoms.append(o3d.geometry.TriangleMesh.create_coordinate_frame(
+        size=max(1.0, scene['radius'] / 10.0)))
+    o3d.visualization.draw_geometries(
+        geoms, window_name=scene['title'], width=1280, height=860)
+
+
+def launch_o3d(spec):
+    """Re-exec this file in a child process to open the window.
+
+    Returns None on success, or a message explaining why it could not
+    start. Deliberately does NOT wait: draw_geometries() blocks until the
+    user closes the window, and the server has to stay responsive.
+    """
+    cmd = [sys.executable, osp.abspath(__file__),
+            '--data-root', STATE['data_root'],
+            '--o3d-spec', json.dumps(spec)]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT)
+    except Exception as e:                           # noqa: BLE001
+        return f'{type(e).__name__}: {e}'
+    # A child that dies instantly (no open3d, no display) is the common
+    # failure and must not look like success. Anything longer-lived is
+    # assumed to be a window; we cannot wait for it.
+    time.sleep(1.2)
+    if proc.poll() is not None:
+        out = (proc.stdout.read() or b'').decode('utf-8', 'replace')
+        return out.strip().splitlines()[-1] if out.strip() else \
+            f'the viewer process exited immediately (code {proc.returncode})'
+    return None
+
+
 def discover_results(work_dir):
     """Find every prediction-results json under a training work_dir.
 
@@ -849,6 +1233,31 @@ def style_axes(ax, center, radius, grid=True):
                    center[0] - radius, center[0] + radius, **style)
 
 
+def tile_frame(block, frame):
+    """(origin, shift, center) for one block in the chosen frame.
+
+    * origin -- the 3-vector everything is expressed relative to. Under
+      'offset' that is the frame the stored features are already in; under
+      'tile_center' it is the tile's own centre.
+    * shift  -- `offset - origin`, what must be ADDED to the stored points
+      to reach that frame. Exactly zero for 'offset'.
+    * center -- where the tile centre lands in the chosen frame: zero under
+      'tile_center', 1-2 m (up to ~17 m on the 60 m export) under 'offset'.
+
+    Shared by the 2D renderer and the 3D scene builder so the two can never
+    disagree about where a tile is. See FRAMES.
+    """
+    block_offset = np.asarray(block['offset'], dtype=np.float64)
+    tile_center = (np.asarray(block['tile_center'], dtype=np.float64)
+                    if 'tile_center' in block else None)
+    origin = (tile_center_origin(tile_center, block_offset)
+              if frame == 'tile_center' else block_offset)
+    shift = (block_offset - origin).astype(np.float32)
+    center = (tile_center[:2] - origin[:2] if tile_center is not None
+              else np.zeros(2))
+    return origin, shift, center
+
+
 def render_tile(*args, **kwargs):
     """Thread-safe wrapper -- see RENDER_LOCK's comment at the top."""
     with RENDER_LOCK:
@@ -871,27 +1280,12 @@ def _render_tile(name, mode, show_polylines,
     # stored in, and (since the converter fix) the frame the training pkl's
     # GT is built in too. `tile_center` is NOT interchangeable: it differs
     # by a mean of ~2.4m, which is what the old converter got wrong.
-    block_offset = np.asarray(block['offset'], dtype=np.float64)
-    tile_center = (np.asarray(block['tile_center'], dtype=np.float64)
-                    if 'tile_center' in block else None)
-    # The origin EVERYTHING on this figure is expressed relative to. Under
-    # 'offset' that is the frame the stored features are already in, so the
-    # points need no shift and the tile sits off-centre; under
-    # 'tile_center' the points are shifted by `offset - origin` to join the
-    # GT and the predictions in the tile's own frame, which is where a
-    # GeMap-trained model puts them. See FRAMES.
-    origin = (tile_center_origin(tile_center, block_offset)
-              if frame == 'tile_center' else block_offset)
-    shift = (block_offset - origin).astype(np.float32)
+    origin, shift, center = tile_frame(block, frame)
     # `shift` is exactly zero in the 'offset' frame, and these arrays run to
     # 5M points, so skip the copy rather than adding zero to all of them.
     xy = feat[:, :2] + shift[:2] if shift.any() else feat[:, :2]
-    # Where the tile centre lands in the chosen frame: zero under
-    # 'tile_center', 1-2 m (up to ~17 m on the 60 m export) under 'offset'.
-    center = (tile_center[:2] - origin[:2] if tile_center is not None
-              else np.zeros(2))
     # The VIEW is centred on (0, 0) either way -- the frame the points, the
-    # GT and the predictions share -- with the radius grown by that
+    # GT and the predictions share -- with the radius grown by the tile's
     # displacement so an off-centre tile is not cropped. See the
     # "Coordinate frames" section of the module docstring.
     view_radius = radius + float(np.abs(center).max())
@@ -1153,7 +1547,7 @@ CSS = STYLE_TMPL.format(bg=BG, panel=BG_PANEL, border=BORDER, text=TEXT,
                         muted=TEXT_MUTED, accent=ACCENT)
 
 TABS = (('browse', 'Browse tiles'), ('stats', 'Dataset statistics'),
-        ('results', 'Training results'))
+        ('results', 'Training results'), ('view3d', '3D view'))
 
 
 def nav_html(active):
@@ -1371,10 +1765,139 @@ def class_boxes_html(selected):
     return '\n'.join(boxes)
 
 
+def view3d_page():
+    """The 3D tab: pick a tile, pick how it is coloured and which polylines
+    are drawn, read its metrics, and launch the Open3D window.
+
+    Everything on the form is also what gets handed to the child process, so
+    the 2D preview above the metrics is drawn from the SAME selection --
+    which is what makes it a preview rather than a second, differently
+    configured picture.
+    """
+    work_dir = STATE.get('work_dir')
+    result_files = discover_results(work_dir) if work_dir else {}
+
+    towns = list(STATE['groups'])
+    town = request.args.get('town')
+    if town not in STATE['groups']:
+        town = towns[0] if towns else None
+    if town is None:
+        return make_response('<p>no tiles loaded</p>')
+    in_town = [t for t in STATE['tiles'] if t['_group'] == town]
+    uid = request.args.get('tile')
+    if not any(t['_uid'] == uid for t in in_town):
+        uid = in_town[0]['_uid'] if in_town else None
+
+    color = request.args.get('color', 'rgb')
+    if color not in O3D_COLORS:
+        color = 'rgb'
+    frame_arg = request.args.get('frame') or STATE.get('frame') or 'auto'
+    if frame_arg not in ('auto',) + FRAMES:
+        frame_arg = 'auto'
+    max_points = max(1000, min(5_000_000,
+                                _safe_int(request.args.get('max_points'),
+                                           400_000)))
+    results = request.args.get('results') or ''
+    if results not in result_files:
+        results = ''
+    score_thresh = request.args.get('score_thresh', '0.3')
+    classes = selected_classes(request.args)
+    # The checkboxes are unticked on a bare page load, which HTML cannot
+    # distinguish from "the user unticked them". `submitted` is the marker
+    # the browse tab already uses for exactly this.
+    fresh = not request.args.get('submitted') and not request.args.get('open')
+    show_gt = fresh or bool(request.args.get('show_gt'))
+    show_pred = fresh or bool(request.args.get('show_pred'))
+
+    status = ''
+    if request.args.get('open') and uid:
+        tile = tile_by_uid(uid)
+        err = launch_o3d(dict(
+            name=tile['name'], ds=tile['_ds'], frame=resolve_frame(frame_arg),
+            color=color, max_points=max_points,
+            classes=sorted(classes) if classes is not None else None,
+            results=result_files.get(results) if results else None,
+            score_thresh=_safe_float(score_thresh, 0.3),
+            show_gt=show_gt, show_pred=show_pred))
+        if err:
+            status = (f'<div class="note" style="color:{CRITICAL};'
+                       f'max-width:60em"><b>Could not open the 3D window:</b> '
+                       f'<code>{html.escape(err)}</code><br>'
+                       f'{O3D_INSTALL}</div>')
+        else:
+            status = (f'<div class="note" style="color:{ACCENT}">Opened '
+                       f'<b>{html.escape(tile["name"])}</b> in a new Open3D '
+                       f'window. It is a separate process &mdash; close it '
+                       f'when done; this page stays usable.</div>')
+
+    preview = html.escape('?' + urlencode(
+        [('name', tile_by_uid(uid)['name']), ('ds', tile_by_uid(uid)['_ds']),
+          ('mode', color if color in ('rgb', 'label', 'intensity')
+           else 'points'),
+          ('frame', frame_arg), ('point_size', '1.5'),
+          ('v', f'{time.time():.6f}')]
+        + ([('polylines', '1')] if show_gt else [])
+        + ([('clsfilter', '1')] + [('cls', c) for c in sorted(classes)]
+           if classes is not None else [])
+        + ([('results', results), ('score_thresh', score_thresh)]
+           if results and show_pred else [])), quote=True)
+
+    items = tile_metrics(uid, result_files.get(results) if results else None,
+                          score_thresh=_safe_float(score_thresh, 0.3))
+    tile = tile_by_uid(uid)
+    page = VIEW3D_PAGE.format(
+        css=CSS, nav=nav_html('view3d'), muted=TEXT_MUTED,
+        header=(f'<code>{html.escape(tile["name"])}</code> in '
+                f'{html.escape(STATE["groups"][town]["town"])} '
+                f'&mdash; {len(in_town):,} tiles in this town'),
+        status=status,
+        town_opts=_opts(towns, town,
+                         [f'{STATE["groups"][t]["town"]}  '
+                          f'({STATE["groups"][t]["split"]}'
+                          f', {STATE["groups"][t]["count"]:,} tiles)'
+                          for t in towns]),
+        tile_opts=_opts([t['_uid'] for t in in_town], uid,
+                         [t['name'] for t in in_town]),
+        color_opts=_opts(list(O3D_COLORS), color,
+                          [O3D_COLORS[k] for k in O3D_COLORS]),
+        frame_opts=_opts(('auto',) + FRAMES, frame_arg,
+                          [FRAME_LABELS[k] for k in ('auto',) + FRAMES]),
+        max_points=max_points,
+        pred_fields=(PRED_FIELDS.format(
+            score_thresh=score_thresh,
+            result_opts=_opts([''] + list(result_files), results,
+                               ['(none)'] + list(result_files)))
+                     if result_files else NO_WORKDIR_NOTE),
+        class_fields=CLASS_FIELDS.format(
+            class_boxes=class_boxes_html(classes)),
+        gt_checked='checked' if show_gt else '',
+        pred_checked='checked' if show_pred else '',
+        preview=preview, metrics=metrics_table(items),
+        o3d_note=O3D_INSTALL)
+    # `submitted` marks any state that came from the form, so the checkbox
+    # defaults above only apply to a first load.
+    page = page.replace('<input type="hidden" name="tab" value="view3d">',
+                         '<input type="hidden" name="tab" value="view3d">'
+                         '<input type="hidden" name="submitted" value="1">')
+    resp = make_response(page)
+    resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+    return resp
+
+
+O3D_INSTALL = (
+    'The 3D window needs <b>Open3D</b>, which this viewer does not otherwise '
+    'require: <code>pip install open3d</code> (it pulls its own deps, so do '
+    'not use <code>--no-deps</code>). It opens a native window on the '
+    'machine running this server, so over SSH you need X forwarding or a '
+    'desktop session.')
+
+
 @app.route('/')
 def index():
     if request.args.get('tab') == 'stats':
         return stats_page()
+    if request.args.get('tab') == 'view3d':
+        return view3d_page()
     if request.args.get('tab') == 'results':
         return results_page()
     towns = list(STATE['groups'].keys())
@@ -1454,23 +1977,41 @@ def index():
         # HTML-parsing the URL; only a real browser triggers it.
         q = '?' + urlencode(params)
         q_attr = html.escape(q, quote=True)
-        cap = (f'{t["name"]} — {t["n_points"]:,} pts, '
-               f'{t.get("n_polylines", 0)} GT polylines')
+        # Header line: identity, plus a link into the 3D tab for this tile.
+        v3 = html.escape('/?' + urlencode(
+            [('tab', 'view3d'), ('town', t['_group']), ('tile', t['_uid']),
+              ('frame', frame_arg), ('color', mode)]
+            + ([('results', results)] if results else [])), quote=True)
+        cap = (f'<b>{html.escape(t["name"])}</b> '
+               f'<a href="{v3}" title="open this tile in the 3D tab">3D</a>')
         by_class = t.get('n_polylines_by_class') or {}
         if len(by_class) > 1 or (by_class and classes is not None):
-            cap += ' (' + ', '.join(f'{k}: {v}' for k, v in
-                                     sorted(by_class.items())) + ')'
+            cap += '<br>' + ', '.join(f'{k}: {v}' for k, v in
+                                       sorted(by_class.items()))
+        # The metrics themselves. Same three tiers as the 3D tab, from the
+        # same helper, so the two can never drift apart: manifest always,
+        # deep-scan fields once scanned, eval metrics once a run is picked.
+        row = next((r for r in stat_rows() if r['uid'] == t['_uid']), None)
+        cap += '<br>' + metrics_caption(tile_metrics(
+            t['_uid'], result_files.get(results) if results else None,
+            score_thresh=float(score_thresh)))
         if results:
             preds = load_results(result_files[results]).get(t['name'])
             if preds is None:
-                cap += ' — <span style="color:#d29922">no preds for this tile</span>'
-            else:
-                kept = sum(1 for _p, s, _c in preds if s >= float(score_thresh))
-                cap += f', {kept} preds'
+                cap += ('<br><span style="color:#d29922">no preds for this '
+                        'tile</span>')
+        if row is not None:
+            flags = ' '.join(
+                f'<span class="chip" style="color:{CHIP_COLORS[k]}" '
+                f'title="{html.escape(why, True)}">{k}</span>'
+                for k, why in tile_flags(row))
+            if flags:
+                cap += f'<br>{flags}'
         figs.append(
             f'<figure><a href="/tile.png{q_attr}" target="_blank">'
             f'<img src="/tile.png{q_attr}"></a>'
-            f'<figcaption>{cap}</figcaption></figure>')
+            f'<figcaption style="text-align:left;word-break:normal">'
+            f'{cap}</figcaption></figure>')
 
     # NB: not named `html` -- that shadows the stdlib `html` module used
     # above for attribute escaping.
@@ -4018,6 +4559,73 @@ def pick_band(ranked, band, count, seed, pinned):
 
 # ---- the page ------------------------------------------------------------
 
+VIEW3D_PAGE = """<!doctype html>
+<html><head>
+<title>CARLA tile in 3D</title>
+<style>{css}</style>
+</head><body>
+<h1>CARLA dataset viewer</h1>
+{nav}
+<div class="sub">{header}</div>
+
+{status}
+
+<form method="get">
+  <input type="hidden" name="tab" value="view3d">
+  <fieldset>
+    <label class="top">Town</label>
+    <select name="town">{town_opts}</select>
+  </fieldset>
+  <fieldset>
+    <label class="top">Tile</label>
+    <select name="tile">{tile_opts}</select>
+  </fieldset>
+  <fieldset>
+    <label class="top">Colour scheme</label>
+    <select name="color">{color_opts}</select>
+  </fieldset>
+  <fieldset>
+    <label class="top">Tile frame</label>
+    <select name="frame">{frame_opts}</select>
+  </fieldset>
+  <fieldset>
+    <label class="top">Max points</label>
+    <input type="number" name="max_points" value="{max_points}"
+           min="1000" max="5000000" step="1000">
+  </fieldset>
+  {pred_fields}
+  {class_fields}
+  <fieldset class="checks">
+    <label class="top">Polylines</label>
+    <label><input type="checkbox" name="show_gt" value="1" {gt_checked}>
+      ground truth</label>
+    <label><input type="checkbox" name="show_pred" value="1" {pred_checked}>
+      predictions</label>
+  </fieldset>
+  <button type="submit">Apply</button>
+  <button type="submit" name="open" value="1">Open in Open3D</button>
+</form>
+
+<div style="display:flex; gap:1.5em; flex-wrap:wrap; align-items:flex-start">
+  <figure style="margin:0">
+    <img src="/tile.png{preview}" style="width:520px; border-radius:4px">
+    <figcaption style="color:{muted}; font-size:0.75em; text-align:left;
+                       max-width:520px; margin-top:0.4em">
+      Top-down preview of the same selection. <b>Open in Open3D</b> launches
+      the interactive 3D window as a separate process &mdash; it draws the
+      full point cloud with these colours, the selected polylines, and a
+      coordinate frame at the origin, which is the tile centre only in the
+      <code>tile_center</code> frame.
+    </figcaption>
+  </figure>
+  <div>{metrics}</div>
+</div>
+
+<div class="note" style="margin-top:1.5em">{o3d_note}</div>
+</body></html>
+"""
+
+
 RESULTS_PAGE = """<!doctype html>
 <html><head>
 <title>CARLA training results</title>
@@ -4748,6 +5356,9 @@ def parse_args():
              "is what makes a GeMap run -- converted with --gt-frame "
              "tile_center -- line up without being told. Overridable per "
              "page.")
+    p.add_argument(
+        '--o3d-spec', default=None,
+        help=argparse.SUPPRESS)   # internal: set by the 3D tab's launcher
     p.add_argument('--port', type=int, default=5001)
     p.add_argument('--max-points', type=int, default=150000,
                     help='cap on points drawn in scatter modes (density mode '
@@ -4879,6 +5490,29 @@ def main():
     n_cached = load_deep_cache()
     print(f"Deep statistics: {n_cached:,}/{len(tiles):,} tiles cached "
           f"(grid={grid_str()} m) in {STATE['cache_dir']}")
+
+    # --o3d-spec makes this a one-shot 3D viewer instead of a server. It is
+    # how the Flask process opens a window: a child re-exec, because
+    # draw_geometries() blocks on its own event loop and needs the main
+    # thread (see the O3D section). Everything above still runs -- the child
+    # needs the tile index and the class lookups to build the scene.
+    if args.o3d_spec:
+        spec = json.loads(args.o3d_spec)
+        scene = build_o3d_scene(
+            spec['name'], spec['ds'], frame=spec.get('frame', 'offset'),
+            color=spec.get('color', 'rgb'),
+            max_points=spec.get('max_points', 400_000),
+            classes=set(spec['classes']) if spec.get('classes') else None,
+            results_path=spec.get('results'),
+            score_thresh=spec.get('score_thresh', 0.0),
+            top_n=spec.get('top_n'),
+            show_gt=spec.get('show_gt', True),
+            show_pred=spec.get('show_pred', True))
+        if scene is None:
+            raise SystemExit(f'could not load tile {spec["ds"]}/{spec["name"]}')
+        print(f'{scene["title"]} -- {scene["info"]}')
+        o3d_show(scene)
+        return
     print(f'Code version: {osp.basename(__file__)} last modified '
           f'{mtime:%Y-%m-%d %H:%M:%S}')
     print(f'Viewer on http://127.0.0.1:{args.port}')

@@ -614,7 +614,8 @@ theme. Two things worth keeping:
   more recorded iterations, per epoch.
 
 **`tools/maptrv2/dataset_viewer.py`** — standalone CARLA browser (flask /
-matplotlib / numpy, no torch or GPU). Three tabs:
+matplotlib / numpy, no torch or GPU; `open3d` optional, 3D tab only). Four
+tabs:
 
 *`?tab=browse`* — per-tile views: true RGB (`features[:, 3:6]`), lane
 label, flat top-down, 1 m² density heat map, intensity; polylines
@@ -908,6 +909,57 @@ gallery and each tile's caption now prints the per-threshold breakdown, which
 is what makes the 1.000 legible. The global AP in the header is unaffected: its
 ranking interleaves every tile, so a tile can't buy a perfect score off a small
 GT set.
+
+### 3D tab, and per-tile metrics on the browse captions (2026-08-18)
+
+`?tab=view3d` opens one tile in an interactive **Open3D** window: tile picker,
+colour scheme (RGB / lane label / height / intensity / uniform), frame,
+polyline-class filter, GT/prediction toggles, a top-down preview of the same
+selection, and the tile's full metric table.
+
+**Open3D is imported ONLY in the child process that opens the window**, never
+in the server, and this is a hard requirement rather than tidiness:
+`draw_geometries()` runs its own event loop and blocks until the window
+closes, and GUI toolkits demand the main thread — which a threaded Flask
+worker is not. No lock can fix it, unlike the matplotlib case (`RENDER_LOCK`).
+So a launch re-execs the file with `--o3d-spec <json>` (an `argparse.SUPPRESS`
+flag) and returns immediately; the window is a separate process with its own
+lifetime, several can be open at once, and closing one doesn't touch the
+server. `launch_o3d()` waits 1.2 s and checks `poll()`, because a child that
+dies instantly (no open3d, no display) must not report success — it surfaces
+the child's own last line, e.g. `ModuleNotFoundError: No module named
+'open3d'`, plus the install hint. **Install with plain `pip install open3d`,
+never `--no-deps`**: 0.19 eagerly imports its ML chain and needs `plotly`,
+`dash` and `addict`.
+
+`build_o3d_scene()` is pure numpy and imports nothing, which is what makes the
+geometry testable on a host without open3d — only `o3d_show()` touches the
+library. Verified against real Open3D 0.19 (installed to a throwaway
+`--target` dir, not the user's env): 116,537-point cloud with colours, one
+`LineSet` per polyline, a coordinate frame at the origin, bbox exactly ±12.5
+in the `tile_center` frame, and an actual X window confirmed open via
+`xdotool` while the server stayed responsive.
+
+**Predictions are drawn on the GT plane** because the results json has no z.
+Not a fudge: `reference_lines/*.json` stores 3D points whose z is CARLA's
+ground plane (world z == 0), so in either frame GT *and* predictions land at
+`-origin[2]` — the true height of the road surface relative to the cloud.
+Measured: point-cloud z spans −7.69..14.84 and the polylines sit at −7.688.
+`load_polylines(..., ndim=3)` keeps that z; every 2D caller still throws it
+away.
+
+`tile_metrics()` is the single source for per-tile numbers, in three tiers
+(manifest / deep scan / selected run), and feeds **both** the 3D tab's table
+and the browse tab's captions, so the two cannot drift apart. Browse captions
+now carry all three tiers plus the suspect chips and a link into the 3D tab.
+The eval tier reuses `evaluate_run()`'s cache, so a browse page pays the eval
+once, not once per tile drawn.
+
+**Watch the decorator when inserting a function before `index()`.**
+`@app.route('/')` sat directly above `def index():`, so inserting
+`view3d_page()` at that anchor silently moved the route onto the new function
+and *every* tab rendered the 3D page. Caught only by asserting on the returned
+`<title>` per tab — a check worth keeping in any page test.
 
 ### The viewer picks its frame off the GT file (2026-08-18)
 
