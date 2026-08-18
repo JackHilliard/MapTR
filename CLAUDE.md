@@ -932,6 +932,22 @@ the child's own last line, e.g. `ModuleNotFoundError: No module named
 never `--no-deps`**: 0.19 eagerly imports its ML chain and needs `plotly`,
 `dash` and `addict`.
 
+**Over an SSH tunnel from a cluster node, the 3D window cannot open**, and
+this is now refused up front rather than failing silently. The window opens on
+the machine running the *server*; `ssh -L` forwards HTTP only. Measured with
+`DISPLAY` unset: Open3D prints a GLFW warning, draws nothing, and the process
+**exits 0** — indistinguishable from success to any caller watching exit codes
+or timing. So `launch_o3d()` pre-checks `DISPLAY`/`WAYLAND_DISPLAY` (0.02 s to
+refuse, with an explanation), and success is confirmed by the child writing to
+a **status file** after `create_window()` returns true — never inferred from
+elapsed time, which cannot work in either direction here. `o3d_show()` uses
+`Visualizer` explicitly rather than `draw_geometries()` precisely because
+`create_window()` returns a bool and `draw_geometries()` does not. A real
+launch reports success in ~2.6 s. `ssh -X` is not a reliable workaround either
+(Open3D needs OpenGL 3.3+; indirect GLX usually cannot provide it) — run the
+viewer on the desktop, or use VNC on the node. Every other tab works fine over
+a tunnel.
+
 `build_o3d_scene()` is pure numpy and imports nothing, which is what makes the
 geometry testable on a host without open3d — only `o3d_show()` touches the
 library. Verified against real Open3D 0.19 (installed to a throwaway
@@ -939,6 +955,16 @@ library. Verified against real Open3D 0.19 (installed to a throwaway
 `LineSet` per polyline, a coordinate frame at the origin, bbox exactly ±12.5
 in the `tile_center` frame, and an actual X window confirmed open via
 `xdotool` while the server stayed responsive.
+
+**Polylines are tube meshes, not LineSets.** Open3D's legacy visualiser
+ignores `RenderOption.line_width` completely — measured by rendering one line
+offscreen at width 1, 5 and 15 and counting pixels, which gave an identical
+1-pixel-tall, 286-pixel line every time (OpenGL core profiles do not honour
+`glLineWidth > 1`). A LineSet is therefore a hairline at any setting. `_tube()`
+builds the mesh in numpy, carrying the rings along the curve by parallel
+transport so it does not twist at corners; thickness is a UI control in
+metres (default 0.30 m diameter). Verified by the same offscreen measurement:
+4 → 10 → 26 pixels tall for radius 0.05 → 0.15 → 0.40.
 
 **Predictions are drawn on the GT plane** because the results json has no z.
 Not a fudge: `reference_lines/*.json` stores 3D points whose z is CARLA's

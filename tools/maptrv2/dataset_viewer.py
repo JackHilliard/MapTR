@@ -223,10 +223,26 @@ file with `--o3d-spec <json>` and returns straight away. The scene itself is
 built by `build_o3d_scene()`, which is pure numpy and imports nothing --
 that is what keeps the geometry testable on a host without open3d.
 
+Polylines are drawn as TUBE MESHES, not LineSets. Open3D's legacy
+visualiser ignores `RenderOption.line_width` outright -- measured, by
+rendering one line offscreen at width 1, 5 and 15 and getting an identical
+1-pixel-tall line every time -- so a LineSet is a hairline at any setting.
+Thickness is a UI control in metres.
+
 Predictions are 2D (the results json has no z), so they are drawn on the GT
-plane. Not a fudge: reference-line z is CARLA's ground plane (world z == 0),
-so in either frame GT and predictions both land at `-origin[2]`, the true
-height of the road surface relative to the cloud.
+plane, lifted by one tube diameter. Not a fudge: reference-line z is CARLA's
+ground plane (world z == 0), so in either frame GT and predictions both land
+at `-origin[2]`, the true height of the road surface relative to the cloud;
+the lift only stops a prediction sitting exactly on its GT from being
+swallowed by it, and is stated in the window's own info line.
+
+The window opens on the machine running the SERVER. Over a port-forwarded
+tunnel from a cluster node there is no display for it, so `launch_o3d()`
+refuses up front rather than starting a child that draws nothing -- Open3D
+fails headless with a GLFW warning and still exits 0, which is otherwise
+indistinguishable from success. Success is confirmed by the child writing to
+a status file once `create_window()` has returned true, never guessed from
+elapsed time.
 
 Per-tile metrics come from `tile_metrics()` in three tiers -- manifest,
 deep scan, selected run -- and the SAME helper feeds the browse tab's
@@ -262,6 +278,7 @@ import os.path as osp
 import pickle
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -921,6 +938,67 @@ O3D_COLORS = {
 PRED_COLOR = (1.0, 0.84, 0.04)
 
 
+def _tube(pts, radius, sides=8):
+    """(vertices, triangles) for a tube of `radius` metres along a polyline.
+
+    Polylines have to be MESHES, not LineSets, to be visible at all: Open3D's
+    legacy visualiser ignores `RenderOption.line_width` outright -- measured
+    by rendering one line offscreen at width 1, 5 and 15 and counting pixels,
+    which gave an identical 1-pixel-tall, 286-pixel line every time (OpenGL
+    core profiles do not honour glLineWidth > 1). A tube has real geometry,
+    so it thickens on every backend and gains proper shading and occlusion
+    into the bargain.
+
+    Rings are carried along the curve by parallel transport rather than being
+    rebuilt from a fixed up-vector, which is what stops the tube twisting
+    where the polyline turns.
+    """
+    P = np.asarray(pts, dtype=np.float64)
+    if len(P) > 1:
+        keep = np.concatenate(
+            [[True], np.linalg.norm(np.diff(P, axis=0), axis=1) > 1e-9])
+        P = P[keep]
+    if len(P) < 2:
+        return None
+    T = np.empty_like(P)
+    T[0] = P[1] - P[0]
+    T[-1] = P[-1] - P[-2]
+    if len(P) > 2:
+        T[1:-1] = P[2:] - P[:-2]
+    T /= np.maximum(np.linalg.norm(T, axis=1, keepdims=True), 1e-12)
+
+    ref = np.array([0.0, 0.0, 1.0])
+    if abs(float(T[0] @ ref)) > 0.9:
+        ref = np.array([1.0, 0.0, 0.0])
+    n = np.cross(T[0], ref)
+    normals = [n / max(np.linalg.norm(n), 1e-12)]
+    for i in range(1, len(P)):
+        n = normals[-1] - T[i] * float(normals[-1] @ T[i])
+        ln = np.linalg.norm(n)
+        if ln < 1e-9:                       # exact reversal; pick any normal
+            alt = (np.array([1.0, 0.0, 0.0]) if abs(T[i][0]) < 0.9
+                   else np.array([0.0, 1.0, 0.0]))
+            n = np.cross(T[i], alt)
+            ln = np.linalg.norm(n)
+        normals.append(n / max(ln, 1e-12))
+    N = np.asarray(normals)
+    B = np.cross(T, N)
+
+    ang = np.linspace(0.0, 2.0 * np.pi, sides, endpoint=False)
+    V = (P[:, None, :]
+         + radius * (np.cos(ang)[None, :, None] * N[:, None, :]
+                      + np.sin(ang)[None, :, None] * B[:, None, :])
+         ).reshape(-1, 3)
+    tris = []
+    for i in range(len(P) - 1):
+        a, b = i * sides, (i + 1) * sides
+        for j in range(sides):
+            k = (j + 1) % sides
+            tris.append([a + j, b + j, b + k])
+            tris.append([a + j, b + k, a + k])
+    return V, np.asarray(tris, dtype=np.int32)
+
+
 def _hex_rgb(h):
     h = h.lstrip('#')
     return tuple(int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
@@ -929,7 +1007,7 @@ def _hex_rgb(h):
 def build_o3d_scene(name, ds, frame='offset', color='rgb',
                      max_points=400000, classes=None, results_path=None,
                      score_thresh=0.0, top_n=None, show_gt=True,
-                     show_pred=True):
+                     show_pred=True, line_radius=0.15):
     """Everything the 3D window draws, as plain numpy. No open3d here.
 
     Returns None if the tile cannot be loaded, else a dict of
@@ -979,13 +1057,20 @@ def build_o3d_scene(name, ds, frame='offset', color='rgb',
         colors = np.tile(np.array(_hex_rgb('#58a6ff')), (xyz.shape[0], 1))
 
     lines = []
+
+    def add(pts, color, label):
+        pts = np.asarray(pts, dtype=np.float64)
+        mesh = _tube(pts, line_radius)
+        if mesh is None:
+            return
+        lines.append(dict(points=pts, vertices=mesh[0], triangles=mesh[1],
+                           color=color, label=label))
+
     if show_gt:
         for pts, cid, cname in load_polylines(name, origin, ds, ndim=3):
             if classes is not None and class_key(cid) not in classes:
                 continue
-            lines.append(dict(points=np.asarray(pts, dtype=np.float64),
-                               color=_hex_rgb(class_color(cid)),
-                               label=f'GT {cname}'))
+            add(pts, _hex_rgb(class_color(cid)), f'GT {cname}')
     n_pred = 0
     if show_pred and results_path:
         plane = -float(origin[2])
@@ -1001,13 +1086,17 @@ def build_o3d_scene(name, ds, frame='offset', color='rgb',
         kept.sort(key=lambda k: -k[1])
         if top_n:
             kept = kept[:top_n]
+        # Lifted clear of the GT plane by one tube diameter. Coincident
+        # tubes are the case that matters -- a prediction sitting exactly on
+        # its GT would be swallowed by it and read as missing -- and this
+        # keeps the 2D view's "prediction on top" convention. The offset is
+        # stated in the scene info so the height is never mistaken for data.
+        lift = 2.0 * line_radius
         for pts, _score, cls, cid in kept:
             xy = np.asarray(pts, dtype=np.float64)[:, :2]
-            lines.append(dict(
-                points=np.hstack([xy, np.full((len(xy), 1), plane)]),
-                color=(_hex_rgb(class_color(cid)) if cid is not None
-                       else PRED_COLOR),
-                label=f'pred {cls}'))
+            add(np.hstack([xy, np.full((len(xy), 1), plane + lift)]),
+                 (_hex_rgb(class_color(cid)) if cid is not None
+                  else PRED_COLOR), f'pred {cls}')
         n_pred = len(kept)
 
     shown = xyz.shape[0]
@@ -1017,7 +1106,9 @@ def build_o3d_scene(name, ds, frame='offset', color='rgb',
         info=(f'{n_raw:,} points'
               + (f' (showing {shown:,})' if sel is not None else '')
               + f', {sum(1 for l in lines if l["label"].startswith("GT"))} GT'
-              + (f', {n_pred} pred' if results_path and show_pred else '')))
+              + (f', {n_pred} pred lifted {2.0 * line_radius:.2f} m above the '
+                 f'GT plane' if results_path and show_pred and n_pred else '')
+              + f', polylines {2.0 * line_radius:.2f} m thick'))
 
 
 def _cmap(name):
@@ -1041,32 +1132,61 @@ def _unit(v):
     return np.full(v.shape, 0.5) if hi <= lo else (v - lo) / (hi - lo)
 
 
-def o3d_show(scene):
-    """Open the window. The ONLY function here that imports open3d."""
+def o3d_show(scene, status_path=None):
+    """Open the window. The ONLY function here that imports open3d.
+
+    Uses Visualizer explicitly rather than draw_geometries() because
+    create_window() returns a BOOL and draw_geometries() does not. On a
+    machine with no display, draw_geometries prints a GLFW warning, draws
+    nothing and the process exits **0** -- indistinguishable from success to
+    the caller. That is exactly the cluster-over-SSH case, so it has to be
+    detectable rather than merely likely.
+
+    `status_path` is how the parent learns which happened without guessing
+    from timing: this writes 'ok' once the window exists, or the failure,
+    and the parent polls the file.
+    """
     import open3d as o3d                             # noqa: PLC0415
+
+    def report(msg):
+        if status_path:
+            try:
+                with open(status_path, 'w') as f:
+                    f.write(msg)
+            except OSError:
+                pass
+
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(scene['points'])
     pcd.colors = o3d.utility.Vector3dVector(scene['colors'])
     geoms = [pcd]
     for spec in scene['lines']:
-        pts = spec['points']
-        if len(pts) < 2:
-            continue
-        ls = o3d.geometry.LineSet()
-        ls.points = o3d.utility.Vector3dVector(pts)
-        idx = np.column_stack([np.arange(len(pts) - 1),
-                                np.arange(1, len(pts))])
-        ls.lines = o3d.utility.Vector2iVector(idx)
-        ls.colors = o3d.utility.Vector3dVector(
-            np.tile(np.asarray(spec['color']), (len(idx), 1)))
-        geoms.append(ls)
+        # A TriangleMesh tube, not a LineSet: line_width is ignored by this
+        # renderer (see _tube). compute_vertex_normals() is what makes the
+        # tube shade as a solid rather than as a flat silhouette.
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(spec['vertices'])
+        mesh.triangles = o3d.utility.Vector3iVector(spec['triangles'])
+        mesh.paint_uniform_color(np.asarray(spec['color']))
+        mesh.compute_vertex_normals()
+        geoms.append(mesh)
     # A frame marker at the origin, which is the whole point of the frame
     # picker: under 'tile_center' it sits at the tile's centre, under
     # 'offset' it does not.
     geoms.append(o3d.geometry.TriangleMesh.create_coordinate_frame(
         size=max(1.0, scene['radius'] / 10.0)))
-    o3d.visualization.draw_geometries(
-        geoms, window_name=scene['title'], width=1280, height=860)
+    vis = o3d.visualization.Visualizer()
+    if not vis.create_window(window_name=scene['title'], width=1280,
+                              height=860):
+        report('error: Open3D could not create an OpenGL window. There is no '
+                'usable display on the machine running this server.')
+        raise SystemExit(
+            'Open3D could not create an OpenGL window (no usable display).')
+    for g in geoms:
+        vis.add_geometry(g)
+    report('ok')
+    vis.run()                                        # blocks until closed
+    vis.destroy_window()
 
 
 def launch_o3d(spec):
@@ -1076,23 +1196,66 @@ def launch_o3d(spec):
     start. Deliberately does NOT wait: draw_geometries() blocks until the
     user closes the window, and the server has to stay responsive.
     """
+    # Pre-flight. The window opens on the machine running THIS SERVER, and
+    # with no display there is nothing for it to open onto. Worth checking
+    # here rather than letting the child fail, because it is the single most
+    # common way this feature does not work: a server on a cluster node,
+    # reached by port-forwarding, has an HTTP tunnel and no display at all.
+    if not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
+        return ('no display on the machine running this server ($DISPLAY and '
+                '$WAYLAND_DISPLAY are both unset)')
     cmd = [sys.executable, osp.abspath(__file__),
             '--data-root', STATE['data_root'],
             '--o3d-spec', json.dumps(spec)]
+    fd, status = tempfile.mkstemp(prefix='o3d_status_', suffix='.txt')
+    os.close(fd)
+    spec = dict(spec, status=status)
+    cmd[-1] = json.dumps(spec)
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                  stderr=subprocess.STDOUT)
     except Exception as e:                           # noqa: BLE001
+        os.unlink(status)
         return f'{type(e).__name__}: {e}'
-    # A child that dies instantly (no open3d, no display) is the common
-    # failure and must not look like success. Anything longer-lived is
-    # assumed to be a window; we cannot wait for it.
-    time.sleep(1.2)
-    if proc.poll() is not None:
-        out = (proc.stdout.read() or b'').decode('utf-8', 'replace')
-        return out.strip().splitlines()[-1] if out.strip() else \
-            f'the viewer process exited immediately (code {proc.returncode})'
-    return None
+    # Poll the child's own status file rather than guessing from elapsed
+    # time. Timing cannot work in either direction here: startup varies with
+    # dataset size, and a headless failure exits 0, so "still alive after N
+    # seconds" and "exited quickly" are both unreliable signals.
+    err = None
+    for _ in range(int(O3D_LAUNCH_TIMEOUT / 0.2)):
+        time.sleep(0.2)
+        try:
+            with open(status) as f:
+                said = f.read().strip()
+        except OSError:
+            said = ''
+        if said == 'ok':
+            break
+        if said.startswith('error:'):
+            err = said[len('error:'):].strip()
+            break
+        if proc.poll() is not None:
+            out = (proc.stdout.read() or b'').decode('utf-8', 'replace')
+            lines = [l for l in out.strip().splitlines() if l.strip()]
+            err = (lines[-1] if lines else
+                   f'the viewer process exited immediately '
+                   f'(code {proc.returncode})')
+            break
+    else:
+        # Neither outcome inside the budget. Not an error -- a big dataset
+        # simply takes longer to index -- so say so rather than claim either.
+        err = None
+    try:
+        os.unlink(status)
+    except OSError:
+        pass
+    return err
+
+
+# How long the launch route waits for the child to report a window. Long
+# enough for the child to index a multi-thousand-tile dataset, short enough
+# that a stuck launch does not hold the request open.
+O3D_LAUNCH_TIMEOUT = 12.0
 
 
 def discover_results(work_dir):
@@ -1797,6 +1960,10 @@ def view3d_page():
     max_points = max(1000, min(5_000_000,
                                 _safe_int(request.args.get('max_points'),
                                            400_000)))
+    # Diameter in the UI (what you actually see), radius in the geometry.
+    line_width = max(0.02, min(3.0,
+                                _safe_float(request.args.get('line_width'),
+                                             0.30)))
     results = request.args.get('results') or ''
     if results not in result_files:
         results = ''
@@ -1818,7 +1985,8 @@ def view3d_page():
             classes=sorted(classes) if classes is not None else None,
             results=result_files.get(results) if results else None,
             score_thresh=_safe_float(score_thresh, 0.3),
-            show_gt=show_gt, show_pred=show_pred))
+            show_gt=show_gt, show_pred=show_pred,
+            line_radius=line_width / 2.0))
         if err:
             status = (f'<div class="note" style="color:{CRITICAL};'
                        f'max-width:60em"><b>Could not open the 3D window:</b> '
@@ -1862,7 +2030,7 @@ def view3d_page():
                           [O3D_COLORS[k] for k in O3D_COLORS]),
         frame_opts=_opts(('auto',) + FRAMES, frame_arg,
                           [FRAME_LABELS[k] for k in ('auto',) + FRAMES]),
-        max_points=max_points,
+        max_points=max_points, line_width=f'{line_width:g}',
         pred_fields=(PRED_FIELDS.format(
             score_thresh=score_thresh,
             result_opts=_opts([''] + list(result_files), results,
@@ -1887,9 +2055,18 @@ def view3d_page():
 O3D_INSTALL = (
     'The 3D window needs <b>Open3D</b>, which this viewer does not otherwise '
     'require: <code>pip install open3d</code> (it pulls its own deps, so do '
-    'not use <code>--no-deps</code>). It opens a native window on the '
-    'machine running this server, so over SSH you need X forwarding or a '
-    'desktop session.')
+    '<b>not</b> use <code>--no-deps</code>).'
+    '<br><br>'
+    '<b>It opens on the machine running this server, not in your browser.</b> '
+    'If you reached this page by port-forwarding from a cluster node '
+    '(<code>ssh -L</code>), that tunnel carries HTTP only &mdash; there is no '
+    'display on the node for Open3D to draw onto, and the launch is refused '
+    'rather than silently doing nothing. <code>ssh -X</code> is not a reliable '
+    'fix either: Open3D needs OpenGL 3.3+ and indirect GLX usually cannot '
+    'provide it. What does work: run this viewer <b>on your desktop</b> '
+    'against the dataset (over sshfs, or a local copy) &mdash; every other '
+    'tab works unchanged over a tunnel, so only the 3D window needs the local '
+    'session. A VNC/virtual desktop on the node also works.')
 
 
 @app.route('/')
@@ -4593,6 +4770,11 @@ VIEW3D_PAGE = """<!doctype html>
     <input type="number" name="max_points" value="{max_points}"
            min="1000" max="5000000" step="1000">
   </fieldset>
+  <fieldset>
+    <label class="top">Polyline thickness (m)</label>
+    <input type="number" name="line_width" value="{line_width}"
+           min="0.02" max="3" step="0.05">
+  </fieldset>
   {pred_fields}
   {class_fields}
   <fieldset class="checks">
@@ -5475,6 +5657,31 @@ def main():
     STATE['class_choices'] = class_choices(datasets)
     STATE['class_summary'] = class_summary(datasets)
 
+    # --o3d-spec makes this a one-shot 3D viewer instead of a server. It is
+    # how the Flask process opens a window: a child re-exec, because
+    # draw_geometries() blocks on its own event loop and needs the main
+    # thread (see the O3D section). Placed here, above the deep-cache load
+    # and the startup banner, because a child drawing ONE tile needs neither
+    # -- and the launch route is waiting on it.
+    if args.o3d_spec:
+        spec = json.loads(args.o3d_spec)
+        scene = build_o3d_scene(
+            spec['name'], spec['ds'], frame=spec.get('frame', 'offset'),
+            color=spec.get('color', 'rgb'),
+            max_points=spec.get('max_points', 400_000),
+            classes=set(spec['classes']) if spec.get('classes') else None,
+            results_path=spec.get('results'),
+            score_thresh=spec.get('score_thresh', 0.0),
+            top_n=spec.get('top_n'),
+            show_gt=spec.get('show_gt', True),
+            show_pred=spec.get('show_pred', True),
+            line_radius=spec.get('line_radius', 0.15))
+        if scene is None:
+            raise SystemExit(f'could not load tile {spec["ds"]}/{spec["name"]}')
+        print(f'{scene["title"]} -- {scene["info"]}')
+        o3d_show(scene, status_path=spec.get('status'))
+        return
+
     # Flask runs with debug=False (the reloader is unreliable when the
     # process is backgrounded), so edits to this file do NOT take effect
     # until it's restarted. Print the file's mtime so a stale process is
@@ -5490,29 +5697,6 @@ def main():
     n_cached = load_deep_cache()
     print(f"Deep statistics: {n_cached:,}/{len(tiles):,} tiles cached "
           f"(grid={grid_str()} m) in {STATE['cache_dir']}")
-
-    # --o3d-spec makes this a one-shot 3D viewer instead of a server. It is
-    # how the Flask process opens a window: a child re-exec, because
-    # draw_geometries() blocks on its own event loop and needs the main
-    # thread (see the O3D section). Everything above still runs -- the child
-    # needs the tile index and the class lookups to build the scene.
-    if args.o3d_spec:
-        spec = json.loads(args.o3d_spec)
-        scene = build_o3d_scene(
-            spec['name'], spec['ds'], frame=spec.get('frame', 'offset'),
-            color=spec.get('color', 'rgb'),
-            max_points=spec.get('max_points', 400_000),
-            classes=set(spec['classes']) if spec.get('classes') else None,
-            results_path=spec.get('results'),
-            score_thresh=spec.get('score_thresh', 0.0),
-            top_n=spec.get('top_n'),
-            show_gt=spec.get('show_gt', True),
-            show_pred=spec.get('show_pred', True))
-        if scene is None:
-            raise SystemExit(f'could not load tile {spec["ds"]}/{spec["name"]}')
-        print(f'{scene["title"]} -- {scene["info"]}')
-        o3d_show(scene)
-        return
     print(f'Code version: {osp.basename(__file__)} last modified '
           f'{mtime:%Y-%m-%d %H:%M:%S}')
     print(f'Viewer on http://127.0.0.1:{args.port}')
