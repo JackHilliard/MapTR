@@ -3665,8 +3665,9 @@ RSHAPES = {
                  by='total GT polylines, in tiles holding both kinds',
                  xlabel='GT polylines in tile (tiles holding both kinds)'),
 }
-# Below this many tiles a box is quartiles of almost nothing, so it is drawn
-# muted and the title says how many such columns there are.
+# Below this many tiles a box is quartiles of almost nothing -- and at n=1 it
+# is literally invisible -- so those columns are drawn as individual hollow
+# markers instead, and the title says how many there are.
 SHAPE_MIN_TILES = 5
 
 
@@ -3705,17 +3706,43 @@ def plot_by_shape_count(rows, which, ykey):
 
     fig, ax = stat_fig(height=4.0, width=6.6)
     pos = np.arange(len(counts), dtype=np.float64)
-    bp = ax.boxplot(
-        series, positions=pos, widths=0.6, patch_artist=True,
-        flierprops=dict(marker='.', markersize=2.5, alpha=0.45,
-                         markerfacecolor=MUTED_MARK, markeredgecolor='none'),
-        medianprops=dict(color=BG, linewidth=1.4),
-        whiskerprops=dict(color=BORDER, linewidth=1.0),
-        capprops=dict(color=BORDER, linewidth=1.0))
-    for patch, s in zip(bp['boxes'], series):
-        patch.set_facecolor(BOX_HUE if len(s) >= SHAPE_MIN_TILES
-                             else MUTED_MARK)
-        patch.set_edgecolor('none')
+
+    # A box plot of one tile draws NOTHING: the box has zero height and its
+    # only mark is a median line painted in the background colour, so the
+    # column reads as missing data rather than as a real measurement. Two to
+    # four tiles is barely better -- a sliver whose quartiles mean nothing.
+    #
+    # So columns below SHAPE_MIN_TILES are drawn as the individual tile
+    # values instead, as hollow markers. Hollow because that is the honest
+    # shape of the claim: these are observations, not a distribution, and
+    # they should not read as a box seen edge-on. Everything else stays a
+    # box.
+    box_at = [i for i, s in enumerate(series) if len(s) >= SHAPE_MIN_TILES]
+    if box_at:
+        bp = ax.boxplot(
+            [series[i] for i in box_at], positions=pos[box_at], widths=0.6,
+            patch_artist=True,
+            flierprops=dict(marker='.', markersize=2.5, alpha=0.45,
+                             markerfacecolor=MUTED_MARK,
+                             markeredgecolor='none'),
+            medianprops=dict(color=BG, linewidth=1.4),
+            whiskerprops=dict(color=BORDER, linewidth=1.0),
+            capprops=dict(color=BORDER, linewidth=1.0))
+        for patch in bp['boxes']:
+            patch.set_facecolor(BOX_HUE)
+            patch.set_edgecolor('none')
+    for i, s in enumerate(series):
+        if i in box_at:
+            continue
+        # Spread the few points across the column so equal values do not
+        # hide behind one another; a single tile stays dead centre.
+        n = len(s)
+        dx = (np.zeros(1) if n == 1
+              else np.linspace(-0.16, 0.16, n))
+        ax.plot(pos[i] + dx, s, linestyle='none', marker='o',
+                 markersize=5.5, markerfacecolor='none',
+                 markeredgecolor=BOX_HUE_ALT, markeredgewidth=1.3,
+                 zorder=4)
     ax.set_xticks(pos)
     # The tile count goes in the tick label rather than above each box: a
     # box that is quartiles of 2 tiles looks exactly like one built from 60,
@@ -3727,8 +3754,9 @@ def plot_by_shape_count(rows, which, ykey):
     ax.grid(False, axis='x')
     # On its own line: this title is already at the width of the figure, and
     # tight_layout does not wrap -- it just lets the tail run off the canvas.
-    extra = (f'\n{thin} column(s), drawn grey, hold fewer than '
-             f'{SHAPE_MIN_TILES} tiles' if thin else '')
+    extra = (f'\n{thin} column(s) hold fewer than {SHAPE_MIN_TILES} tiles '
+             f'and show each tile as a hollow marker, not a box'
+             if thin else '')
     return finish(fig, ax, f'{ym["axis"]} by {spec["by"]}{extra}',
                    spec['xlabel'], tight=True)
 

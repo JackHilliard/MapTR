@@ -818,6 +818,17 @@ predictions; the partition removes the confound of the other kind being
 present, it does not attribute a match to the geometry of the line it
 matched.
 
+**A column of one tile drew literally nothing** (fixed 2026-08-18) — measured,
+not inferred: rendering an n=1 box and diffing against the background gives
+**0** differing pixels. A box plot of a single value is a zero-height patch
+whose only mark is a median line painted in `BG`, so the column read as
+missing data rather than as a real measurement. Columns below
+`SHAPE_MIN_TILES` (5) are now drawn as the individual tile values, as
+**hollow** markers — hollow because that is the honest shape of the claim:
+those are observations, not a distribution, and a filled mark would read as a
+box seen edge-on. Points in a thin column are spread across it so equal values
+don't hide behind each other; a single tile stays dead centre.
+
 **Per-tile AP = 1.000 is arithmetic, not a bug** — the most-asked question of
 this tab, now answered on the page by `ap_health()`. For a tile with G GT
 lines, AP (mmdet's `'area'` mode over that tile's own detections) is 1.000
