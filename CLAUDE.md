@@ -320,6 +320,42 @@ Verified on the 259-tile test split: 1210 instances / 0 dropped in both
 frames, and a full 1-epoch train+eval under the tile-centre config runs clean
 (mAP 0.0218 with train==val, so no accuracy conclusion).
 
+### Tile-centre configs, per tile size (2026-08-18)
+
+`maptrv2_carla_r50_24ep_lidar_tilecenter.py` (25 m) and
+`maptrv2_carla_r50_24ep_lidar_30m_tilecenter.py` (30 m, `tile_radius=15`).
+Each is a thin `_base_` overlay on its own offset-frame sibling and changes
+only four things: `recenter=True` on the loader in **both** pipelines, and
+`ann_file`/`map_ann_file` redirected under a `tile_center/` subdirectory.
+Everything tile-size dependent — `sparse_shape`, `bev_h_`/`bev_w_`, the coder
+and assigner ranges, the dataset's own `pc_range` — stays bound in the base's
+namespace and is deliberately NOT re-derived. Verified through `Config.
+fromfile`: the 30 m overlay resolves to `sparse_shape=[301,301,421]`,
+`bev_size=(120,120)`, `pc_range=±15`, `recenter=True` on train *and* test, and
+`aux_seg` intact (mmcv merges dicts recursively, so only the listed keys move).
+
+Generate the pkl per split, into that same `tile_center/` directory:
+
+```bash
+python tools/maptrv2/custom_carla_map_converter.py \
+    --data-root <30m export> --split test \
+    --gt-frame tile_center --out-dir data/carla_30m/tile_center/
+```
+
+**Do not pass `--lidar-point-cloud-range`.** The converter derives xy from the
+manifest's own `tile_radius`/`tile_side` (2026-08-10 section) and prints what
+it resolved; that must equal the config's `lidar_point_cloud_range` or the
+dataset warns at load. Confirmed end-to-end on the 60 m grid export, which is
+the only non-25 m export on this machine: it resolves ±30 unaided, and range
+coverage goes from **median 92.4% / 8 of 30 tiles under 90%** in the offset
+frame to **median 100%** in the tile-centre one, with instance counts
+unchanged (1246). That is the same effect measured on the 25 m split, and it
+does not shrink as tiles grow — the range is square around the origin while
+the tile is displaced from it.
+
+**No `tile_radius=15` export exists locally**; `data/carla_30m/` is absent, so
+both 30 m configs are still unexercised against real data.
+
 ### It reproduces GeMap's converter exactly (2026-08-18)
 
 Both converters were run over the same 259-tile test split and their pkls
