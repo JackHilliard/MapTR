@@ -829,6 +829,15 @@ those are observations, not a distribution, and a filled mark would read as a
 box seen edge-on. Points in a thin column are spread across it so equal values
 don't hide behind each other; a single tile stays dead centre.
 
+The **fliers had the same problem** and needed the same answer: at the stats
+tab's 2.5 pt / 45%-alpha muted dot, the two outliers in the curves-only chart
+(AP 0.88 and 0.71 — the best tiles in their columns) took a 3× zoom to find.
+They now use the identical hollow-circle style, so one rule holds across the
+whole chart: **a hollow circle is one tile**, whether it is an outlier inside
+a box or a whole column. The stats tab keeps its tiny muted dot on purpose —
+there a box summarises hundreds of tiles and the fliers are a cloud, whereas
+these columns hold 7–27.
+
 **Per-tile AP = 1.000 is arithmetic, not a bug** — the most-asked question of
 this tab, now answered on the page by `ap_health()`. For a tile with G GT
 lines, AP (mmdet's `'area'` mode over that tile's own detections) is 1.000

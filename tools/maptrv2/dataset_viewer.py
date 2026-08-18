@@ -3722,9 +3722,19 @@ def plot_by_shape_count(rows, which, ykey):
         bp = ax.boxplot(
             [series[i] for i in box_at], positions=pos[box_at], widths=0.6,
             patch_artist=True,
-            flierprops=dict(marker='.', markersize=2.5, alpha=0.45,
-                             markerfacecolor=MUTED_MARK,
-                             markeredgecolor='none'),
+            # Fliers are hollow circles in the SAME style as a thin column's
+            # markers, so one visual rule holds across the whole chart: a
+            # hollow circle is one tile. The stats tab's muted 2.5pt dot is
+            # right there, where a box summarises hundreds of tiles and the
+            # fliers are a cloud -- here a column holds 7-27 tiles and a
+            # flier is one of them, often the best-scoring one. At that size
+            # and 45% alpha on this background they were invisible: the two
+            # in the curves-only chart, at AP 0.88 and 0.71, needed a 3x
+            # zoom to find.
+            flierprops=dict(marker='o', markersize=4.5, alpha=0.9,
+                             markerfacecolor='none',
+                             markeredgecolor=BOX_HUE_ALT,
+                             markeredgewidth=1.0),
             medianprops=dict(color=BG, linewidth=1.4),
             whiskerprops=dict(color=BORDER, linewidth=1.0),
             capprops=dict(color=BORDER, linewidth=1.0))
