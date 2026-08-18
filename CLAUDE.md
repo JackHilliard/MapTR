@@ -322,11 +322,13 @@ frames, and a full 1-epoch train+eval under the tile-centre config runs clean
 
 ### Tile-centre configs, per tile size (2026-08-18)
 
-`maptrv2_carla_r50_24ep_lidar_tilecenter.py` (25 m) and
-`maptrv2_carla_r50_24ep_lidar_30m_tilecenter.py` (30 m, `tile_radius=15`).
-Each is a thin `_base_` overlay on its own offset-frame sibling and changes
-only four things: `recenter=True` on the loader in **both** pipelines, and
-`ann_file`/`map_ann_file` redirected under a `tile_center/` subdirectory.
+`maptrv2_carla_r50_24ep_lidar_tilecenter.py` (25 m),
+`maptrv2_carla_r50_24ep_lidar_30m_tilecenter.py` (30 m, `tile_radius=15`) and
+`maptrv2_carla_r50_24ep_lidar_30m_HM_tilecenter.py` (30 m + the polyline
+geometry loss). Each is a thin `_base_` overlay on its own offset-frame
+sibling and changes only four things: `recenter=True` on the loader in
+**both** pipelines, and `ann_file`/`map_ann_file` redirected under a
+`tile_center/` subdirectory.
 Everything tile-size dependent — `sparse_shape`, `bev_h_`/`bev_w_`, the coder
 and assigner ranges, the dataset's own `pc_range` — stays bound in the base's
 namespace and is deliberately NOT re-derived. Verified through `Config.
@@ -334,7 +336,24 @@ fromfile`: the 30 m overlay resolves to `sparse_shape=[301,301,421]`,
 `bev_size=(120,120)`, `pc_range=±15`, `recenter=True` on train *and* test, and
 `aux_seg` intact (mmcv merges dicts recursively, so only the listed keys move).
 
-Generate the pkl per split, into that same `tile_center/` directory:
+**`evaluation` has to be restated in the overlay**, purely to re-point it at
+the recentred `test_pipeline`. Neither HM config overrides `evaluation`, so
+without that line it inherits the 30 m base's copy and scores in the `offset`
+frame while training in the tile-centre one — silently. Verified through
+`Config.fromfile`: `recenter=True` reaches `train_pipeline`,
+`test_pipeline` **and** `evaluation.pipeline`, while `model`, `optimizer`,
+`lr_config` and `total_epochs` are byte-identical to the base (`loss_pts`
+stays `PolylineGeomLoss` mode `emd` at the tile-scaled weight 2.4 = 2.0 ×
+30/25, so the HM tile-size derivation is untouched). The HM overlay shares
+its base's `map_ann_file` name because it leaves `fixed_ptsnum_per_gt_line`
+at 20 — note the comment above `data` in the HM configs still says 40, which
+is **stale**; read the value. Two configs with *different* line counts must
+not share a `map_ann_file`, since `_format_gt()` bakes the resampling into a
+json it writes once and never regenerates.
+
+Generate the pkl per split, into that same `tile_center/` directory. One pkl
+serves both the plain and HM configs at a given tile size — the frame is a
+property of the data, the loss is not:
 
 ```bash
 python tools/maptrv2/custom_carla_map_converter.py \
