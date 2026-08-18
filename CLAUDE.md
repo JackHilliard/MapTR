@@ -966,6 +966,13 @@ transport so it does not twist at corners; thickness is a UI control in
 metres (default 0.30 m diameter). Verified by the same offscreen measurement:
 4 → 10 → 26 pixels tall for radius 0.05 → 0.15 → 0.40.
 
+**Everything is lifted clear of the road** (`line_lift`, a UI control,
+default 0.5 m). A tube centred *on* the ground plane has half its volume
+inside the densest part of the cloud, and the road returns draw over it from
+most angles — the line is present but unreadable. The whole set moves by one
+rigid amount, so GT and predictions stay comparable with each other; only
+their height above the road is fictional, and the window's info line says so.
+
 **Predictions are drawn on the GT plane** because the results json has no z.
 Not a fudge: `reference_lines/*.json` stores 3D points whose z is CARLA's
 ground plane (world z == 0), so in either frame GT *and* predictions land at

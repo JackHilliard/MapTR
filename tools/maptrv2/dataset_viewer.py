@@ -229,8 +229,14 @@ rendering one line offscreen at width 1, 5 and 15 and getting an identical
 1-pixel-tall line every time -- so a LineSet is a hairline at any setting.
 Thickness is a UI control in metres.
 
+Every polyline is lifted clear of the road (`line_lift`, a UI control,
+default 0.5 m): a tube centred ON the ground plane has half its volume inside
+the densest part of the cloud and is drawn over from most angles. The whole
+set moves rigidly, so GT and predictions stay comparable; only their height
+above the road is fictional, and the window's info line says so.
+
 Predictions are 2D (the results json has no z), so they are drawn on the GT
-plane, lifted by one tube diameter. Not a fudge: reference-line z is CARLA's
+plane, lifted by a further tube diameter. Not a fudge: reference-line z is CARLA's
 ground plane (world z == 0), so in either frame GT and predictions both land
 at `-origin[2]`, the true height of the road surface relative to the cloud;
 the lift only stops a prediction sitting exactly on its GT from being
@@ -1007,7 +1013,7 @@ def _hex_rgb(h):
 def build_o3d_scene(name, ds, frame='offset', color='rgb',
                      max_points=400000, classes=None, results_path=None,
                      score_thresh=0.0, top_n=None, show_gt=True,
-                     show_pred=True, line_radius=0.15):
+                     show_pred=True, line_radius=0.15, line_lift=0.5):
     """Everything the 3D window draws, as plain numpy. No open3d here.
 
     Returns None if the tile cannot be loaded, else a dict of
@@ -1066,10 +1072,19 @@ def build_o3d_scene(name, ds, frame='offset', color='rgb',
         lines.append(dict(points=pts, vertices=mesh[0], triangles=mesh[1],
                            color=color, label=label))
 
+    # Lift every polyline clear of the road surface. Without it a GT tube is
+    # centred ON the ground plane, so half of it is inside the densest part
+    # of the cloud and the road returns draw over it from most angles -- the
+    # line is there but you cannot see it. The whole set moves by the same
+    # rigid amount, so GT and predictions stay comparable with each other and
+    # only their height above the road is fictional; the amount is stated in
+    # the window's info line.
     if show_gt:
         for pts, cid, cname in load_polylines(name, origin, ds, ndim=3):
             if classes is not None and class_key(cid) not in classes:
                 continue
+            pts = np.asarray(pts, dtype=np.float64).copy()
+            pts[:, 2] += line_lift
             add(pts, _hex_rgb(class_color(cid)), f'GT {cname}')
     n_pred = 0
     if show_pred and results_path:
@@ -1086,12 +1101,10 @@ def build_o3d_scene(name, ds, frame='offset', color='rgb',
         kept.sort(key=lambda k: -k[1])
         if top_n:
             kept = kept[:top_n]
-        # Lifted clear of the GT plane by one tube diameter. Coincident
-        # tubes are the case that matters -- a prediction sitting exactly on
-        # its GT would be swallowed by it and read as missing -- and this
-        # keeps the 2D view's "prediction on top" convention. The offset is
-        # stated in the scene info so the height is never mistaken for data.
-        lift = 2.0 * line_radius
+        # The shared lift, plus one tube diameter so a prediction sitting
+        # exactly on its GT is not swallowed by it and read as missing --
+        # the 2D view's "prediction on top" convention.
+        lift = line_lift + 2.0 * line_radius
         for pts, _score, cls, cid in kept:
             xy = np.asarray(pts, dtype=np.float64)[:, :2]
             add(np.hstack([xy, np.full((len(xy), 1), plane + lift)]),
@@ -1106,9 +1119,12 @@ def build_o3d_scene(name, ds, frame='offset', color='rgb',
         info=(f'{n_raw:,} points'
               + (f' (showing {shown:,})' if sel is not None else '')
               + f', {sum(1 for l in lines if l["label"].startswith("GT"))} GT'
-              + (f', {n_pred} pred lifted {2.0 * line_radius:.2f} m above the '
-                 f'GT plane' if results_path and show_pred and n_pred else '')
-              + f', polylines {2.0 * line_radius:.2f} m thick'))
+              + (f', {n_pred} pred' if results_path and show_pred and n_pred
+                 else '')
+              + f', polylines {2.0 * line_radius:.2f} m thick, drawn '
+                f'{line_lift:.2f} m above the road'
+              + (f' (pred a further {2.0 * line_radius:.2f} m up)'
+                 if results_path and show_pred and n_pred else '')))
 
 
 def _cmap(name):
@@ -1964,6 +1980,8 @@ def view3d_page():
     line_width = max(0.02, min(3.0,
                                 _safe_float(request.args.get('line_width'),
                                              0.30)))
+    line_lift = max(0.0, min(20.0,
+                              _safe_float(request.args.get('line_lift'), 0.5)))
     results = request.args.get('results') or ''
     if results not in result_files:
         results = ''
@@ -1986,7 +2004,7 @@ def view3d_page():
             results=result_files.get(results) if results else None,
             score_thresh=_safe_float(score_thresh, 0.3),
             show_gt=show_gt, show_pred=show_pred,
-            line_radius=line_width / 2.0))
+            line_radius=line_width / 2.0, line_lift=line_lift))
         if err:
             status = (f'<div class="note" style="color:{CRITICAL};'
                        f'max-width:60em"><b>Could not open the 3D window:</b> '
@@ -2031,6 +2049,7 @@ def view3d_page():
         frame_opts=_opts(('auto',) + FRAMES, frame_arg,
                           [FRAME_LABELS[k] for k in ('auto',) + FRAMES]),
         max_points=max_points, line_width=f'{line_width:g}',
+        line_lift=f'{line_lift:g}',
         pred_fields=(PRED_FIELDS.format(
             score_thresh=score_thresh,
             result_opts=_opts([''] + list(result_files), results,
@@ -4775,6 +4794,11 @@ VIEW3D_PAGE = """<!doctype html>
     <input type="number" name="line_width" value="{line_width}"
            min="0.02" max="3" step="0.05">
   </fieldset>
+  <fieldset>
+    <label class="top">Lift above road (m)</label>
+    <input type="number" name="line_lift" value="{line_lift}"
+           min="0" max="20" step="0.1">
+  </fieldset>
   {pred_fields}
   {class_fields}
   <fieldset class="checks">
@@ -5675,7 +5699,8 @@ def main():
             top_n=spec.get('top_n'),
             show_gt=spec.get('show_gt', True),
             show_pred=spec.get('show_pred', True),
-            line_radius=spec.get('line_radius', 0.15))
+            line_radius=spec.get('line_radius', 0.15),
+            line_lift=spec.get('line_lift', 0.5))
         if scene is None:
             raise SystemExit(f'could not load tile {spec["ds"]}/{spec["name"]}')
         print(f'{scene["title"]} -- {scene["info"]}')
