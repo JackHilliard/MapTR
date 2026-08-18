@@ -301,6 +301,55 @@ def polyline_class_id(poly):
     return None
 
 
+def tile_center_origin(tile, offset):
+    """The 3-vector to subtract from a tile's world-frame polylines under
+    ``--gt-frame tile_center``.
+
+    xy is the tile centre: ``center`` where the export states one, else the
+    midpoint of ``bounds`` (identical on every tile of the 25m export, which
+    states both).
+
+    z is the awkward part, because not every export gives its tile centres a
+    z -- some write ``center`` as ``[x, y]``. Where a z is stated it is used;
+    where it is not, it falls back to the block's own ``offset``, making the
+    z component of the recentring shift exactly zero. That is the only choice
+    that keeps polylines and points in ONE frame: the shift is rigid and
+    applied to both, so alignment holds either way, and a 2D manifest simply
+    leaves z in the offset frame. Nothing downstream minds -- ``code_size=2``
+    means z never reaches a regression target.
+
+    This mirrors GeMap's ``tile_origin()`` exactly, which is the point: the
+    two converters must agree, or a checkpoint trained under one is scored
+    against GT built by the other. Verified on the 259-tile test split --
+    every annotation array bit-identical between the two, max |difference|
+    0.0.
+    """
+    center = tile.get('center')
+    if center is None:
+        bounds = tile.get('bounds')
+        if bounds is None:
+            raise ValueError(
+                f'tile {tile.get("name")!r} states neither `center` nor '
+                '`bounds`, so --gt-frame tile_center cannot place it')
+        bounds = np.asarray(bounds, dtype=np.float64)
+        if bounds.size == 4:            # [x_min, y_min, x_max, y_max]
+            center = (bounds[:2] + bounds[2:]) / 2.0
+        elif bounds.size == 6:          # [x_min, y_min, z_min, x_max, ...]
+            center = (bounds[:3] + bounds[3:]) / 2.0
+        else:
+            raise ValueError(
+                f'tile {tile.get("name")!r}: cannot read a centre from '
+                f'`bounds` of length {bounds.size}')
+    center = np.asarray(center, dtype=np.float32).ravel()
+    if center.size == 2:
+        return np.array([center[0], center[1], offset[2]], dtype=np.float32)
+    if center.size == 3:
+        return center.astype(np.float32)
+    raise ValueError(
+        f'tile {tile.get("name")!r}: `center` has {center.size} components, '
+        'expected 2 or 3')
+
+
 def count_points_in_range(lidar_path, pc_range, z_max, shift=None):
     """Count a block's points that would survive the training pipeline.
 
@@ -403,7 +452,7 @@ def convert_carla_tiles(data_root,
         # recorded per sample below and applied by
         # LoadCarlaPointsFromFile(recenter=True).
         if gt_frame == 'tile_center':
-            origin = np.asarray(tile['center'], dtype=np.float32)[:3]
+            origin = tile_center_origin(tile, block_offset)
         else:
             origin = block_offset
         shift = (block_offset - origin).astype(np.float32)

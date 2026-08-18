@@ -278,7 +278,7 @@ instances) with 0 tiles dropped under the current range; re-running train
 with the *old* narrow z-range (`-10..18`) drops exactly the 6 town03
 overpass tiles, confirming the criterion picks the right tiles.
 
-## GeMap-style `tile_center` frame (branch `worktree-carla-gt-frame-tile-center`, 2026-08-13)
+## GeMap-style `tile_center` frame (2026-08-13, merged to `maptrv2` 2026-08-18)
 
 GeMap's copy of the converter centres tiles and polylines on `tile_center`,
 not `offset`. That is available here as an opt-in frame, wired on **both**
@@ -319,6 +319,33 @@ bit-identical (0.0568 m) in both. What it does change:
 Verified on the 259-tile test split: 1210 instances / 0 dropped in both
 frames, and a full 1-epoch train+eval under the tile-centre config runs clean
 (mAP 0.0218 with train==val, so no accuracy conclusion).
+
+### It reproduces GeMap's converter exactly (2026-08-18)
+
+Both converters were run over the same 259-tile test split and their pkls
+compared array by array: **max |GT_MapTRv2 − GT_GeMap| = 0.0** across all 1210
+instances, same tiles, same `annotation_origin`. So the two are
+interchangeable on this data and a GeMap checkpoint can be scored against
+either pkl. Only the bookkeeping differs, which matters when reading a pkl
+back:
+
+| | MapTRv2 | GeMap |
+|---|---|---|
+| pkl-level key | `gt_frame` | `annotation_frame` |
+| per-sample shift | `lidar_recenter_shift` = `offset − origin` | `recenter_shift` = `origin − offset` |
+
+Note the **opposite sign**. Anything reading either file should detect the
+frame *structurally* — compare `annotation_origin` against `tile_center` —
+rather than trusting a key, which is what `dataset_viewer.pkl_gt_frame()`
+does.
+
+`tile_center_origin()` was hardened to match GeMap's `tile_origin()`: an
+export that states `center` as `[x, y]`, or states only `bounds`, no longer
+crashes. The z rule is GeMap's and is load-bearing — a 2D centre keeps the
+block's own z, so the shift has zero z component and the cloud's z is left
+untouched. `code_size=2` means z never reaches a regression target either
+way. The 25 m export states 3D centres, so this changes nothing there (still
+bit-identical); it only stops other exports failing.
 
 ## The converter is tile-size agnostic (2026-08-10)
 
@@ -777,10 +804,19 @@ converted with a `--classes` subset.
 Three box plots (`shape__arc` / `shape__straight` / `shape__all`), one box per
 tile-count on the x axis, quality on the y — the one place in this file where
 boxes are **vertical**, because the x axis is the count and that was the ask.
-**They are not per-instance accuracy by geometry kind.** A tile's AP covers all
-its polylines and tiles hold both kinds, so the chart says "how does a tile
-*containing* n curves score". The comparison that is valid is arc against
-straight *at equal counts*.
+
+**They partition the tiles; they are not three views of all of them** (changed
+2026-08-18). Every tile is curves-only, straights-only, or mixed, and appears
+in exactly one chart — 45 / 65 / 149 on the test split, summing to 259. The
+overlapping version could not answer "does the model struggle with curves",
+because the curve chart's tiles were mostly full of straight lines too. The
+comparison that is valid is curves-only against straights-only **at equal
+counts**, with the mixed chart as the population in between.
+
+**Still a per-TILE score, not per-instance.** A tile's AP covers all its
+predictions; the partition removes the confound of the other kind being
+present, it does not attribute a match to the geometry of the line it
+matched.
 
 **Per-tile AP = 1.000 is arithmetic, not a bug** — the most-asked question of
 this tab, now answered on the page by `ap_health()`. For a tile with G GT
@@ -797,6 +833,43 @@ gallery and each tile's caption now prints the per-threshold breakdown, which
 is what makes the 1.000 legible. The global AP in the header is unaffected: its
 ranking interleaves every tile, so a tile can't buy a perfect score off a small
 GT set.
+
+### The viewer picks its frame off the GT file (2026-08-18)
+
+A GeMap checkpoint drew its predictions centred while the viewer drew the
+tile displaced — the two frames above, mixed. The viewer now has a **Tile
+frame** picker (`--frame`, and a select on both the browse and results tabs)
+with `auto` / `offset` / `tile_center`.
+
+**`auto` detects the frame structurally**, by comparing each pkl sample's
+`annotation_origin` against its `tile_center` — not by reading a declared
+key, because MapTRv2 writes `gt_frame`, GeMap writes `annotation_frame` (with
+the opposite shift sign), and older pkls declare neither. The origins are
+always present and cannot disagree with the annotations they were subtracted
+from. `carla_map_gt.json` carries no origin, so it returns None and the
+caller falls back; that file's frame is the config's, not something recorded
+in it.
+
+Under `tile_center` the render shifts the POINTS by `offset − origin` (the
+stored `features` are always in the offset frame) and feeds the same origin
+to `load_polylines`, so points, GT and predictions land together. Verified:
+the viewer's drawn GT is **bit-identical to the converter pkl's** across all
+1210 instances (max |diff| 0.0), and `auto` renders byte-identical PNGs to an
+explicit `tile_center` while `offset` differs.
+
+Resolution order for `auto` with no GT selected (the browse tab): `--gt-json`
+first, then `discover_gt()`. Explicit beats discovery, because `discover_gt()`
+returns `data/carla`'s first pkl, which on a machine holding both frames is
+just whichever sorts first. With no `--gt-json` and an offset-frame
+`data/carla`, `auto` resolves to `offset` — old behaviour, byte-identical.
+
+The results tab warns (`frame_health()`) when the frame being **drawn**
+differs from the frame its GT was **built** in. What it cannot check is the
+frame the predictions were trained in: nothing in a results json records
+that, which is exactly why the symptom is confusing. The `gt` path also rides
+along on every `/tile.png` URL so the image route can resolve `auto` the same
+way the page did — validated against the discovered GT list first, since it
+reaches an `open()`.
 
 ### Example tiles are centred on the origin, with a metric grid (2026-08-17)
 

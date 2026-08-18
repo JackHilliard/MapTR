@@ -75,9 +75,38 @@ which misaligned every GT polyline against its own point cloud; it now
 subtracts `offset` and records the origin it used as `annotation_origin`
 in each pkl sample.
 
+--- Which frame? (`--frame`, and the "Tile frame" picker) ---
+Two conventions exist, and they are not interchangeable:
+
+  * `offset`      -- the block's own `offset`. MapTRv2's historical default.
+                     The tile is displaced from the origin here.
+  * `tile_center` -- the tile's nominal geometric centre. GeMap's
+                     convention, and what `custom_carla_map_converter.py
+                     --gt-frame tile_center` now writes. The tile IS
+                     centred, so it lines up with the model's square
+                     pc_range.
+
+A checkpoint trained under one cannot be read in the other: the frames
+differ by 1-2 m (25 m export) to ~17 m (60 m grid), far past chamfer
+thresholds of 0.5/1.0/1.5 m, so predictions look uniformly displaced from a
+correctly-placed tile. That is the symptom this picker exists for.
+
+`--frame auto` (the default) reads the frame back OUT of the selected GT
+pkl, structurally: it compares each sample's `annotation_origin` against its
+`tile_center` rather than trusting a declared key, because MapTRv2 writes
+`gt_frame`, GeMap writes `annotation_frame`, and older pkls declare neither
+-- while the origins are always present and cannot disagree with the
+annotations they were subtracted from. So a GeMap run just lines up.
+
+The results tab additionally warns when the frame being DRAWN differs from
+the frame its GT was built in, since that silently compares two different
+sets of lines.
+
 A consequence of rendering in the `offset` frame: the tile is NOT centred
 on (0, 0) there, it sits `tile_center - offset` away from it (1-2 m on the
-25 m export, ~17 m on the 60 m grid one).
+25 m export, ~17 m on the 60 m grid one). In the `tile_center` frame that
+displacement is zero by construction, and the points are shifted by
+`offset - tile_center` at render time to join the GT and the predictions.
 
 The axes are nonetheless centred on (0, 0), because that origin is the one
 thing every layer of a rendered tile shares: the LiDAR points are stored
@@ -178,14 +207,17 @@ says which split it came from.
   * The scatters mark tiles the statistics tab flags as suspect in the
     status colour, which is what makes "are the bad tiles just the broken
     ones?" answerable by looking.
-  * Curve-vs-line box plots split quality by how many ARC and how many
-    STRAIGHT GT polylines a tile holds. That tag lives only in
-    reference_lines/*.json (`type`), not in the converter pkl, so it is
-    read back per tile and only trusted when it accounts for exactly the
-    GT instances that were scored. Note what the split can and cannot say:
-    a tile's AP covers all its polylines, and tiles hold both kinds, so
-    these are "how does a tile CONTAINING this many curves score", not
-    per-instance accuracy by geometry kind.
+  * Curve-vs-line box plots PARTITION the tiles by what they hold --
+    curves only, straight lines only, or both -- so each tile appears in
+    exactly one chart and the curves-only chart really is measuring tiles
+    whose entire GT is curves (45 / 65 / 149 tiles on the test split).
+    That is what makes "does the model struggle with curves" answerable:
+    compare curves-only against straights-only at equal counts. The tag
+    lives only in reference_lines/*.json (`type`), not in the converter
+    pkl, so it is read back per tile and only trusted when it accounts for
+    exactly the GT instances that were scored. Still a per-TILE score: the
+    partition removes the confound of the other kind being present, it
+    does not attribute a match to the geometry of the line it matched.
   * Per-tile AP = 1.000 is arithmetic, not a bug, and ap_health() says so
     on the page. For a tile with G ground-truth lines it means the G
     highest-scoring of the head's 50 detections all matched, at every
@@ -562,6 +594,123 @@ def shape_counts(name, ds):
     return out
 
 
+# ---- GT frame -------------------------------------------------------------
+#
+# Two conventions exist for "where is the tile", and a checkpoint trained
+# under one cannot be read in the other. See the "Coordinate frames" section
+# of the module docstring for the geometry; this is the selector for it.
+#
+#   'offset'      -- the block's own `offset` array, i.e. the frame the raw
+#                    `features` are already stored in. MapTRv2's historical
+#                    default. The tile is NOT centred on the origin here.
+#   'tile_center' -- the tile's nominal geometric centre. GeMap's convention,
+#                    and what `custom_carla_map_converter.py --gt-frame
+#                    tile_center` now produces. The tile IS centred, so it
+#                    lines up with the model's square pc_range.
+#
+# They differ by 1-2 m on the 25 m export and up to ~17 m on the 60 m grid
+# one -- far past chamfer thresholds of 0.5/1.0/1.5 m, so mixing them makes
+# predictions look uniformly displaced from a correctly-placed tile.
+FRAMES = ('offset', 'tile_center')
+FRAME_LABELS = {
+    'auto': 'auto (follow the GT file)',
+    'offset': "offset — the block's own frame (MapTRv2 default)",
+    'tile_center': 'tile_center — tile centred on 0 (GeMap)',
+}
+
+
+def tile_center_origin(tile_center, offset):
+    """The origin to subtract under the tile_center frame.
+
+    Mirrors the converter's tile_center_origin() and GeMap's tile_origin(),
+    including the z rule: an export that states its tile centres as [x, y]
+    keeps the block's own z, so the recentring shift has zero z component
+    and the cloud's z is left untouched. code_size=2 means z never reaches a
+    regression target either way.
+    """
+    if tile_center is None:
+        return np.asarray(offset, dtype=np.float64)
+    c = np.asarray(tile_center, dtype=np.float64).ravel()
+    if c.size >= 3:
+        return c[:3].astype(np.float64)
+    return np.array([c[0], c[1], np.asarray(offset, dtype=np.float64)[2]])
+
+
+def pkl_gt_frame(path):
+    """Which frame a GT file's annotations are in, or None if unreadable.
+
+    Decided STRUCTURALLY -- by comparing each sample's `annotation_origin`
+    against its `tile_center` -- rather than by trusting a declared key,
+    because three producers write three different keys for this: MapTRv2
+    writes `gt_frame`, GeMap writes `annotation_frame`, and any pkl built
+    before either existed declares nothing at all. The origins themselves
+    are always there, and they cannot disagree with the annotations they
+    were subtracted from.
+
+    carla_map_gt.json carries no origin, so it returns None and the caller
+    falls back; that file is only ever written by an eval run, whose frame
+    is the config's, not something recorded in the file.
+    """
+    if not path or not path.endswith('.pkl'):
+        return None
+    cached = STATE['frame_cache'].get(path)
+    if cached is not None:
+        return cached
+    frame = None
+    try:
+        with open(path, 'rb') as f:
+            blob = pickle.load(f)
+        votes = {'offset': 0, 'tile_center': 0}
+        for smp in (blob.get('samples') or ())[:200]:
+            org, ctr = smp.get('annotation_origin'), smp.get('tile_center')
+            if org is None or ctr is None:
+                continue
+            a = np.asarray(org, dtype=np.float64).ravel()[:2]
+            b = np.asarray(ctr, dtype=np.float64).ravel()[:2]
+            votes['tile_center' if np.abs(a - b).max() < 1e-3
+                   else 'offset'] += 1
+        if any(votes.values()):
+            frame = max(votes, key=votes.get)
+        else:
+            # nothing to measure: fall back to whatever it declares
+            declared = blob.get('gt_frame') or blob.get('annotation_frame')
+            frame = declared if declared in FRAMES else None
+    except Exception:                                # noqa: BLE001
+        frame = None
+    STATE['frame_cache'][path] = frame
+    return frame
+
+
+def _known_gt(path):
+    """A GT path from a query string, or None if it is not one of ours."""
+    if not path:
+        return None
+    allowed = set(discover_gt(STATE.get('work_dir')))
+    if STATE.get('gt_json'):
+        allowed.add(STATE['gt_json'])
+    return path if path in allowed else None
+
+
+def resolve_frame(arg, gt_path=None):
+    """A concrete frame from the UI's three-valued selector."""
+    if arg in FRAMES:
+        return arg
+    if gt_path:
+        got = pkl_gt_frame(gt_path)
+        if got:
+            return got
+    # No GT selected -- the browse tab, which has no GT picker. An explicit
+    # --gt-json wins over discovery: it is the user naming the file, whereas
+    # discover_gt() just returns data/carla's first pkl, which on a machine
+    # holding both frames is whichever sorts first.
+    for cand in filter(None, [STATE.get('gt_json')]
+                       + discover_gt(STATE.get('work_dir'))):
+        got = pkl_gt_frame(cand)
+        if got:
+            return got
+    return 'offset'
+
+
 def discover_results(work_dir):
     """Find every prediction-results json under a training work_dir.
 
@@ -709,13 +858,12 @@ def render_tile(*args, **kwargs):
 def _render_tile(name, mode, show_polylines,
                   point_size, max_points, log_density=True, ds=None,
                   results_path=None, score_thresh=0.3, classes=None,
-                  top_n=None):
+                  top_n=None, frame='offset'):
     block = load_block(name, ds)
     if block is None:
         return None
     split = STATE['datasets'][ds]['split'] if ds in STATE['datasets'] else ds
     feat = block['features']
-    xy = feat[:, :2]
     labels = block['labels'] if 'labels' in block else None
     radius = float(block['tile_radius']) if 'tile_radius' in block else 12.5
 
@@ -723,15 +871,29 @@ def _render_tile(name, mode, show_polylines,
     # stored in, and (since the converter fix) the frame the training pkl's
     # GT is built in too. `tile_center` is NOT interchangeable: it differs
     # by a mean of ~2.4m, which is what the old converter got wrong.
-    origin = block['offset']
-    # ...which also means the tile is not centred on (0,0) here: it sits
-    # `center` away from the origin. The VIEW is still centred on (0,0) --
-    # the frame the points, the GT and the predictions all share -- and the
-    # radius is grown by that displacement so nothing is cropped. See the
+    block_offset = np.asarray(block['offset'], dtype=np.float64)
+    tile_center = (np.asarray(block['tile_center'], dtype=np.float64)
+                    if 'tile_center' in block else None)
+    # The origin EVERYTHING on this figure is expressed relative to. Under
+    # 'offset' that is the frame the stored features are already in, so the
+    # points need no shift and the tile sits off-centre; under
+    # 'tile_center' the points are shifted by `offset - origin` to join the
+    # GT and the predictions in the tile's own frame, which is where a
+    # GeMap-trained model puts them. See FRAMES.
+    origin = (tile_center_origin(tile_center, block_offset)
+              if frame == 'tile_center' else block_offset)
+    shift = (block_offset - origin).astype(np.float32)
+    # `shift` is exactly zero in the 'offset' frame, and these arrays run to
+    # 5M points, so skip the copy rather than adding zero to all of them.
+    xy = feat[:, :2] + shift[:2] if shift.any() else feat[:, :2]
+    # Where the tile centre lands in the chosen frame: zero under
+    # 'tile_center', 1-2 m (up to ~17 m on the 60 m export) under 'offset'.
+    center = (tile_center[:2] - origin[:2] if tile_center is not None
+              else np.zeros(2))
+    # The VIEW is centred on (0, 0) either way -- the frame the points, the
+    # GT and the predictions share -- with the radius grown by that
+    # displacement so an off-centre tile is not cropped. See the
     # "Coordinate frames" section of the module docstring.
-    center = ((np.asarray(block['tile_center'][:2], dtype=np.float64)
-                - np.asarray(origin[:2], dtype=np.float64))
-              if 'tile_center' in block else np.zeros(2))
     view_radius = radius + float(np.abs(center).max())
 
     fig = Figure(figsize=(6, 6))
@@ -907,7 +1069,8 @@ def _render_tile(name, mode, show_polylines,
         leg2.set_zorder(20)
 
     sub_note = f', showing {max_points:,}' if subsampled else ''
-    ax.set_title(f'{name}  [{split}]\n{n_raw:,} pts{sub_note} — {title_extra}',
+    ax.set_title(f'{name}  [{split}]  ({frame} frame)\n'
+                  f'{n_raw:,} pts{sub_note} — {title_extra}',
                   color=TEXT, fontsize=9)
     fig.tight_layout()
 
@@ -1030,6 +1193,10 @@ PAGE = """<!doctype html>
   <fieldset>
     <label class="top">Representation</label>
     <select name="mode">{mode_opts}</select>
+  </fieldset>
+  <fieldset>
+    <label class="top">Tile frame</label>
+    <select name="frame">{frame_opts}</select>
   </fieldset>
   <fieldset>
     <label class="top">Point size</label>
@@ -1248,6 +1415,12 @@ def index():
     # every image URL unique, which no cache layer can defeat. Rendering is
     # cheap and local, so always re-fetching costs nothing that matters.
     cachebust = f'{time.time():.6f}'
+    # Three-valued on purpose: 'auto' follows whatever GT file the converter
+    # last wrote, which is what makes a GeMap run (converted with --gt-frame
+    # tile_center) line up without the user having to know it should.
+    frame_arg = request.args.get('frame') or STATE.get('frame') or 'auto'
+    if frame_arg not in ('auto',) + FRAMES:
+        frame_arg = 'auto'
 
     figs = []
     for t in tiles:
@@ -1256,6 +1429,7 @@ def index():
             ('ds', t['_ds']),
             ('mode', mode),
             ('point_size', point_size),
+            ('frame', frame_arg),
             ('v', cachebust),
         ]
         if polylines:
@@ -1321,6 +1495,8 @@ def index():
                          ['true RGB colour', 'lane label',
                           'top-down (flat colour)',
                           'density heat map (1 m² bins)', 'intensity']),
+        frame_opts=_opts(('auto',) + FRAMES, frame_arg,
+                          [FRAME_LABELS[k] for k in ('auto',) + FRAMES]),
         pl_checked='checked' if polylines else '',
         lin_checked='checked' if linear_density else '',
         pred_fields=(
@@ -1366,6 +1542,11 @@ def tile_png():
         classes=(set(request.args.getlist('cls'))
                  if request.args.get('clsfilter') else None),
         top_n=_safe_int(request.args.get('top_n')),
+        # `gt` arrives from a query string, so it is only allowed to
+        # reach pkl_gt_frame()'s open() if it is one of the GT files this
+        # viewer discovered -- same rule /res.png applies.
+        frame=resolve_frame(request.args.get('frame'),
+                             _known_gt(request.args.get('gt'))),
     )
     if buf is None:
         abort(404)
@@ -3464,16 +3645,25 @@ def plot_quality_by_group(rows, ykey, group_by):
 # The geometry-kind splits. `key` is the per-row count this bins on; the
 # 'all' entry falls back to n_gt, which is n_arc + n_straight by
 # construction (checked in evaluate_run before either is trusted).
+# The three charts are a PARTITION of the tiles, not three views of all of
+# them: a tile is curves-only, straights-only, or mixed, and appears in
+# exactly one. Overlapping versions of these (bin every tile by its arc
+# count regardless of what else it holds) cannot answer "does the model
+# struggle with curves", because the curve chart's tiles were full of
+# straights too. `filt` is the membership test, `key` the x axis within it.
 RSHAPES = {
-    'arc': dict(key='n_arc', noun='curved (arc)',
-                 by='number of curved (arc) GT polylines',
-                 xlabel='curved GT polylines in tile'),
-    'straight': dict(key='n_straight', noun='straight',
-                      by='number of straight GT polylines',
-                      xlabel='straight GT polylines in tile'),
-    'all': dict(key='n_gt', noun='curved and straight',
-                 by='total GT polylines, curved and straight',
-                 xlabel='GT polylines in tile (curved + straight)'),
+    'arc': dict(key='n_arc', noun='curves-only',
+                 filt=lambda r: r['n_arc'] > 0 and r['n_straight'] == 0,
+                 by='number of curves, in curves-only tiles',
+                 xlabel='curved GT polylines (tiles with no straight lines)'),
+    'straight': dict(key='n_straight', noun='straights-only',
+                      filt=lambda r: r['n_straight'] > 0 and r['n_arc'] == 0,
+                      by='number of straight lines, in straights-only tiles',
+                      xlabel='straight GT polylines (tiles with no curves)'),
+    'all': dict(key='n_gt', noun='mixed',
+                 filt=lambda r: r['n_arc'] > 0 and r['n_straight'] > 0,
+                 by='total GT polylines, in tiles holding both kinds',
+                 xlabel='GT polylines in tile (tiles holding both kinds)'),
 }
 # Below this many tiles a box is quartiles of almost nothing, so it is drawn
 # muted and the title says how many such columns there are.
@@ -3484,14 +3674,17 @@ def plot_by_shape_count(rows, which, ykey):
     """Quality distribution against how many GT polylines of one geometry
     kind a tile holds -- one box per count, on a shared y axis.
 
-    The question it answers is whether the model struggles with curves as
-    such. Reading it needs one caveat kept in view: the three charts are not
-    independent slices of the same tiles. A tile with 4 curves usually also
-    has straights, and its AP is the AP of ALL its predictions, so the
-    'curved' chart is "how does a tile WITH this many curves score", not
-    "how well are curves predicted". Separating the second question would
-    need per-instance attribution, which needs the arc/straight tag to
-    survive into the matched pairs -- see the note in the caption.
+    The three charts partition the tiles by what they contain -- curves
+    only, straight lines only, or both -- so each tile appears in exactly
+    one, and the curves-only chart really is measuring tiles whose entire
+    GT is curves. That is what makes "does the model struggle with curves"
+    answerable: compare the curves-only and straights-only charts at equal
+    counts, with the mixed chart as the population in between.
+
+    It is still a per-TILE score, not per-instance: a tile's AP covers all
+    its predictions. The partition removes the confound of the other kind
+    being present; it does not attribute a match to the geometry of the
+    line it matched.
     """
     spec = RSHAPES[which]
     ym = RMETRICS[ykey]
@@ -3499,7 +3692,9 @@ def plot_by_shape_count(rows, which, ykey):
     for r in rows:
         n = r.get(spec['key'])
         v = r_metric(r, ykey)
-        if n is None or v is None:
+        if n is None or v is None or r.get('n_arc') is None:
+            continue
+        if not spec['filt'](r):
             continue
         per.setdefault(int(n), []).append(float(v))
     if len(per) < 2:
@@ -3643,18 +3838,18 @@ for _sk, _ss in RSHAPES.items():
     RPLOTS[f'shape__{_sk}'] = dict(
         kind='shape', shape=_sk, deep=False,
         note=(
-            'Does the model struggle with <b>curves</b>? One box per tile '
-            f'count of {_ss["noun"]} GT polylines; the y axis follows the '
-            'sort metric above. The geometry kind comes from each '
+            'Does the model struggle with <b>curves</b>? These three charts '
+            'are a <b>partition</b>: every tile is curves-only, '
+            'straights-only, or mixed, and appears in exactly one, so this '
+            f'one holds only <b>{_ss["noun"]}</b> tiles. Compare '
+            'curves-only against straights-only <i>at equal counts</i>; the '
+            'mixed chart is the population in between. The y axis follows '
+            'the sort metric above. Geometry kind comes from each '
             'polyline\'s <code>type</code> (arc / straight) in '
             '<code>reference_lines/*.json</code> &mdash; the converter pkl '
-            'does not carry it.'
-            + ('' if _sk == 'all' else
-               ' <b>Read it as</b> "how does a tile <i>containing</i> this '
-               'many score", not "how well are these predicted": a tile\'s '
-               'AP covers all its polylines, and tiles hold both kinds. The '
-               'comparison worth making is this chart against its '
-               'counterpart, at equal counts.')))
+            'does not carry it. Still a per-tile score: the partition '
+            'removes the confound of the other kind being present, it does '
+            'not attribute a match to the geometry of the line it matched.'))
 RPLOTS['pr'] = dict(kind='pr', deep=False,
                      note='The cross-check on everything else here: this is '
                           'the real interleaved-ranking eval, so its AP '
@@ -3826,6 +4021,10 @@ RESULTS_BODY = """
     <select name="mode">{mode_opts}</select>
   </fieldset>
   <fieldset>
+    <label class="top">Tile frame</label>
+    <select name="frame">{frame_opts}</select>
+  </fieldset>
+  <fieldset>
     <label class="top">Prediction counts&colon; score &ge;</label>
     <input type="number" name="score_thresh" value="{score_thresh}"
            min="0" max="1" step="0.01">
@@ -3976,10 +4175,41 @@ def results_summary_html(rows):
                  f'against, so they are left out of the curve-vs-line charts '
                  f'&mdash; the usual cause is a pkl converted with a '
                  f'<code>--classes</code> subset.</div>')
+    note += frame_health()
     note += ap_health(rows)
     note += count_health(rows)
     return (f'<table class="stats"><thead><tr>{head}</tr></thead>'
             f'<tbody><tr>{body}</tr></tbody></table>{note}')
+
+
+def frame_health():
+    """Warn when the tiles are being drawn in a different frame than the GT
+    they were scored against.
+
+    This is the failure the frame selector exists for, and it is silent
+    otherwise: the eval reads GT out of the pkl, in the pkl's frame, and
+    compares it to predictions the model emitted in ITS frame. Get those two
+    wrong relative to each other and every tile is uniformly displaced by
+    1-2 m (25 m export) or up to ~17 m (60 m grid) -- past every chamfer
+    threshold, so the scores collapse while each tile still looks
+    individually plausible.
+
+    The drawn frame is a rendering choice and can differ harmlessly; what
+    cannot differ is the frame the PREDICTIONS were trained in, and nothing
+    in a results json records that. So this reports what it can check and
+    names the thing it cannot.
+    """
+    drawn, gt_frame = REval.get('frame'), REval.get('gt_frame')
+    if not drawn or not gt_frame or drawn == gt_frame:
+        return ''
+    return (f'<div class="note" style="color:{CRITICAL};max-width:60em">'
+            f'<b>Frame mismatch:</b> tiles are drawn in the '
+            f'<code>{drawn}</code> frame while this GT was built in '
+            f'<code>{gt_frame}</code>. The two differ by 1&ndash;2 m on the '
+            f'25 m export and up to ~17 m on the 60 m one, so the drawn GT '
+            f'and the scored GT are not the same lines. Set <b>Tile '
+            f'frame</b> to <code>auto</code> unless you are deliberately '
+            f'comparing frames.</div>')
 
 
 def ap_coarse(row):
@@ -4180,6 +4410,12 @@ def results_page():
     top_n = request.args.get('top_n', 'gt')
     if top_n not in ('gt', 'all') and _safe_int(top_n) is None:
         top_n = 'gt'
+    # 'auto' resolves against the GT file selected above, so the tiles are
+    # drawn in the same frame their GT was built in -- which is also the
+    # frame the predictions must be in for the scores to mean anything.
+    frame_arg = request.args.get('frame') or STATE.get('frame') or 'auto'
+    if frame_arg not in ('auto',) + FRAMES:
+        frame_arg = 'auto'
 
     rows = evaluate_run(result_files[results], gt,
                          _safe_float(score_thresh, 0.0))
@@ -4239,12 +4475,18 @@ def results_page():
             f'<a href="/?tab=stats">deep scan</a> has run &mdash; all three '
             f'need every tile\'s .npz read.</figcaption></figure>')
 
+    # Recorded for frame_health(), which runs inside results_summary_html()
+    # and has no other way to see what the page chose.
+    REval['frame'] = resolve_frame(frame_arg, gt)
+    REval['gt_frame'] = pkl_gt_frame(gt)
+
     ranked = rank_rows(rows, sort_key)
     hidden = ''.join(
         f'<input type="hidden" name="{k}" value="{html.escape(str(v), True)}">'
         for k, v in [('tab', 'results'), ('results', results), ('gt', gt),
                       ('sort', sort_key), ('count', count), ('mode', mode),
                       ('group_by', group_by), ('top_n', top_n),
+                      ('frame', frame_arg),
                       ('score_thresh', score_thresh), ('seed', seed)])
     bands = []
     for band, title in BANDS:
@@ -4271,7 +4513,8 @@ def results_page():
             options='\n'.join(opts) or '<option disabled>no tiles</option>',
             next_seed=str(int(seed) + 1 if seed.isdigit() else 1),
             gallery=tile_gallery(chosen, mode, results, score_thresh,
-                                  sort_key, cachebust, top_n)))
+                                  sort_key, cachebust, top_n, frame_arg,
+                                  gt)))
 
     body = RESULTS_BODY.format(
         result_opts=_opts(list(result_files), results),
@@ -4285,6 +4528,8 @@ def results_page():
                                 'lane label', 'density heat map',
                                 'intensity']),
         count=count, seed=seed, score_thresh=score_thresh,
+        frame_opts=_opts(('auto',) + FRAMES, frame_arg,
+                          [FRAME_LABELS[k] for k in ('auto',) + FRAMES]),
         topn_opts=_opts(['gt', '1', '3', '5', '10', '20', 'all'], top_n,
                          ['as many as GT lines', 'top 1 by score', 'top 3',
                           'top 5', 'top 10', 'top 20', 'all predictions']),
@@ -4313,7 +4558,7 @@ def band_label(band, pool, sort_key):
 
 
 def tile_gallery(chosen, mode, results, score_thresh, sort_key, cachebust,
-                  top_n='all'):
+                  top_n='all', frame='auto', gt=None):
     """Renders through the existing /tile.png route, so these tiles look
     exactly like the browse tab's and the GT/pred overlay logic lives in one
     place."""
@@ -4322,6 +4567,9 @@ def tile_gallery(chosen, mode, results, score_thresh, sort_key, cachebust,
         params = [('name', r['name']), ('ds', r['ds']), ('mode', mode),
                    ('polylines', '1'), ('results', results),
                    ('score_thresh', score_thresh), ('point_size', '1.5'),
+                   # `gt` rides along so /tile.png can resolve frame='auto'
+                   # against the same GT file this page was scored with
+                   ('frame', frame), ('gt', gt or ''),
                    ('v', cachebust)]
         # 'gt' resolves per tile, which is the point of it
         n = r['n_gt'] if top_n == 'gt' else _safe_int(top_n)
@@ -4358,7 +4606,8 @@ def tile_gallery(chosen, mode, results, score_thresh, sort_key, cachebust,
         browse = html.escape(
             '/?' + urlencode([('town', r['group']), ('start', r['gidx']),
                                ('count', 1), ('mode', mode),
-                               ('polylines', '1')]), quote=True)
+                               ('frame', frame), ('polylines', '1')]),
+            quote=True)
         figs.append(
             f'<figure><a href="/tile.png{q}" target="_blank">'
             f'<img src="/tile.png{q}"></a>'
@@ -4454,6 +4703,13 @@ def parse_args():
                          'polylines from any *result*.json found under it '
                          '(or under val/<work-dir>, where the training eval '
                          'hook writes them)')
+    p.add_argument(
+        '--frame', default='auto', choices=('auto',) + FRAMES,
+        help="which origin tiles, GT and predictions are drawn relative to. "
+             "'auto' (default) reads it back from the selected GT pkl, which "
+             "is what makes a GeMap run -- converted with --gt-frame "
+             "tile_center -- line up without being told. Overridable per "
+             "page.")
     p.add_argument('--port', type=int, default=5001)
     p.add_argument('--max-points', type=int, default=150000,
                     help='cap on points drawn in scatter modes (density mode '
@@ -4512,6 +4768,8 @@ def main():
     STATE['results_cache'] = {}
     STATE['gt_cache'] = {}
     STATE['shape_cache'] = {}
+    STATE['frame_cache'] = {}
+    STATE['frame'] = args.frame
     STATE['gt_json'] = osp.abspath(args.gt_json) if args.gt_json else None
     if STATE['gt_json'] and not osp.isfile(STATE['gt_json']):
         raise SystemExit(f'--gt-json is not a file: {args.gt_json}')
