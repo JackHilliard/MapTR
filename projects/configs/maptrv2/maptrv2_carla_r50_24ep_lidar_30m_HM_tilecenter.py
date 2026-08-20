@@ -41,12 +41,12 @@ both, since the frame is a property of the data, not of the loss::
     python tools/maptrv2/custom_carla_map_converter.py \
         --data-root <30m export> --split test \
         --gt-frame tile_center \
-        --out-dir data/carla_30m/tile_center/
+        --out-dir data/carla/ --out-tag 30m_tc
 
     python tools/maptrv2/custom_carla_map_converter.py \
         --data-root <30m export> --split train \
         --gt-frame tile_center \
-        --out-dir data/carla_30m/tile_center/
+        --out-dir data/carla/ --out-tag 30m_tc
 
 Do NOT pass `--lidar-point-cloud-range`: the converter derives xy from the
 manifest's own `tile_radius`/`tile_side` and prints what it resolved, which
@@ -72,7 +72,7 @@ lidar_point_cloud_range = [-15.0, -15.0, -72.0, 15.0, 15.0, 96.0]
 lidar_voxel_size = [0.1, 0.1, 0.4]
 map_classes = ['divider']
 
-data_root = 'data/carla_30m/'
+data_root = 'data/carla/'
 # The same files the non-HM tile-centre config uses, map_ann_file included:
 # the frame is a property of the data, the loss is not, and this config
 # leaves `fixed_ptsnum_per_gt_line` at the base's 20, so _format_gt() would
@@ -85,10 +85,15 @@ data_root = 'data/carla_30m/'
 # must NOT share a path. The comment above `data` in
 # maptrv2_carla_r50_24ep_lidar_30m_HM.py still says 40 -- it is stale, the
 # value there is 20 -- so read the value, not the comment.)
-ann_file_train = data_root + 'tile_center/carla_map_infos_train.pkl'
-ann_file_val = data_root + 'tile_center/carla_map_infos_test.pkl'
-ann_file_test = data_root + 'tile_center/carla_map_infos_test.pkl'
-map_ann_file = data_root + 'tile_center/carla_map_gt.json'
+#
+# Kept in data/carla/ and separated by the converter's `--out-tag`, not by a
+# per-variant subdirectory -- matching the non-HM sibling and the 2cls
+# configs. These four lines must stay equal to that sibling's, since the two
+# deliberately share one pkl.
+ann_file_train = data_root + 'carla_map_infos_train_30m_tc.pkl'
+ann_file_val = data_root + 'carla_map_infos_test_30m_tc.pkl'
+ann_file_test = data_root + 'carla_map_infos_test_30m_tc.pkl'
+map_ann_file = data_root + 'carla_map_gt_30m_tc.json'
 
 # Same steps as the base, with recenter=True on the loader. mmcv replaces
 # list-valued keys wholesale rather than merging them, so the pipelines are

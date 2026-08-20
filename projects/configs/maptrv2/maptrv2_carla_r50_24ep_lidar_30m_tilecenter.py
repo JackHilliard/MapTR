@@ -34,18 +34,18 @@ does not shrink as tiles grow.
 
 --- Generating the pkl ---
 
-The 30m export needs its own converter run, into its own directory so the
-two frames never share an `ann_file`::
+The 30m export needs its own converter run, tagged so the two frames never
+share an `ann_file`::
 
     python tools/maptrv2/custom_carla_map_converter.py \
         --data-root <30m export> --split test \
         --gt-frame tile_center \
-        --out-dir data/carla_30m/tile_center/
+        --out-dir data/carla/ --out-tag 30m_tc
 
     python tools/maptrv2/custom_carla_map_converter.py \
         --data-root <30m export> --split train \
         --gt-frame tile_center \
-        --out-dir data/carla_30m/tile_center/
+        --out-dir data/carla/ --out-tag 30m_tc
 
 `--lidar-point-cloud-range` is deliberately NOT passed: the converter
 derives xy from the manifest's own `tile_radius`/`tile_side`, so a real 30m
@@ -79,12 +79,21 @@ lidar_point_cloud_range = [-15.0, -15.0, -72.0, 15.0, 15.0, 96.0]
 lidar_voxel_size = [0.1, 0.1, 0.4]
 map_classes = ['divider']
 
-data_root = 'data/carla_30m/'
-# Separate directory, so a `--gt-frame offset` 30m pkl can coexist untouched.
-ann_file_train = data_root + 'tile_center/carla_map_infos_train.pkl'
-ann_file_val = data_root + 'tile_center/carla_map_infos_test.pkl'
-ann_file_test = data_root + 'tile_center/carla_map_infos_test.pkl'
-map_ann_file = data_root + 'tile_center/carla_map_gt.json'
+data_root = 'data/carla/'
+# All CARLA pkls live in one directory and are kept apart by the converter's
+# `--out-tag`, not by nested per-variant directories -- the same convention
+# the 2cls configs use. The tag names what differs from the plain
+# `carla_map_infos_<split>.pkl` sitting beside it (25m, offset frame,
+# divider-only): here 30m tiles in the tile_center frame, `_2cls` on top of
+# that where the taxonomy differs too.
+#
+# The tag is what makes `--out-dir data/carla/` safe: the converter's output
+# filename is otherwise a function of `--split` alone, so a second dataset
+# written there would overwrite the existing 25m pkl with no warning.
+ann_file_train = data_root + 'carla_map_infos_train_30m_tc.pkl'
+ann_file_val = data_root + 'carla_map_infos_test_30m_tc.pkl'
+ann_file_test = data_root + 'carla_map_infos_test_30m_tc.pkl'
+map_ann_file = data_root + 'carla_map_gt_30m_tc.json'
 
 # Same steps as the base, with recenter=True on the loader. mmcv replaces
 # list-valued keys wholesale rather than merging them, so the pipelines are

@@ -327,8 +327,8 @@ frames, and a full 1-epoch train+eval under the tile-centre config runs clean
 `maptrv2_carla_r50_24ep_lidar_30m_HM_tilecenter.py` (30 m + the polyline
 geometry loss). Each is a thin `_base_` overlay on its own offset-frame
 sibling and changes only four things: `recenter=True` on the loader in
-**both** pipelines, and `ann_file`/`map_ann_file` redirected under a
-`tile_center/` subdirectory.
+**both** pipelines, and `ann_file`/`map_ann_file` redirected to a
+tagged filename (see below).
 Everything tile-size dependent — `sparse_shape`, `bev_h_`/`bev_w_`, the coder
 and assigner ranges, the dataset's own `pc_range` — stays bound in the base's
 namespace and is deliberately NOT re-derived. Verified through `Config.
@@ -351,15 +351,25 @@ is **stale**; read the value. Two configs with *different* line counts must
 not share a `map_ann_file`, since `_format_gt()` bakes the resampling into a
 json it writes once and never regenerates.
 
-Generate the pkl per split, into that same `tile_center/` directory. One pkl
-serves both the plain and HM configs at a given tile size — the frame is a
-property of the data, the loss is not:
+Generate the pkl per split. One pkl serves both the plain and HM configs at a
+given tile size — the frame is a property of the data, the loss is not:
 
 ```bash
 python tools/maptrv2/custom_carla_map_converter.py \
     --data-root <30m export> --split test \
-    --gt-frame tile_center --out-dir data/carla_30m/tile_center/
+    --gt-frame tile_center --out-dir data/carla/ --out-tag 30m_tc
 ```
+
+**Everything lives in `data/carla/`, kept apart by `--out-tag`** (changed
+2026-08-20; these configs previously used a `data/carla_30m/tile_center/`
+subdirectory). The tag names what differs from the plain
+`carla_map_infos_<split>.pkl` beside it — the 25 m, offset-frame,
+divider-only original: `30m_tc` for 30 m tiles in the tile-centre frame,
+`30m_tc_2cls` when the taxonomy differs too. The four tile-centre 30 m
+configs and their `_nocolour` children resolve to exactly two pkl sets, and
+`--out-tag` is what keeps a second dataset from silently overwriting the
+first, since the converter's filename is otherwise a function of `--split`
+alone.
 
 **Do not pass `--lidar-point-cloud-range`.** The converter derives xy from the
 manifest's own `tile_radius`/`tile_side` (2026-08-10 section) and prints what
@@ -372,8 +382,11 @@ unchanged (1246). That is the same effect measured on the 25 m split, and it
 does not shrink as tiles grow — the range is square around the origin while
 the tile is displaced from it.
 
-**No `tile_radius=15` export exists locally**; `data/carla_30m/` is absent, so
-both 30 m configs are still unexercised against real data.
+**A `tile_radius=15` export now exists**: `../carla_test`, 3795 tiles (see
+the 2026-08-20 section), converted to
+`data/carla/carla_map_infos_test_30m_tc_2cls.pkl`. The single-class
+`30m_tc` pkl these two configs point at has **not** been generated yet —
+run the converter without `--map-classes` to produce it.
 
 ### It reproduces GeMap's converter exactly (2026-08-18)
 
@@ -433,8 +446,11 @@ python tools/maptrv2/custom_carla_map_converter.py \
   function of `--split` alone, so writing a second dataset into
   `data/carla/` would **overwrite the existing 25 m offset-frame pkl with no
   warning**. That is why these configs, which live under `data/carla/` by
-  request rather than in a `carla_30m/tile_center/` subdirectory, name their
-  files `..._30m_tc_2cls.pkl`.
+  request rather than in a per-variant subdirectory, name their files
+  `..._30m_tc_2cls.pkl`. The single-class 30 m tile-centre configs were moved
+  to the same convention on 2026-08-20 (`_30m_tc`); the **25 m**
+  `maptrv2_carla_r50_24ep_lidar_tilecenter.py` still uses the older
+  `data/carla/tile_center/` subdirectory and is now the odd one out.
 - The pkl gains `map_classes` (the names, in label order) and `class_groups`
   (name → export class ids).
 
