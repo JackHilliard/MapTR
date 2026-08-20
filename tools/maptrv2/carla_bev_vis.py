@@ -4,17 +4,19 @@ CARLA-specific, LiDAR-only counterpart to tools/maptrv2/av2_vis_pred.py --
 that script's BEV plotting is entangled with AV2's multi-camera image
 projection (irrelevant here, CARLA has no camera branch) and its own
 multi-class (divider/ped_crossing/boundary/centerline) bookkeeping
-(irrelevant here, CARLA is divider-only). This keeps just the BEV plot,
-adapted to this dataset's ±12.5m square tile and single class, and writes
-one combined GT+prediction PNG per sample (not separate GT_MAP/PRED_MAP
-files) for easier side-by-side viewing.
+(irrelevant here -- CARLA's classes are whatever the converter's
+--map-classes produced, and GT is drawn in one colour either way). This
+keeps just the BEV plot, adapted to this dataset's ±12.5m square tile, and
+writes one combined GT+prediction PNG per sample (not separate
+GT_MAP/PRED_MAP files) for easier side-by-side viewing.
 
 GT is read directly from the dataset's own stored annotations
-(`dataset.data_infos[i]['annotation']['divider']`) rather than through the
-model-input pipeline, since CustomCarlaLocalMapDataset's test-mode path
-(unlike its train-mode path) never attaches gt_bboxes_3d/gt_labels_3d --
-there's nothing to denormalize or transform, the converter's coordinates
-are already tile-relative metric xy, matching the model's predicted xy.
+(`dataset.data_infos[i]['annotation']`, one key per map class) rather than
+through the model-input pipeline, since CustomCarlaLocalMapDataset's
+test-mode path (unlike its train-mode path) never attaches
+gt_bboxes_3d/gt_labels_3d -- there's nothing to denormalize or transform,
+the converter's coordinates are already tile-relative metric xy, matching
+the model's predicted xy.
 
 Usage (inside the container, from /MapTR):
   python3 tools/maptrv2/carla_bev_vis.py <config> <checkpoint> \
@@ -106,7 +108,16 @@ def main():
             result = model(return_loss=False, rescale=True, **data)
         pred = result[0]['pts_bbox']
 
-        gt_polylines = dataset.data_infos[i]['annotation'].get('divider', [])
+        # Every map class, not just 'divider': a pkl converted with the
+        # converter's --map-classes carries one key per class (e.g.
+        # 'driving'/'curb'), and asking for 'divider' alone would draw no GT
+        # at all while looking like a model that predicts into empty space.
+        # Drawn in one colour -- this plot is GT-vs-pred geometry, and the
+        # dataset viewer is where per-class colouring lives.
+        gt_polylines = [
+            pts for cls in dataset.MAPCLASSES
+            for pts in dataset.data_infos[i]['annotation'].get(cls, [])
+        ]
 
         keep = pred['scores_3d'] > args.score_thresh
         pred_pts = pred['pts_3d'][keep]

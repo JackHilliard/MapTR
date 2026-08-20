@@ -33,7 +33,15 @@ everything here is derived from the tile entries, never from those counts.
 
 Note the reference-lines json on disk is not filtered to match: it still
 holds every class, so a class-carrying export converts all of them unless
---classes says otherwise.
+--classes or --map-classes says otherwise.
+
+By default every kept polyline becomes one `divider` instance, i.e. a
+single-class map. ``--map-classes name=export_class[,export_class...]``
+instead emits one annotation key per named map class, in the order given --
+which is the label order, and must equal the training config's
+``map_classes``::
+
+    --map-classes driving=driving_centerline curb=curb
 
 Each tile's LiDAR block is also scanned for points that would actually
 survive the training pipeline's filters (``z <= --z-max`` and inside
@@ -110,6 +118,19 @@ def parse_args():
         "`driving_centerline`). Default: keep every polyline. Only exports "
         "whose polylines carry a class can be filtered")
     parser.add_argument(
+        '--map-classes',
+        type=str,
+        nargs='+',
+        default=None,
+        metavar='NAME=CLASS[,CLASS...]',
+        help='emit SEVERAL map classes instead of one `divider`, as an '
+        'ordered list of `name=export_class[,export_class]` groups (e.g. '
+        '`--map-classes driving=driving_centerline curb=curb`). A bare '
+        '`name` is shorthand for `name=name`. The names, in this order, are '
+        "the config's `map_classes`, so the pkl and the config must agree. "
+        'Mutually exclusive with --classes, which only ever produces one '
+        'class')
+    parser.add_argument(
         '--lane-types',
         type=str,
         nargs='+',
@@ -128,6 +149,16 @@ def parse_args():
         'dropped before voxelization, so a tile with none inside produces '
         'zero voxels. Default: +/-tile_radius in xy (read from the manifest) '
         f'and {DEFAULT_Z_RANGE[0]}..{DEFAULT_Z_RANGE[1]} in z')
+    parser.add_argument(
+        '--out-tag',
+        type=str,
+        default=None,
+        metavar='TAG',
+        help='suffix for the output filenames, giving '
+        '`carla_map_infos_<split>_<TAG>.pkl`. Use it to keep several '
+        'datasets (tile sizes, GT frames, class taxonomies) in ONE --out-dir '
+        'without silently overwriting each other, since the filename is '
+        'otherwise a function of --split alone')
     parser.add_argument(
         '--z-max',
         type=float,
@@ -273,7 +304,9 @@ def resolve_classes(selected, manifest):
     if not lookup:
         raise ValueError(
             'this export has no `class_lookup`, so its polylines carry no '
-            'class and cannot be filtered; re-run without --classes')
+            'class and cannot be filtered or split; re-run without '
+            '--classes/--map-classes (every polyline then becomes one '
+            '`divider` instance)')
     by_name = {name: int(cid) for cid, name in lookup.items()}
     out = set()
     for entry in selected:
@@ -288,6 +321,45 @@ def resolve_classes(selected, manifest):
             raise ValueError(
                 f'unknown class {entry!r}; this export has: {known}')
     return out
+
+
+def resolve_map_classes(selected, manifest):
+    """Parse ``--map-classes`` into ordered ``[(name, {class ids}), ...]``.
+
+    Each entry is ``name=export_class[,export_class...]``; a bare ``name``
+    means ``name=name``. The order is the label order the model trains
+    against (the dataset builds its CLASS2LABEL from the config's
+    ``map_classes`` list, in order), so it is preserved exactly as given.
+
+    A class appearing in two groups is an error rather than a duplication:
+    the same polyline would become two GT instances at the same coordinates
+    with different labels, which no matching can resolve.
+    """
+    if not selected:
+        return None
+    groups = []
+    seen_names = set()
+    owner = {}
+    for entry in selected:
+        name, _, members = entry.partition('=')
+        name = name.strip()
+        if not name:
+            raise ValueError(f'--map-classes entry {entry!r} has no name')
+        if name in seen_names:
+            raise ValueError(f'--map-classes names must be unique; {name!r} '
+                             'appears twice')
+        seen_names.add(name)
+        member_list = [m.strip() for m in members.split(',') if m.strip()]
+        ids = resolve_classes(member_list or [name], manifest)
+        for cid in sorted(ids):
+            if cid in owner:
+                raise ValueError(
+                    f'export class id {cid} is listed under both '
+                    f'{owner[cid]!r} and {name!r}; a polyline can only carry '
+                    'one label')
+            owner[cid] = name
+        groups.append((name, ids))
+    return groups
 
 
 def polyline_class_id(poly):
@@ -385,6 +457,7 @@ def count_points_in_range(lidar_path, pc_range, z_max, shift=None):
 def convert_carla_tiles(data_root,
                         split,
                         classes=None,
+                        map_classes=None,
                         pc_range=None,
                         z_max=DEFAULT_Z_MAX,
                         min_lidar_points=1,
@@ -393,7 +466,16 @@ def convert_carla_tiles(data_root,
     assert gt_frame in ('offset', 'tile_center')
     tile_dir, manifest = load_manifest(data_root, split)
     tile_radius = manifest_tile_radius(manifest)
+    if classes and map_classes:
+        raise ValueError('--classes and --map-classes both filter the same '
+                         'polylines; pass only one')
     keep_classes = resolve_classes(classes, manifest)
+    # One annotation key per map class, in the order the config lists them.
+    # The default reproduces the historical single-class output exactly:
+    # every kept polyline becomes a `divider` instance.
+    groups = resolve_map_classes(map_classes, manifest) or [('divider',
+                                                            keep_classes)]
+    class_names = [name for name, _ in groups]
     if pc_range is None:
         pc_range = default_pc_range(tile_radius)
         if tile_radius is None:
@@ -409,6 +491,7 @@ def convert_carla_tiles(data_root,
     out_of_bounds = []
     coverage = []
     total_instances = 0
+    per_class_instances = {name: 0 for name in class_names}
     prog_bar = mmcv.ProgressBar(len(manifest['tiles']))
     for idx, tile in enumerate(manifest['tiles']):
         prog_bar.update()
@@ -485,16 +568,26 @@ def convert_carla_tiles(data_root,
         with open(ref_path, encoding='utf-8') as f:
             ref = json.load(f)
 
-        divider = []
+        annotation = {c: [] for c in class_names}
         for poly in ref['polylines']:
-            if keep_classes is not None and \
-                    polyline_class_id(poly) not in keep_classes:
-                continue
-            pts = np.array(poly['points'], dtype=np.float32)
-            if pts.shape[0] < 2:
-                continue
-            divider.append(pts - origin)
-            total_instances += 1
+            cid = polyline_class_id(poly)
+            # Groups are disjoint by construction, so this appends at most
+            # once; the class ids are resolved before the tile loop, so the
+            # points array is only built for a polyline that is kept.
+            # (`cls_name`, not `name` -- that is the TILE's name, and a
+            # loop variable leaks past its loop in Python.)
+            for cls_name, keep in groups:
+                if keep is not None and cid not in keep:
+                    continue
+                pts = np.array(poly['points'], dtype=np.float32)
+                if pts.shape[0] < 2:
+                    break
+                annotation[cls_name].append(pts - origin)
+                per_class_instances[cls_name] += 1
+                total_instances += 1
+        # Flat view of every instance in this tile, for the bounds check
+        # below -- which is about tile geometry, not about class.
+        divider = [p for c in class_names for p in annotation[c]]
 
         # Sanity check only (tiles are asserted to already be the patch, so
         # no clipping is applied) -- collect, don't crash, if this fires.
@@ -542,7 +635,7 @@ def convert_carla_tiles(data_root,
                 # a missing count as "unknown" and keeps the sample.
                 num_lidar_points=n_raw,
                 num_lidar_points_in_range=n_in_range,
-                annotation=dict(divider=divider),
+                annotation=annotation,
             ))
 
     n = max(len(samples), 1)
@@ -551,7 +644,8 @@ def convert_carla_tiles(data_root,
         print(f'{split}: {len(samples)} tiles kept, {len(dropped)} dropped '
               f'(<{min_lidar_points} in-range LiDAR point'
               f'{"" if min_lidar_points == 1 else "s"}), {total_instances} '
-              f'divider instances ({total_instances / n:.1f} per tile)')
+              f'map instances ({total_instances / n:.1f} per tile)')
+        report_class_counts(per_class_instances, n)
         for entry in dropped[:20]:
             print(f'  [drop] {entry["name"]}: {entry["n_points"]} raw points, '
                   f'{entry["n_points_in_range"]} in range')
@@ -560,9 +654,10 @@ def convert_carla_tiles(data_root,
             # the sidecar json below has the rest.
             print(f'  [drop] ... and {len(dropped) - 20} more')
     else:
-        print(f'{split}: {len(samples)} tiles, {total_instances} divider '
+        print(f'{split}: {len(samples)} tiles, {total_instances} map '
               f'instances ({total_instances / n:.1f} per tile) '
               '[LiDAR check skipped]')
+        report_class_counts(per_class_instances, n)
     report_coverage(coverage, pc_range)
     report_out_of_bounds(out_of_bounds)
     return samples, dropped, dict(
@@ -573,7 +668,28 @@ def convert_carla_tiles(data_root,
         gt_frame=gt_frame,
         class_lookup=manifest.get('class_lookup') or {},
         classes_kept=sorted(keep_classes) if keep_classes else None,
+        map_classes=class_names,
+        class_groups={
+            name: (sorted(keep) if keep is not None else None)
+            for name, keep in groups
+        },
         n_out_of_bounds=len(out_of_bounds))
+
+
+def report_class_counts(per_class_instances, n_tiles):
+    """Per-map-class instance totals.
+
+    Printed even for the single-class default, so a run's output always
+    states which annotation keys the pkl actually carries -- a config whose
+    `map_classes` disagrees with them trains against silently empty GT for
+    the missing ones.
+    """
+    for name, count in per_class_instances.items():
+        print(f'  [class] {name}: {count} instances '
+              f'({count / max(n_tiles, 1):.1f} per tile)')
+        if count == 0:
+            print(f'  [class] {name} is EMPTY -- check the export carries '
+                  'that class')
 
 
 def report_coverage(coverage, pc_range):
@@ -622,6 +738,7 @@ def main():
         args.data_root,
         args.split,
         classes,
+        map_classes=args.map_classes,
         pc_range=args.lidar_point_cloud_range,
         z_max=args.z_max,
         min_lidar_points=args.min_lidar_points,
@@ -631,7 +748,9 @@ def main():
     # not given on the CLI, so read it back rather than re-deriving it here.
     pc_range = meta['pc_range']
     mmcv.mkdir_or_exist(args.out_dir)
-    out_path = os.path.join(args.out_dir, f'carla_map_infos_{args.split}.pkl')
+    tag = f'_{args.out_tag}' if args.out_tag else ''
+    out_path = os.path.join(args.out_dir,
+                            f'carla_map_infos_{args.split}{tag}.pkl')
     mmcv.dump(
         dict(
             samples=samples,
@@ -649,6 +768,12 @@ def main():
             gt_frame=meta['gt_frame'],
             class_lookup=meta['class_lookup'],
             classes_kept=meta['classes_kept'],
+            # The annotation keys every sample carries, in label order.
+            # CustomCarlaLocalMapDataset checks its own map_classes against
+            # this, so a config/pkl mismatch is reported rather than
+            # silently training on empty GT.
+            map_classes=meta['map_classes'],
+            class_groups=meta['class_groups'],
             # Records the geometry the per-sample counts were measured
             # against, so CustomCarlaLocalMapDataset can warn if the config
             # it is running under no longer matches.
@@ -665,7 +790,7 @@ def main():
         # Sidecar report, so a cluster run can be inspected without
         # unpickling the (large) infos file.
         report_path = os.path.join(
-            args.out_dir, f'carla_map_infos_{args.split}_dropped.json')
+            args.out_dir, f'carla_map_infos_{args.split}{tag}_dropped.json')
         with open(report_path, 'w', encoding='utf-8') as f:
             json.dump(
                 dict(

@@ -30,6 +30,29 @@ from .av2_offlinemap_dataset import (LiDARInstanceLines,
 from .pipelines.loading import EmptyLidarTileError
 
 
+class VectorizedCarlaLocalMap(VectorizedAV2LocalMap):
+    """``VectorizedAV2LocalMap`` with a label mapping built from the config.
+
+    The AV2 base hardcodes ``CLASS2LABEL`` to nuScenes/AV2 class names
+    ('divider', 'ped_crossing', 'boundary', 'centerline'), and
+    ``gen_vectorized_samples`` drops any annotation key that maps to -1. A
+    CARLA taxonomy of its own -- 'driving'/'curb', say -- would therefore
+    vectorize to *zero* instances with no error, which is the failure mode
+    this class exists to remove: labels are simply the position of each name
+    in ``map_classes``.
+
+    For the historical single-class ``['divider']`` config that is
+    ``{'divider': 0}``, i.e. bit-identical to the base's behaviour.
+    """
+
+    def __init__(self, *args, map_classes=('divider', ), **kwargs):
+        super().__init__(*args, map_classes=map_classes, **kwargs)
+        self.CLASS2LABEL = {
+            name: label
+            for label, name in enumerate(self.vec_classes)
+        }
+
+
 @DATASETS.register_module()
 class CustomCarlaLocalMapDataset(Custom3DDataset):
     """CARLA simulator dataset with vectorized map (divider) ground truth."""
@@ -89,7 +112,7 @@ class CustomCarlaLocalMapDataset(Custom3DDataset):
         # Counts consecutive samples skipped by the runtime empty-tile guard
         # in prepare_train_data -- see the comment there.
         self._consecutive_empty_skips = 0
-        self.vector_map = VectorizedAV2LocalMap(
+        self.vector_map = VectorizedCarlaLocalMap(
             canvas_size=bev_size,
             patch_size=self.patch_size,
             map_classes=self.MAPCLASSES,
@@ -112,8 +135,54 @@ class CustomCarlaLocalMapDataset(Custom3DDataset):
     def load_annotations(self, ann_file):
         data = mmcv.load(ann_file, file_format='pkl')
         samples = sorted(data['samples'], key=lambda e: e['sample_idx'])
+        self._check_map_classes(samples, data.get('map_classes'))
         return self._filter_empty_lidar_tiles(samples,
                                               data.get('lidar_check'))
+
+    def _check_map_classes(self, samples, pkl_map_classes):
+        """Warn when the pkl's annotation keys don't match ``map_classes``.
+
+        ``gen_vectorized_samples`` indexes ``annotation[vec_class]`` per
+        configured class, so a name the converter never wrote is a KeyError
+        at the first sample -- but a name it wrote *empty* (because the
+        export carries no such polylines, or the converter ran with a
+        different ``--map-classes`` grouping) trains silently against no GT
+        for that label. Both are worth saying out loud at load time rather
+        than discovering from a class AP pinned at zero.
+
+        The per-sample annotation keys are the authority; the pkl-level
+        ``map_classes`` key only exists in files written after multi-class
+        support, so its absence is not itself a problem.
+        """
+        if not samples:
+            return
+        keys = set(samples[0].get('annotation') or {})
+        missing = [c for c in self.MAPCLASSES if c not in keys]
+        if missing:
+            warnings.warn(
+                f'{self.__class__.__name__}: this config asks for map '
+                f'classes {list(self.MAPCLASSES)}, but the annotation file '
+                f'has no {missing} key(s) (it carries {sorted(keys)}). '
+                'Regenerate the pkl with a matching '
+                '--map-classes on custom_carla_map_converter.py.')
+        elif pkl_map_classes is not None and \
+                list(pkl_map_classes) != list(self.MAPCLASSES):
+            # Order is the label order, so a permutation is not cosmetic.
+            warnings.warn(
+                f'{self.__class__.__name__}: the annotation file was built '
+                f'with map_classes={list(pkl_map_classes)}, but this config '
+                f'uses {list(self.MAPCLASSES)}. Labels follow the config\'s '
+                'order, so a different order means a different label per '
+                'class.')
+        empty = [
+            c for c in self.MAPCLASSES if c in keys
+            and not any(s.get('annotation', {}).get(c) for s in samples)
+        ]
+        if empty:
+            warnings.warn(
+                f'{self.__class__.__name__}: map class(es) {empty} have no '
+                'instances in any sample of this annotation file -- that '
+                'label will never receive a positive match.')
 
     def _filter_empty_lidar_tiles(self, samples, lidar_check):
         """Drop tiles whose LiDAR points would voxelize to zero voxels.

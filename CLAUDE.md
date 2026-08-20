@@ -402,6 +402,118 @@ untouched. `code_size=2` means z never reaches a regression target either
 way. The 25 m export states 3D centres, so this changes nothing there (still
 bit-identical); it only stops other exports failing.
 
+## Multi-class map taxonomies: driving / curb (2026-08-20)
+
+The pipeline was divider-only — *every* CARLA lane type collapsed into one
+`divider` class. It now supports an arbitrary named taxonomy, wired on all
+three sides (converter, dataset, config) so a mismatch is reported instead of
+producing silently empty GT for a class.
+
+Two configs use it, both 30 m tile-centre overlays that change the taxonomy
+and *nothing* else:
+`maptrv2_carla_r50_24ep_lidar_30m_tilecenter_2cls.py` and
+`maptrv2_carla_r50_24ep_lidar_30m_HM_tilecenter_2cls.py`, with
+`map_classes = ['driving', 'curb']` (label 0 = the export's
+`driving_centerline` polylines, label 1 = its `curb` ones).
+
+```bash
+python tools/maptrv2/custom_carla_map_converter.py \
+    --data-root <30m export> --split test --gt-frame tile_center \
+    --map-classes driving=driving_centerline curb=curb \
+    --out-dir data/carla/ --out-tag 30m_tc_2cls
+```
+
+- **`--map-classes name=export_class[,export_class...]`** emits one
+  `annotation` key per named class instead of a single `divider`. Order is
+  the label order. A bare `name` means `name=name`. Groups must be disjoint
+  (the same polyline under two labels is unmatchable, so it raises), and
+  `--classes` is refused alongside it — both filter the same polylines.
+- **`--out-tag TAG`** appends to the output filename
+  (`carla_map_infos_<split>_<TAG>.pkl`). Without it the filename is a
+  function of `--split` alone, so writing a second dataset into
+  `data/carla/` would **overwrite the existing 25 m offset-frame pkl with no
+  warning**. That is why these configs, which live under `data/carla/` by
+  request rather than in a `carla_30m/tile_center/` subdirectory, name their
+  files `..._30m_tc_2cls.pkl`.
+- The pkl gains `map_classes` (the names, in label order) and `class_groups`
+  (name → export class ids).
+
+**`VectorizedAV2LocalMap.CLASS2LABEL` is hardcoded to nuScenes/AV2 names**
+(`divider`/`ped_crossing`/`boundary`/`centerline`), and
+`gen_vectorized_samples` drops anything mapping to −1. A CARLA taxonomy of
+its own would therefore vectorize to **zero instances, with no error at all**
+— the failure this needed guarding. `VectorizedCarlaLocalMap`
+(`carla_offlinemap_dataset.py`) subclasses it and builds the mapping from the
+config's `map_classes` list: `{name: index}`. For `['divider']` that is
+`{'divider': 0}`, i.e. identical to the base.
+
+`CustomCarlaLocalMapDataset.load_annotations` now warns at load time when the
+config's `map_classes` names a key the pkl lacks, when the pkl's declared
+order differs (order *is* label order, so a permutation relabels every
+instance), and when a configured class has zero instances anywhere.
+
+Note `--map-classes` **drops** every export class not named: with
+`driving=driving_centerline curb=curb`, the `road_edge`, `lane_divider`,
+`center_divider`, `sidewalk_edge`, `median` and `crosswalk` polylines are
+gone, not merged. On the Town10HD grid export that keeps 299 + 135 of 1251
+polylines. To fold road edges into curbs, say `curb=curb,road_edge` and
+reconvert — the grouping lives in the pkl, not the config.
+
+**The local 25 m export cannot be split this way**: it has no `class_lookup`
+at all, so its polylines carry no class and the converter raises rather than
+emitting empty classes. Only the newer class-carrying exports (the 60 m grid
+one, and presumably the 30 m one when it exists) can.
+
+`aux_seg` stays at `seg_classes=1` in both configs. The BEV auxiliary seg
+head's channel count comes from `aux_seg['seg_classes']`, independently of
+`num_classes` (`maptrv2_head.py:242`), and the dataset rasterizes every class
+into that one mask. Raising it is a separate experiment and changes the seg
+head's weight shape.
+
+**Verified**, on the 60 m grid export (the only class-carrying data here) and
+the 259-tile 25 m split:
+
+- Single-class output is **unchanged**: same 259 tiles / 1210 instances, every
+  annotation array bit-identical to the pre-change converter (max |diff| 0.0),
+  every per-sample key equal; the pkl gains only `map_classes` and
+  `class_groups`. The dataset still loads it with `CLASS2LABEL ==
+  {'divider': 0}`, 1210 label-0 instances, and no warnings.
+- Two-class output: 299 `driving` + 135 `curb`, exactly the manifest's
+  `polyline_counts_by_class`, disjoint on every tile.
+- Both configs resolve through `Config.fromfile` with `num_classes=2` on the
+  head *and* the coder, `map_classes` on all three data splits, `recenter=
+  True` on train/test/`evaluation` pipelines, `pc_range` ±15 intact, and
+  `model` minus the class knobs, `optimizer`, `lr_config`, `total_epochs` and
+  both pipelines **byte-identical to their parents** (`loss_pts` stays
+  `PolylineGeomLoss` in the HM one).
+- Building the dataset on the two-class pkl yields labels {0: 299, 1: 135};
+  the missing-key and wrong-order warnings both fire when deliberately
+  mismatched.
+
+**Gotcha #15 again, in the HM config.** `max_num` must be ≤
+`num_vec_one2one * num_map_classes`, and the HM configs cut queries to 25. At
+one class that pinned `max_num` to 25; at two the bound is 50, so the 2-class
+HM config raises it back to the base's 50 — which also matters because
+`max_num` caps how many instances an eval can ever score, and there are more
+lines to find. Raising is the safe direction; lowering crashes at the first
+validation, after a full epoch has trained.
+
+Two host-side tools read the `divider` key directly and would have shown an
+empty GT rather than an error; both now iterate the actual classes:
+`tools/maptrv2/carla_bev_vis.py` (unions every class, drawn in one colour)
+and `dataset_viewer.py`'s `load_gt_pkl` (via a new `pkl_map_classes()`, which
+reads the pkl's declared order and falls back to `('divider',)` for older
+files). Verified: 259 tiles / {0: 1210} on the old pkl, 30 tiles /
+{0: 299, 1: 135} on the new one.
+
+**Still divider-shaped**: the viewer's `shape_counts()` (the curve-vs-line
+box plots) reconciles `n_arc + n_straight` from `reference_lines/*.json`
+against the pkl's instance count, and a `--map-classes` pkl legitimately
+holds fewer instances than the json holds polylines. Those tiles are dropped
+from the shape charts and reported — the same behaviour a `--classes` subset
+already produced, safe but unhelpful. Threading `class_groups` into that
+filter is the fix if the charts are wanted on a multi-class run.
+
 ## The converter is tile-size agnostic (2026-08-10)
 
 `custom_carla_map_converter.py` had three hardcoded assumptions from the
@@ -1229,12 +1341,14 @@ per-pair Python loop is what makes it unusable, not the order axis.
 - **A new/larger dataset should be converted first and its
   `carla_map_infos_<split>_dropped.json` inspected** before a long run — a
   large drop count means the range is wrong, not that the data is bad.
-- **Class taxonomy is divider-only**, collapsing *all* CARLA lane types
-  (driving/curb/sidewalk/border/restricted/parking/shoulder/stop/other)
-  into one `divider` class — deliberate, to maximise GT density on the tiny
-  local set. Revisit filtering to driving lanes before a real run via the
-  converter's `--classes` flag (e.g. `--classes driving_centerline`); the
-  older `--lane-types` never matched anything — see the 2026-08-10 section.
+- **The default taxonomy is still divider-only**, collapsing *all* CARLA
+  lane types into one `divider` class — deliberate, to maximise GT density
+  on the tiny local set. A real multi-class run now has two paths: filter to
+  one class with `--classes driving_centerline`, or train a named taxonomy
+  with `--map-classes` (see the 2026-08-20 section and the `_2cls` configs).
+  Neither works on the local 25 m export, which carries no `class_lookup`.
+  The older `--lane-types` never matched anything — see the 2026-08-10
+  section.
 - **`sparse_shape`/`lidar_bev_proj.in_channels` were measured empirically**
   for the *current* range/resolution (`[251,251,71]` and `384`). If either
   changes, re-measure with a dummy `extract_lidar_feat()` call rather than

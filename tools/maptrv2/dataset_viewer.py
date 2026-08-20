@@ -3731,11 +3731,36 @@ def ap_from_tpfp(tp, fp, scores, num_gts):
                               ctp / np.maximum(ctp + cfp, eps))
 
 
-# CustomCarlaLocalMapDataset.MAPCLASSES, in order -- the index IS the
-# `type` written into the GT json, via VectorizedAV2LocalMap.CLASS2LABEL.
-# The CARLA taxonomy is divider-only today; if that widens, this has to
-# widen with it (and stay in the same order, or every type id shifts).
+# The historical CARLA taxonomy, and the fallback for a pkl that predates
+# multi-class support. The ORDER is the label order: the index IS the `type`
+# written into the GT json, via the dataset's CLASS2LABEL. Never reorder it,
+# and prefer pkl_map_classes() below -- reading the order off the file beats
+# assuming it, now that the converter's --map-classes can write any names.
 MAPCLASSES = ('divider',)
+
+
+def pkl_map_classes(blob, samples):
+    """The map classes a converter pkl carries, in label order.
+
+    Newer pkls state it outright (`map_classes`, written next to
+    `class_groups`). Older ones don't, and for those the annotation keys are
+    the only evidence -- which is fine, because every pkl written before that
+    key existed was single-class `divider`. A hand-built file with several
+    keys and no declaration has no recoverable order, so its keys are sorted
+    and that is said out loud rather than guessed silently.
+    """
+    declared = blob.get('map_classes')
+    if declared:
+        return tuple(declared)
+    keys = set()
+    for s in samples:
+        keys |= set(s.get('annotation') or {})
+    if not keys or keys == set(MAPCLASSES):
+        return MAPCLASSES
+    print(f'[warn] this annotation pkl declares no map_classes; assuming '
+          f'label order {sorted(keys)} from its annotation keys, which may '
+          'not be the order the config trained in')
+    return tuple(sorted(keys))
 
 
 def load_gt(path):
@@ -3811,10 +3836,11 @@ def load_gt_pkl(path):
             f'{path} does not look like a CARLA annotation pkl (no '
             f'"samples" key; found {list(blob)[:6] if isinstance(blob, dict) else type(blob).__name__})')
     out = {}
+    classes = pkl_map_classes(blob, samples)
     for s in samples:
         ann = s.get('annotation') or {}
         vecs = []
-        for label, cls in enumerate(MAPCLASSES):
+        for label, cls in enumerate(classes):
             for inst in ann.get(cls, []):
                 pts = np.asarray(inst, dtype=np.float64)
                 # the <2-point filter is gen_vectorized_samples's own
