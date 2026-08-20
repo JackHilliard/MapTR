@@ -637,6 +637,49 @@ Note the local RTX 3070 usually has a CARLA simulator on it (~1.9 GB), and
 the first attempt at this OOM'd at 3.16 GiB with 30 MiB free. Check
 `nvidia-smi` before blaming the config.
 
+#### Class count is free; polyline count is not (2026-08-20)
+
+Measured back-to-back on one GPU, same 64 tiles, same point clouds, only the
+stated variable changed. `samples_per_gpu=1`, local RTX 3070, mean of the
+steady buckets (the 10-iteration warm-up bucket dropped):
+
+| run | GT lines/tile | s/iter |
+|---|---|---|
+| plain config, **1 class** | 238 total | 1.022 |
+| plain config, **2 classes** | 238 total | 1.034 |
+| HM config, 2 classes | 238 total | 1.455 |
+| HM config, 2 classes | **714 total** | 2.208 |
+
+* **Number of CLASSES: free.** +1.2%, inside the ±0.03 s spread within each
+  run. A class costs one wider `Linear(embed_dims, num_classes)` and a focal
+  loss over `num_vec x num_classes`; the decoder, BEV cross-attention and
+  LiDAR backbone have no class dimension at all. The 1-class run used a
+  merged copy of the 2-class pkl (`{'all': driving + curb}`), so the geometry
+  was bit-identical and only the label count differed.
+* **Number of GT POLYLINES: not free.** Tripling GT per tile cost **+52%**
+  on the HM config. The assigner's `pts_cost` matrix is
+  `(num_vec x num_gts x num_orders)`, the Hungarian solve grows with it, the
+  one2many branch repeats every GT `k_one2many=6` times, and
+  `PolylineGeomCost` is per pred x gt pair (the term that was 10-17 s/iter
+  before the dedup fix).
+* **The HM geometry loss is itself a ~42% tax** at equal GT (1.034 ->
+  1.455), larger than anything the taxonomy does.
+
+The distinction that matters when widening a taxonomy: `--map-classes
+driving curb` **partitions** the polylines the export already had, so it is
+the free case. Keeping *more* export classes (`road_edge` alone is 506
+polylines in the Town10HD export) adds GT instances, which is the expensive
+case.
+
+None of this speaks to **epochs to converge** — a 2-class model has to learn
+a discrimination the 1-class one never faced. At the 1-epoch checkpoint the
+two class scores are still 0.017 apart (see above), so sample efficiency is
+an open question these numbers cannot answer.
+
+Dominating both effects in practice: `../carla_test` is 3795 tiles against
+the old 259, i.e. ~65 min/epoch at 1.03 s/iter and batch 1, ~26 h for 24
+epochs on this 3070. Tile count, not class count, sets the wall clock.
+
 ## The converter is tile-size agnostic (2026-08-10)
 
 `custom_carla_map_converter.py` had three hardcoded assumptions from the
