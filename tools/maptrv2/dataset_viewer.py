@@ -3601,6 +3601,17 @@ CHAMFER_THRESHOLDS = (0.5, 1.0, 1.5)
 # are NOT resampled (eval_use_same_gt_sample_num_flag defaults False), so they
 # arrive at whatever fixed_ptsnum_per_pred_line the model emitted.
 GT_NUM_SAMPLE = 100
+# Predictions are resampled to the SAME number of points before scoring, and
+# that is not cosmetic: get_cls_results() in map_utils/mean_ap.py interpolates
+# both sides to `num_fixed_sample_pts` (100) whenever the dataset's
+# `eval_use_same_gt_sample_num_flag` is set -- which every CARLA config sets.
+# The head emits 20 points per instance, so scoring those raw measures a
+# 20-point polyline against a 100-point one and reports a chamfer distance
+# that is too LARGE, i.e. an AP that is too small. Measured on the
+# webviewer_demo run: raw predictions gave AP 0.00003/0.00311/0.02569 where
+# the real eval gives 0.00008/0.00672/0.03118 -- understated by up to 2.2x.
+# With this resampling both agree to 1e-10.
+PRED_NUM_SAMPLE = GT_NUM_SAMPLE
 # The threshold at which "correctly predicted polylines" is counted. 1.0 m is
 # the middle of the three, and the one whose AP tracks the mean most closely.
 TP_THRESHOLD = 1.0
@@ -3763,6 +3774,32 @@ def pkl_map_classes(blob, samples):
     return tuple(sorted(keys))
 
 
+def gt_classes(path):
+    """Map class names, in label order, for whichever GT file this is.
+
+    A converter pkl states them (or implies them from its annotation keys);
+    `carla_map_gt.json` does not -- it carries only integer `type`s, because
+    the names live in the config that wrote it. For the json the names are
+    reconstructed as `class_<i>` over whatever types appear, which is enough
+    to keep the classes SEPARATE (the only thing the matching needs); the
+    labels are then unnamed rather than wrong.
+    """
+    cached = STATE.setdefault('gt_classes_cache', {}).get(path)
+    if cached is not None:
+        return cached
+    if path.endswith('.pkl'):
+        with open(path, 'rb') as f:
+            blob = pickle.load(f)
+        samples = blob.get('samples') or []
+        out = pkl_map_classes(blob, samples)
+    else:
+        types = {t for vecs in load_gt(path).values() for _p, t in vecs}
+        out = (MAPCLASSES if types <= {0} else
+               tuple(f'class_{i}' for i in range(max(types) + 1)))
+    STATE['gt_classes_cache'][path] = out
+    return out
+
+
 def load_gt(path):
     """{sample_token: [(pts, type)]} from either GT source.
 
@@ -3915,14 +3952,61 @@ def best_gt_for(results_path, gt_files):
     return best
 
 
-def eval_tile(preds, gts, score_thresh=0.0):
+def split_by_class(preds, gts, classes):
+    """Group one tile's predictions and GT by class label.
+
+    Returns ``[(label, preds_of_that_class, gts_of_that_class)]``, or None
+    when the split cannot be trusted and the caller should pool instead:
+    a single-class taxonomy (nothing to split), or predictions whose
+    `cls_name` is not one of `classes` -- an older class-free results json
+    writes '?' there, and silently dropping every prediction would read as a
+    model that predicts nothing.
+    """
+    if not classes or len(classes) < 2:
+        return None
+    index = {name: i for i, name in enumerate(classes)}
+    if any(c not in index for _p, _s, c in preds):
+        return None
+    out = []
+    for label in range(len(classes)):
+        out.append((
+            label,
+            [(p, sc) for p, sc, c in preds if index[c] == label],
+            [g for g, t in gts if t == label],
+        ))
+    return out
+
+
+def _score_group(pred_pts, scores, gt_pts, n_gt):
+    """tp/fp/AP per threshold for ONE pool of predictions against one GT."""
+    matrix = chamfer_score_matrix(pred_pts, gt_pts)
+    per_thr, tpfp = {}, {}
+    for thr in CHAMFER_THRESHOLDS:
+        tp, fp, matched = tpfp_from_matrix(matrix, scores, thr)
+        tpfp[thr] = (tp, fp, matched)
+        per_thr[thr] = ap_from_tpfp(tp, fp, scores, n_gt)
+    return matrix, per_thr, tpfp
+
+
+def eval_tile(preds, gts, score_thresh=0.0, classes=None):
     """Every per-tile number this tab can sort or plot by.
 
     `preds` is [(pts, score, cls)] straight from load_results(); `gts` is
-    [(pts, type)] from load_gt(). Classes are not separated: the CARLA
-    taxonomy is divider-only, so class-conditional AP would be the same
-    number three times. If a real multi-class taxonomy lands, this is the
-    place that has to grow a per-class loop (mirroring eval_map's).
+    [(pts, type)] from load_gt().
+
+    **Matching happens WITHIN a class**, as `eval_map` does: a `driving`
+    prediction can never be a true positive against a `curb` GT line, and
+    pooling them would score a model for putting the right geometry under
+    the wrong label. With a single-class taxonomy -- which every CARLA run
+    before 2026-08-20 used -- there is exactly one group and every number
+    here is bit-identical to the pooled version.
+
+    Per-tile AP averages the classes **present in that tile's GT**, not all
+    of them. The eval's own mAP divides by the full class count, so a tile
+    holding only driving lines would otherwise be capped at 0.5 for reasons
+    that have nothing to do with the prediction. That makes this a local
+    score, in the same spirit as the per-tile AP already is; the header's
+    global AP is the one that mirrors the eval.
 
     `score_thresh` affects ONLY the count metrics (n_pred_kept,
     count_error). AP, TP and recall deliberately ignore it, because AP
@@ -3930,24 +4014,58 @@ def eval_tile(preds, gts, score_thresh=0.0):
     threshold first would silently redefine the metric and stop it matching
     the training log.
     """
-    pred_pts = [p for p, _s, _c in preds]
-    scores = np.array([s for _p, s, _c in preds], dtype=np.float64)
-    gt_pts = [resample_line(g, GT_NUM_SAMPLE) for g, _t in gts]
-    n_gt, n_pred = len(gt_pts), len(pred_pts)
+    groups = split_by_class(preds, gts, classes)
+    n_gt, n_pred = len(gts), len(preds)
 
-    matrix = chamfer_score_matrix(pred_pts, gt_pts)
-    per_thr, tpfp = {}, {}
-    for thr in CHAMFER_THRESHOLDS:
-        tp, fp, matched = tpfp_from_matrix(matrix, scores, thr)
-        tpfp[thr] = (tp, fp, matched)
-        per_thr[thr] = ap_from_tpfp(tp, fp, scores, n_gt)
+    if groups is None:
+        pred_pts = [resample_line(p, PRED_NUM_SAMPLE) for p, _s, _c in preds]
+        scores = np.array([s for _p, s, _c in preds], dtype=np.float64)
+        gt_pts = [resample_line(g, GT_NUM_SAMPLE) for g, _t in gts]
+        matrix, per_thr, tpfp = _score_group(pred_pts, scores, gt_pts, n_gt)
+        tp, fp, matched = tpfp[TP_THRESHOLD]
+        n_tp = int(tp.sum())
+        # Chamfer distance of the matched pairs -- how good the hits are, as
+        # opposed to how many there are. Sign flipped back to a real
+        # distance.
+        dists = [-matrix[i, m] for i, m in enumerate(matched) if m >= 0]
+        # One pool, so the per-class bookkeeping global_ap() needs is just
+        # that pool under label 0.
+        by_cls = {0: dict(scores=scores, n_gt=n_gt,
+                          tp_thr={t: (v[0], v[1]) for t, v in tpfp.items()})}
+        scores_all = scores
+    else:
+        per_cls_thr, by_cls, dists, n_tp = {}, {}, [], 0
+        score_chunks = []
+        for label, cpreds, cgts in groups:
+            cpred_pts = [resample_line(p, PRED_NUM_SAMPLE) for p, _s in cpreds]
+            cscores = np.array([sc for _p, sc in cpreds], dtype=np.float64)
+            cgt_pts = [resample_line(g, GT_NUM_SAMPLE) for g in cgts]
+            matrix, per_thr_c, tpfp_c = _score_group(
+                cpred_pts, cscores, cgt_pts, len(cgt_pts))
+            tp, fp, matched = tpfp_c[TP_THRESHOLD]
+            n_tp += int(tp.sum())
+            dists += [-matrix[i, m] for i, m in enumerate(matched) if m >= 0]
+            by_cls[label] = dict(
+                scores=cscores, n_gt=len(cgt_pts),
+                tp_thr={t: (v[0], v[1]) for t, v in tpfp_c.items()})
+            score_chunks.append(cscores)
+            # Classes absent from this tile's GT contribute nothing -- see
+            # the docstring.
+            if cgt_pts:
+                for thr, ap in per_thr_c.items():
+                    per_cls_thr.setdefault(thr, []).append(ap)
+        per_thr = {
+            thr: (float(np.mean([a for a in v if a is not None]))
+                  if any(a is not None for a in v) else None)
+            for thr, v in per_cls_thr.items()
+        }
+        for thr in CHAMFER_THRESHOLDS:
+            per_thr.setdefault(thr, None)
+        scores_all = (np.concatenate(score_chunks) if score_chunks
+                      else np.zeros(0))
 
     aps = [v for v in per_thr.values() if v is not None]
-    tp, fp, matched = tpfp[TP_THRESHOLD]
-    n_tp = int(tp.sum())
-    # Chamfer distance of the matched pairs -- how good the hits are, as
-    # opposed to how many there are. Sign flipped back to a real distance.
-    dists = [-matrix[i, m] for i, m in enumerate(matched) if m >= 0]
+    scores = scores_all
 
     # How many polylines the model actually claims exist here. The raw
     # count is useless on its own -- the head emits a fixed num_vec every
@@ -3971,9 +4089,11 @@ def eval_tile(preds, gts, score_thresh=0.0):
         # threshold in this tab only ever affects what is DRAWN.
         'precision': (n_tp / n_pred) if n_pred else None,
         'chamfer': float(np.median(dists)) if dists else None,
-        # kept per threshold so global_ap() can pool them across tiles
+        # kept per CLASS and per threshold so global_ap() can pool them
+        # across tiles the way eval_map does -- pooling classes together
+        # would rank a driving detection against a curb one.
         'scores': scores,
-        'tp_thr': {t: (v[0], v[1]) for t, v in tpfp.items()},
+        'by_cls': by_cls,
     }
 
 
@@ -3995,6 +4115,14 @@ def evaluate_run(results_path, gt_path, score_thresh=0.0):
             return REval['rows']
         preds_by_token = load_results(results_path)
         gt_by_token = load_gt(gt_path)
+        classes = gt_classes(gt_path)
+        # Whether the per-class split actually engaged. It needs >1 class AND
+        # predictions naming one of them, so a multi-class GT scored against
+        # a class-free results json falls back to pooling -- reported rather
+        # than assumed, since pooled numbers mean something different.
+        split_ok = any(
+            split_by_class(p, gt_by_token.get(t, []), classes) is not None
+            for t, p in preds_by_token.items())
         # A results json identifies a tile by bare `sample_idx`, which is
         # unique only WITHIN a dataset -- two grid exports both contain
         # tile_00000 (the reason the rest of this viewer keys by
@@ -4021,7 +4149,7 @@ def evaluate_run(results_path, gt_path, score_thresh=0.0):
                 # a results json from a different dataset than --data-root
                 missing_tile += 1
                 continue
-            m = eval_tile(preds, gts, score_thresh)
+            m = eval_tile(preds, gts, score_thresh, classes=classes)
             row = dict(base)
             row.update(m)
             row['token'] = token
@@ -4045,6 +4173,7 @@ def evaluate_run(results_path, gt_path, score_thresh=0.0):
 
         glob = global_ap(rows)
         REval.update(key=key, rows=rows, global_ap=glob, ambiguous=ambiguous,
+                      classes=classes, per_class=split_ok,
                       missing_gt=missing_gt, missing_tile=missing_tile,
                       shape_mismatch=shape_mismatch,
                       n_gt_total=sum(r['n_gt'] for r in rows),
@@ -4056,17 +4185,28 @@ def evaluate_run(results_path, gt_path, score_thresh=0.0):
 def global_ap(rows):
     """The real, interleaved-ranking AP -- every tile's detections pooled and
     ranked together, exactly as eval_map does. Reported so this tab can be
-    checked against the training log rather than taken on faith."""
+    checked against the training log rather than taken on faith.
+
+    Pooling is per CLASS (mirroring eval_map's own loop) and the class APs
+    are then averaged, which is what makes this comparable with the log's
+    `CarlaMap_chamfer/mAP`. With one class that is a single pool, i.e.
+    unchanged."""
     out = {}
-    n_gts = sum(r['n_gt'] for r in rows)
+    labels = sorted({c for r in rows for c in r['by_cls']})
     for thr in CHAMFER_THRESHOLDS:
-        tp = np.concatenate([r['tp_thr'][thr][0] for r in rows]) if rows \
-            else np.zeros(0)
-        fp = np.concatenate([r['tp_thr'][thr][1] for r in rows]) if rows \
-            else np.zeros(0)
-        sc = np.concatenate([r['scores'] for r in rows]) if rows \
-            else np.zeros(0)
-        out[thr] = ap_from_tpfp(tp, fp, sc, n_gts)
+        per_cls = []
+        for c in labels:
+            parts = [r['by_cls'][c] for r in rows if c in r['by_cls']]
+            n_gts = sum(p['n_gt'] for p in parts)
+            tp = (np.concatenate([p['tp_thr'][thr][0] for p in parts])
+                  if parts else np.zeros(0))
+            fp = (np.concatenate([p['tp_thr'][thr][1] for p in parts])
+                  if parts else np.zeros(0))
+            sc = (np.concatenate([p['scores'] for p in parts])
+                  if parts else np.zeros(0))
+            per_cls.append(ap_from_tpfp(tp, fp, sc, n_gts))
+        vals = [v for v in per_cls if v is not None]
+        out[thr] = float(np.mean(vals)) if vals else None
     vals = [v for v in out.values() if v is not None]
     out['mean'] = float(np.mean(vals)) if vals else None
     return out
@@ -4534,45 +4674,77 @@ def plot_by_shape_count(rows, which, ykey):
                    spec['xlabel'], tight=True)
 
 
-def plot_pr_curve(rows):
-    """The GLOBAL precision-recall curve, one line per chamfer threshold.
+def _pooled_curve(rows, label, thr):
+    """(recall, precision, AP) for one class, pooled over every tile."""
+    parts = [r['by_cls'][label] for r in rows if label in r['by_cls']]
+    n_gts = sum(p['n_gt'] for p in parts)
+    if not parts or not n_gts:
+        return None
+    tp = np.concatenate([p['tp_thr'][thr][0] for p in parts])
+    fp = np.concatenate([p['tp_thr'][thr][1] for p in parts])
+    sc = np.concatenate([p['scores'] for p in parts])
+    order = np.argsort(-sc)
+    ctp, cfp = np.cumsum(tp[order]), np.cumsum(fp[order])
+    eps = np.finfo(np.float32).eps
+    return (ctp / max(n_gts, eps), ctp / np.maximum(ctp + cfp, eps),
+            ap_from_tpfp(tp, fp, sc, n_gts))
+
+
+def plot_pr_curve(rows, classes=None):
+    """The GLOBAL precision-recall curve.
 
     Interleaved ranking across every tile -- i.e. the real eval, not the
     per-tile approximation the rest of this tab sorts by. It is here as the
     cross-check: the AP printed in its legend is directly comparable to the
     training log's CarlaMap_chamfer/*_AP_thr_* entries.
 
-    Ordered scale (0.5 < 1.0 < 1.5 m), so it gets one hue in three steps
-    rather than three categorical colours.
+    With ONE map class: one line per chamfer threshold, on an ordered scale
+    (0.5 < 1.0 < 1.5 m), so it gets one hue in three steps rather than three
+    categorical colours.
+
+    With SEVERAL: one line per class, all at the 1.0 m threshold. Three
+    thresholds times N classes is an unreadable tangle, and the question a
+    multi-class run actually raises is which class is being found -- so the
+    class becomes the series and the threshold is fixed. Curves are never
+    pooled ACROSS classes: ranking a driving detection against a curb one
+    would invent an ordering the eval never computes.
     """
-    n_gts = sum(r['n_gt'] for r in rows)
-    if not rows or not n_gts:
+    labels = sorted({c for r in rows for c in r['by_cls']})
+    if not rows or not sum(r['n_gt'] for r in rows):
         return None
-    # one hue in three steps, low->high threshold. The darkest step still has
-    # to clear the page background (#0d1117); a genuinely dark navy reads as
-    # an absent line here, which is why this ramp starts mid-hue rather than
-    # at the bottom of the scale.
-    shades = ['#1f6feb', ACCENT, '#a5d6ff']
     fig, ax = stat_fig(height=4.0, width=6.2)
-    for i, thr in enumerate(CHAMFER_THRESHOLDS):
-        tp = np.concatenate([r['tp_thr'][thr][0] for r in rows])
-        fp = np.concatenate([r['tp_thr'][thr][1] for r in rows])
-        sc = np.concatenate([r['scores'] for r in rows])
-        order = np.argsort(-sc)
-        ctp, cfp = np.cumsum(tp[order]), np.cumsum(fp[order])
-        eps = np.finfo(np.float32).eps
-        rec = ctp / max(n_gts, eps)
-        prec = ctp / np.maximum(ctp + cfp, eps)
-        ap = ap_from_tpfp(tp, fp, sc, n_gts)
-        ax.plot(rec, prec, color=shades[i], linewidth=1.6,
-                 label=f'{thr:g} m — AP {ap:.4f}')
+    if len(labels) < 2:
+        # one hue in three steps, low->high threshold. The darkest step still
+        # has to clear the page background (#0d1117); a genuinely dark navy
+        # reads as an absent line here, which is why this ramp starts mid-hue
+        # rather than at the bottom of the scale.
+        shades = ['#1f6feb', ACCENT, '#a5d6ff']
+        for i, thr in enumerate(CHAMFER_THRESHOLDS):
+            got = _pooled_curve(rows, labels[0] if labels else 0, thr)
+            if got is None:
+                continue
+            rec, prec, ap = got
+            ax.plot(rec, prec, color=shades[i], linewidth=1.6,
+                     label=f'{thr:g} m — AP {ap:.4f}')
+        title = 'Global precision-recall (all tiles ranked together)'
+    else:
+        for i, lab in enumerate(labels):
+            got = _pooled_curve(rows, lab, TP_THRESHOLD)
+            if got is None:
+                continue
+            rec, prec, ap = got
+            name = (classes[lab] if classes and lab < len(classes)
+                    else f'class {lab}')
+            ax.plot(rec, prec,
+                     color=CLASS_COLORS.get(i % 8, CLASS_FALLBACK),
+                     linewidth=1.6, label=f'{name} — AP {ap:.4f}')
+        title = (f'Global precision-recall per class, {TP_THRESHOLD:g} m '
+                 '(all tiles ranked together)')
     ax.set_xlim(0, max(0.05, ax.get_xlim()[1]))
     ax.set_ylim(0, 1.02)
     ax.set_ylabel('precision', color=TEXT_MUTED, fontsize=8)
     legend(ax, loc='upper right')
-    return finish(fig, ax,
-                   'Global precision-recall (all tiles ranked together)',
-                   'recall', tight=True)
+    return finish(fig, ax, title, 'recall', tight=True)
 
 
 def plot_quality_hist(rows, ykey):
@@ -4698,7 +4870,7 @@ def _render_res(kind, rows, group_by, ykey):
     if spec['kind'] == 'counts':
         return plot_counts(rows)
     if spec['kind'] == 'pr':
-        return plot_pr_curve(rows)
+        return plot_pr_curve(rows, REval.get('classes'))
     if spec['kind'] == 'hist':
         return plot_quality_hist(rows, spec['y'])
     if spec['kind'] == 'bygroup':
@@ -5053,11 +5225,43 @@ def results_summary_html(rows):
                  f'against, so they are left out of the curve-vs-line charts '
                  f'&mdash; the usual cause is a pkl converted with a '
                  f'<code>--classes</code> subset.</div>')
+    note += class_health()
     note += frame_health()
     note += ap_health(rows)
     note += count_health(rows)
     return (f'<table class="stats"><thead><tr>{head}</tr></thead>'
             f'<tbody><tr>{body}</tr></tbody></table>{note}')
+
+
+def class_health():
+    """Say which map classes are being scored, and warn when they cannot be
+    kept apart.
+
+    Matching runs WITHIN a class, as eval_map does -- a driving prediction is
+    never a true positive against a curb GT line. That needs two things: a GT
+    file with more than one class, and predictions whose `cls_name` names one
+    of them. A results json from a class-free run writes '?' instead, and
+    scoring it against a multi-class GT can only pool the classes together,
+    which inflates AP by allowing exactly the cross-class matches the eval
+    forbids. Silent otherwise, so it is stated here.
+    """
+    classes = REval.get('classes') or ()
+    if len(classes) < 2:
+        return ''
+    names = ', '.join(f'<code>{c}</code>' for c in classes)
+    if REval.get('per_class'):
+        return (f'<div class="note">Scoring {len(classes)} map classes '
+                f'({names}) separately, as the eval does: a prediction can '
+                'only match GT of its own class. Per-tile AP averages the '
+                'classes present in that tile; the global AP averages all '
+                'of them, like the log\'s <code>mAP</code>.</div>')
+    return (f'<div class="note" style="color:{CRITICAL}">This GT has '
+            f'{len(classes)} map classes ({names}) but the predictions carry '
+            'no matching class name, so every class was pooled into one. '
+            'That lets a prediction match GT of another class and reports '
+            'an AP the real eval would not &mdash; regenerate the results '
+            'json from a config whose <code>map_classes</code> matches this '
+            'GT.</div>')
 
 
 def frame_health():

@@ -21,6 +21,18 @@ both layouts it writes are accepted::
     <data_root>/blocks/<tile>.npz                # (no <split> level, and
     <data_root>/reference_lines/<tile>_...json   #  tile names carry no town)
 
+An export may ship SEVERAL polyline directories holding different GT sets --
+the 30m test export has an unclassified `reference_lines/` next to a
+`reference_curb_driving_lines/` that carries `class_id`/`class` and states
+its own `classes` lookup per tile. `--reference-dir` picks one; by default
+`reference_lines/` wins, except that --classes/--map-classes falls back to a
+sibling that actually has a taxonomy. The choice is always printed, and the
+one used is recorded in the pkl's `tile_geometry.reference_dir`.
+
+The class lookup is likewise read from the manifest's `class_lookup` where
+there is one, and from the polyline json's own `classes` key where there is
+not.
+
 Where a directory holds both files, `manifest.json` wins and
 `grid_manifest.json` only backfills keys it lacks -- the same rule
 `tools/maptrv2/dataset_viewer.py` uses. `manifest.json` is written by a
@@ -150,6 +162,17 @@ def parse_args():
         'zero voxels. Default: +/-tile_radius in xy (read from the manifest) '
         f'and {DEFAULT_Z_RANGE[0]}..{DEFAULT_Z_RANGE[1]} in z')
     parser.add_argument(
+        '--reference-dir',
+        type=str,
+        default=None,
+        metavar='DIR',
+        help='name of the per-tile polyline directory under the tile dir '
+        "(default: 'reference_lines', or a sibling that actually carries a "
+        'class taxonomy when --classes/--map-classes asks for one -- some '
+        'exports keep the classified polylines in a separate directory such '
+        'as reference_curb_driving_lines/). The resolved directory is '
+        'always printed')
+    parser.add_argument(
         '--out-tag',
         type=str,
         default=None,
@@ -227,6 +250,91 @@ def load_manifest(data_root, split):
     raise FileNotFoundError(
         f'no {" or ".join(MANIFEST_NAMES)} under {data_root!r}'
         f'{f" or {os.path.join(data_root, split)!r}" if split else ""}')
+
+
+def _first_ref_json(tile_dir, ref_dir, tiles):
+    """Parse the first tile's polyline json under ``ref_dir``, or None."""
+    for tile in tiles:
+        path = os.path.join(tile_dir, ref_dir,
+                            f'{tile["name"]}_reference_lines.json')
+        if os.path.isfile(path):
+            with open(path, encoding='utf-8') as f:
+                return json.load(f)
+    return None
+
+
+def reference_dir_candidates(tile_dir):
+    """Directories that could hold per-tile polyline jsons, preferred first.
+
+    ``reference_lines`` is the name every export has used for the unclassified
+    set, so it stays first; anything else matching ``reference*lines*`` is a
+    variant (this dataset ships ``reference_curb_driving_lines``).
+    """
+    try:
+        entries = sorted(os.listdir(tile_dir))
+    except OSError:
+        return []
+    found = [
+        d for d in entries
+        if d.startswith('reference') and 'lines' in d
+        and os.path.isdir(os.path.join(tile_dir, d))
+    ]
+    found.sort(key=lambda d: (d != 'reference_lines', d))
+    return found
+
+
+def resolve_reference_dir(tile_dir, manifest, requested, need_classes):
+    """Pick the polyline directory to convert, and its class lookup.
+
+    Returns ``(ref_dir, class_lookup)``. The lookup comes from the manifest
+    where an export states one, and otherwise from the polyline json's own
+    ``classes`` key -- this dataset's manifest has no ``class_lookup`` at all,
+    and declares ``{"0": "driving", "1": "curb"}`` per tile instead.
+
+    An export can ship BOTH an unclassified ``reference_lines`` and a
+    classified sibling, and those are different GT sets, not two spellings of
+    one. So the choice is never silent: an explicit --reference-dir is obeyed,
+    and the automatic fallback (only ever taken when --classes/--map-classes
+    needs a taxonomy that the default directory lacks) prints what it picked
+    and why.
+    """
+    tiles = manifest.get('tiles') or []
+    candidates = reference_dir_candidates(tile_dir)
+    if requested:
+        path = os.path.join(tile_dir, requested)
+        if not os.path.isdir(path):
+            raise FileNotFoundError(
+                f'{path} does not exist; this export has: '
+                f'{", ".join(candidates) or "no reference*lines* directory"}')
+        candidates = [requested]
+    if not candidates:
+        raise FileNotFoundError(
+            f'no reference*lines* directory under {tile_dir}')
+
+    def lookup_for(ref_dir):
+        stated = manifest.get('class_lookup')
+        if stated:
+            return {str(k): v for k, v in stated.items()}
+        ref = _first_ref_json(tile_dir, ref_dir, tiles)
+        classes = (ref or {}).get('classes') or {}
+        return {str(k): v for k, v in classes.items()}
+
+    chosen = candidates[0]
+    lookup = lookup_for(chosen)
+    if need_classes and not lookup:
+        # Only now is it worth looking past the default directory.
+        for alt in candidates[1:]:
+            alt_lookup = lookup_for(alt)
+            if alt_lookup:
+                stated = ', '.join(
+                    f'{k}={v}' for k, v in sorted(alt_lookup.items()))
+                print(f'  [ref] {chosen}/ carries no class taxonomy; using '
+                      f'{alt}/ instead, which declares {stated}')
+                return alt, alt_lookup
+    print(f'  [ref] reading polylines from {chosen}/'
+          + (f' (classes: {", ".join(sorted(lookup.values()))})'
+             if lookup else ' (no class taxonomy)'))
+    return chosen, lookup
 
 
 def manifest_tile_radius(manifest):
@@ -462,9 +570,17 @@ def convert_carla_tiles(data_root,
                         z_max=DEFAULT_Z_MAX,
                         min_lidar_points=1,
                         lidar_check=True,
-                        gt_frame='offset'):
+                        gt_frame='offset',
+                        reference_dir=None):
     assert gt_frame in ('offset', 'tile_center')
     tile_dir, manifest = load_manifest(data_root, split)
+    ref_dir, class_lookup = resolve_reference_dir(
+        tile_dir, manifest, reference_dir,
+        need_classes=bool(classes or map_classes))
+    # The lookup may have come from the polyline jsons rather than the
+    # manifest; resolve_classes() only ever reads it off the manifest, so put
+    # it there. A copy -- the caller's dict is not ours to edit.
+    manifest = dict(manifest, class_lookup=class_lookup)
     tile_radius = manifest_tile_radius(manifest)
     if classes and map_classes:
         raise ValueError('--classes and --map-classes both filter the same '
@@ -491,6 +607,7 @@ def convert_carla_tiles(data_root,
     out_of_bounds = []
     coverage = []
     total_instances = 0
+    class_conflicts = []
     per_class_instances = {name: 0 for name in class_names}
     prog_bar = mmcv.ProgressBar(len(manifest['tiles']))
     for idx, tile in enumerate(manifest['tiles']):
@@ -563,10 +680,18 @@ def convert_carla_tiles(data_root,
             if n_raw:
                 coverage.append((n_in_range / n_raw, name))
 
-        ref_path = os.path.join(tile_dir, 'reference_lines',
+        ref_path = os.path.join(tile_dir, ref_dir,
                                 f'{name}_reference_lines.json')
         with open(ref_path, encoding='utf-8') as f:
             ref = json.load(f)
+
+        # Every tile of this dataset restates the taxonomy, so check it
+        # rather than trusting the first file: a tile whose ids mean
+        # something else would be relabelled silently, and the class ids are
+        # what --map-classes matches on.
+        stated = ref.get('classes')
+        if stated and {str(k): v for k, v in stated.items()} != class_lookup:
+            class_conflicts.append(dict(name=name, classes=stated))
 
         annotation = {c: [] for c in class_names}
         for poly in ref['polylines']:
@@ -660,8 +785,10 @@ def convert_carla_tiles(data_root,
         report_class_counts(per_class_instances, n)
     report_coverage(coverage, pc_range)
     report_out_of_bounds(out_of_bounds)
+    report_class_conflicts(class_conflicts, class_lookup)
     return samples, dropped, dict(
         tile_dir=tile_dir,
+        reference_dir=ref_dir,
         tile_radius=tile_radius,
         tile_side=manifest.get('tile_side'),
         pc_range=list(pc_range),
@@ -713,6 +840,24 @@ def report_coverage(coverage, pc_range):
               '-- check the range covers the tile in the `offset` frame')
 
 
+def report_class_conflicts(class_conflicts, class_lookup):
+    """Tiles whose own class taxonomy disagrees with the one being used.
+
+    Not fatal -- the conversion has already happened by the time this prints
+    -- but it means some tiles' `class_id`s were matched against the wrong
+    names, so the resulting labels cannot be trusted.
+    """
+    if not class_conflicts:
+        return
+    print(f'  [warn] {len(class_conflicts)} tile(s) declare a DIFFERENT class '
+          f'lookup than the {class_lookup} used for --map-classes/--classes; '
+          'their labels are not trustworthy:')
+    for entry in class_conflicts[:10]:
+        print(f'  [warn]   {entry["name"]}: {entry["classes"]}')
+    if len(class_conflicts) > 10:
+        print(f'  [warn]   ... and {len(class_conflicts) - 10} more')
+
+
 def report_out_of_bounds(out_of_bounds):
     if not out_of_bounds:
         return
@@ -743,7 +888,8 @@ def main():
         z_max=args.z_max,
         min_lidar_points=args.min_lidar_points,
         lidar_check=lidar_check,
-        gt_frame=args.gt_frame)
+        gt_frame=args.gt_frame,
+        reference_dir=args.reference_dir)
     # Derived from the manifest's tile size inside convert_carla_tiles when
     # not given on the CLI, so read it back rather than re-deriving it here.
     pc_range = meta['pc_range']
@@ -761,6 +907,9 @@ def main():
             # the source manifest.
             tile_geometry=dict(
                 tile_dir=meta['tile_dir'],
+                # which polyline directory the annotations came from -- an
+                # export can ship several, holding DIFFERENT GT sets
+                reference_dir=meta['reference_dir'],
                 tile_radius=meta['tile_radius'],
                 tile_side=meta['tile_side']),
             # The origin every sample's annotation (and, via

@@ -17,7 +17,8 @@ so it would only look as though it had.
 
 --- What changes ---
 
-    0 = driving   <- the export's `driving_centerline` polylines
+    0 = driving   <- the export's `driving` polylines
+                     (`driving_centerline` on the older grid export)
     1 = curb      <- the export's `curb` polylines
 
 in that order, because the order is the label order:
@@ -44,16 +45,23 @@ config leaves `fixed_ptsnum_per_gt_line` at the parent's 20, so `_format_gt()`
 would write byte-identical GT either way::
 
     python tools/maptrv2/custom_carla_map_converter.py \\
-        --data-root <30m export> --split test \\
+        --data-root ../carla_test --split test \\
         --gt-frame tile_center \\
-        --map-classes driving=driving_centerline curb=curb \\
+        --map-classes driving curb \\
         --out-dir data/carla/ --out-tag 30m_tc_2cls
 
-    python tools/maptrv2/custom_carla_map_converter.py \\
-        --data-root <30m export> --split train \\
-        --gt-frame tile_center \\
-        --map-classes driving=driving_centerline curb=curb \\
-        --out-dir data/carla/ --out-tag 30m_tc_2cls
+`driving` and `curb` are that export's OWN class names, so the bare-name
+shorthand applies; on an export that spells them differently, name the
+mapping (`--map-classes driving=driving_centerline curb=curb`). Note it also
+ships two polyline directories -- an unclassified `reference_lines/` and a
+classified `reference_curb_driving_lines/` -- and the converter switches to
+the classified one because `--map-classes` needs a taxonomy, printing the
+`[ref]` line that says so. Pass `--reference-dir` to override.
+
+**There is no train split yet.** `../carla_test` is test-only, so
+`ann_file_train` below names a pkl that does not exist; convert one the same
+way (`--split train`) or repoint it before a real run. Training with
+train == val scores nothing meaningful.
 
 (Watch the shared `map_ann_file` if the HM line count ever diverges from the
 parent's. The resampling is baked into the json, which `_format_gt()` writes

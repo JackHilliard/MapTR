@@ -506,13 +506,136 @@ reads the pkl's declared order and falls back to `('divider',)` for older
 files). Verified: 259 tiles / {0: 1210} on the old pkl, 30 tiles /
 {0: 299, 1: 135} on the new one.
 
+The viewer's **results tab now matches per class**, and while doing that a
+separate, pre-existing eval bug came out (prediction resampling). Both are
+written up under "Training-results tab" — read that before trusting any AP
+this tab printed before 2026-08-20.
+
 **Still divider-shaped**: the viewer's `shape_counts()` (the curve-vs-line
 box plots) reconciles `n_arc + n_straight` from `reference_lines/*.json`
 against the pkl's instance count, and a `--map-classes` pkl legitimately
-holds fewer instances than the json holds polylines. Those tiles are dropped
-from the shape charts and reported — the same behaviour a `--classes` subset
-already produced, safe but unhelpful. Threading `class_groups` into that
-filter is the fix if the charts are wanted on a multi-class run.
+holds fewer instances than the json holds polylines — and on the
+`../carla_test` export it reads a DIFFERENT directory than the one converted
+(`reference_lines/` vs `reference_curb_driving_lines/`), so the counts cannot
+reconcile at all. Those tiles are dropped from the shape charts and reported
+— the same behaviour a `--classes` subset already produced, safe but
+unhelpful. The fix, if those charts are wanted on a multi-class run, is to
+thread the pkl's `class_groups` and `tile_geometry.reference_dir` into that
+filter; both are recorded for exactly this reason.
+
+### The 30m curb/driving export (`../carla_test`, 2026-08-20)
+
+The first real class-carrying CARLA dataset on this machine, and what the
+`_2cls` configs were verified against: `../carla_test/test`, 3795 tiles,
+7.7 GB, `tile_side` 30.0 (so `tile_radius` 15 -- exactly the 30m configs'
+geometry, and the converter resolves `+-15` from the manifest unaided).
+
+Two things about its layout that the converter had to learn:
+
+1. **It ships TWO polyline directories, holding different GT.**
+   `reference_lines/` is the historical unclassified set (~2.1 polylines/tile,
+   `class_id` absent) and `reference_curb_driving_lines/` is the classified
+   one (3.5/tile, every polyline carrying `class_id`/`class`). Same filenames
+   in both. `--reference-dir` selects one explicitly; by default
+   `reference_lines/` still wins, and only `--classes`/`--map-classes` -- which
+   *need* a taxonomy -- falls back to a sibling that has one, printing what it
+   picked. Recorded in the pkl as `tile_geometry.reference_dir`, because the
+   two directories are not two spellings of one GT set.
+2. **The manifest has no `class_lookup`.** The taxonomy is declared per tile,
+   inside each polyline json (`"classes": {"0": "driving", "1": "curb"}`), so
+   the converter reads it from there when the manifest is silent. All 3795
+   tiles agree; a tile that disagreed would be listed by
+   `report_class_conflicts()` rather than relabelled silently.
+
+Its manifest also states `center` as a 2D `[x, y]` and gives tiles no
+`bounds`, both of which the 2026-08-18 hardening already covers (2D centre ->
+zero z shift; footprint falls back to the polyline json's `tile_bounds`).
+
+Converted with::
+
+    python tools/maptrv2/custom_carla_map_converter.py \
+        --data-root ../carla_test --split test --gt-frame tile_center \
+        --map-classes driving curb \
+        --out-dir data/carla/ --out-tag 30m_tc_2cls
+
+(`driving` and `curb` are the export's own class names, so the bare-name
+shorthand applies -- no `name=export_class` needed.) Result: **3795 tiles, 0
+dropped, 9458 driving + 3819 curb = 13277 instances**, matching a direct
+count over the jsons exactly. Every tile has driving; 2025 of 3795 (53%) also
+have curb, and 1770 are driving-only.
+
+**The tile-centre frame is not optional on this export.** Converted in the
+`offset` frame instead, the same data gives **75 tiles dropped outright**
+(zero in-range points, i.e. gotcha #13 territory), median coverage 92.5%, and
+**1282 of the surviving 3720 tiles keeping <90%** of their points -- one tile
+keeps 0.0%. In `tile_center`: 0 dropped, median **100%**, worst tile 99.8%.
+The reason is visible in the pkl: `|offset - tile_center|` has a median of
+2.9 m but a **max of 117.6 m**, and 279 tiles exceed 15 m -- on this export
+`offset` is evidently not the tile's own centroid for every block. This is
+the 2026-08-13 coverage argument, an order of magnitude louder.
+
+Frame sanity, measured the same way the original `tile_center` bug was
+caught: GT vertex -> nearest LiDAR return, median over 60 random tiles,
+**0.076 m** with the points recentred as `LoadCarlaPointsFromFile(
+recenter=True)` does it, and `max |GT xy| = 15.00 m` exactly (the tile half
+width). The recentring shift's z component is identically zero here, because
+the manifest's 2D `center` makes z fall back to the block's own `offset`.
+
+**There is no train split** -- this export is `test` only, so
+`data.train.ann_file` in both `_2cls` configs points at a
+`carla_map_infos_train_30m_tc_2cls.pkl` that does not exist yet. Convert one
+(or repoint `data.train.ann_file`) before a real run; a train==val run scores
+nothing meaningful.
+
+#### First real 2-class run, and why `curb_AP` is 0 (2026-08-20)
+
+A 1-epoch train+eval over a 64-tile subset of `../carla_test` (tiles that
+carry *both* classes; 126 driving + 112 curb GT instances) runs clean end to
+end under `maptrv2_carla_r50_24ep_lidar_30m_tilecenter_2cls.py`: 3326 MiB at
+`samples_per_gpu=1`, 1.14 s/iter on the local RTX 3070, checkpoint saved,
+and the eval reports **per class**::
+
+    CarlaMap_chamfer/driving_AP: 0.0102   curb_AP: 0.0000   mAP: 0.0051
+    | driving | 126 GT | 3200 dets |
+    | curb    | 112 GT |    0 dets |
+
+So the two-class chain works. **`curb` getting zero detections is not a
+decoding bug**, and it is worth knowing why before reading it as one:
+
+* `MapTRNMSFreeCoder.decode_single` takes `cls_scores.view(-1).topk(max_num)`
+  and derives `labels = indexs % num_classes`, so label 1 is perfectly
+  reachable; 3200 = 64 tiles x `max_num` 50, all of which landed on driving.
+* Measured on the resulting checkpoint: mean sigmoid score **0.1865 driving
+  vs 0.1694 curb**, and **0 of 400** one2one queries have curb as their
+  argmax. Both classes are collapsed into the same narrow band an
+  undertrained MapTR always produces (the 0.163-0.174 range documented under
+  "Tooling"), with driving uniformly ~0.017 higher -- it is the majority
+  class, 2.5:1 in this data.
+* Because `max_num == num_vec_one2one`, a uniform bias of *any* size is
+  enough for one class to take every slot: the top 50 of 100 flattened
+  scores are all driving. Upstream nuScenes has the same shape (max_num 50,
+  num_vec 50, 3 classes), so this is inherent to the decoding, not to this
+  config.
+
+**Read `curb_AP` only after the classifier has actually separated the
+classes.** Re-check the score gap on a converged checkpoint before treating
+a zero as a modelling result.
+
+Reproduce (the subset pkl is just a filtered copy of the converted one)::
+
+    docker run --rm --runtime=nvidia --shm-size=8g \
+      -e NVIDIA_VISIBLE_DEVICES=all -e PYTHONPATH=/MapTR \
+      -v $(pwd)/projects:/MapTR/projects -v $(pwd)/data:/MapTR/data \
+      -v $(pwd)/tools:/MapTR/tools -v $(pwd)/work_dirs:/MapTR/work_dirs \
+      -v /home-local/johil9.nobkp/Documents/Code/carla_test:/home-local/johil9.nobkp/Documents/Code/carla_test:ro \
+      -w /MapTR jhd0ck3r/maptrv2:latest python3 tools/train.py \
+      projects/configs/maptrv2/maptrv2_carla_r50_24ep_lidar_30m_tilecenter_2cls.py \
+      --work-dir work_dirs/carla_2cls_smoke --cfg-options total_epochs=1 \
+      runner.max_epochs=1 evaluation.interval=1 data.workers_per_gpu=0
+
+Note the local RTX 3070 usually has a CARLA simulator on it (~1.9 GB), and
+the first attempt at this OOM'd at 3.16 GiB with 30 MiB free. Check
+`nvidia-smi` before blaming the config.
 
 ## The converter is tile-size agnostic (2026-08-10)
 
@@ -849,16 +972,50 @@ there. Two deliberate deviations, both verified inert:
   sidesteps gotcha #6 (shapely 2.0's STRtree break) entirely.
 
 **Verified bit-exact against the real implementation**, not just
-approximately: identical TP/FP vectors on **all 259** test tiles (0
-mismatches), identical global AP at every threshold (0.00003 / 0.00311 /
-0.02569, mAP 0.00961) and identical TP total (189) versus
-`custom_tpfp_gen`/`eval_map` run inside the container on the same files.
-Re-run that comparison if the matching is ever touched.
+approximately: identical global AP at every threshold versus
+`_evaluate_single` (i.e. `format_res_gt_by_classes` +
+`custom_tpfp_gen`/`eval_map`) run inside the container on the same files —
+**0.00008 / 0.00672 / 0.03118** on the 259-tile demo run, agreeing to 1.6e-10,
+and 5.5e-12 on the two-class run. Re-run that comparison if the matching is
+ever touched; `/gel/usr/johil9/.claude/jobs/*/tmp/resample_probe.py` is the
+harness, and it drives the real dataset object rather than reassembling
+eval_map's arguments by hand.
 
-Note the training log's epoch-1 mAP (0.01551) does **not** match this
-results json (0.00961) — different prediction sets, not a discrepancy in the
-maths. The log's came from the training-time eval hook; the json came from a
+**CORRECTION (2026-08-20)**: this section previously recorded 0.00003 /
+0.00311 / 0.02569 (mAP 0.00961) as the verified-identical numbers. They were
+the viewer's, and they were **wrong** — understated by up to 2.2x. The
+viewer resampled GT to 100 points but scored the raw 20-point predictions,
+while `get_cls_results()` interpolates **both sides** to 100 whenever the
+dataset's `eval_use_same_gt_sample_num_flag` is set, which every CARLA config
+sets. Measuring a 20-point polyline against a 100-point one inflates chamfer,
+so matches were lost: the effect was almost exactly a one-notch threshold
+shift (the viewer's AP at 1.5 m equalled the real AP at 1.0 m). Fixed by
+resampling predictions to `PRED_NUM_SAMPLE` too. Whatever the original
+comparison checked, it was not this; the numbers above are re-measured.
+
+Note the training log's epoch-1 mAP (0.01551) still does not equal the
+results json's — different prediction sets, not a discrepancy in the maths.
+The log's came from the training-time eval hook; the json came from a
 separate `tools/test.py` pass.
+
+**Matching is per CLASS** (2026-08-20), as `eval_map`'s own loop is: a
+`driving` prediction can never be a true positive against a `curb` GT line.
+The pooled version this replaced was not a rounding difference — a
+deliberately mislabelled prediction laid *exactly* on a GT line of another
+class scored AP **1.000** pooled and **0.000** per class. It needs the GT to
+declare >1 class and the results json to carry matching `cls_name`s;
+otherwise it falls back to pooling and `class_health()` says so in red.
+`global_ap()` pools per class and then averages, which is what makes it
+comparable to the log's `mAP`; per-tile AP averages only the classes present
+in *that* tile, since dividing by the full class count would cap a
+driving-only tile at 0.5 for reasons unrelated to the prediction. With one
+class every number is unchanged — verified tile by tile, pooled versus split,
+on all 259 test tiles (0 mismatches, identical global AP and TP total 286).
+Note 286, not the 189 this file used to record: that number came from the
+un-resampled predictions corrected above.
+The global PR chart becomes one curve per class at 1.0 m when there is more
+than one; three thresholds times N classes is unreadable, and curves are
+never pooled across classes.
 
 **`top_n` on the tile renderer** (new, also available to the browse tab).
 The model emits a fixed `num_vec` (50) predictions *every* time, so drawing
@@ -1334,6 +1491,11 @@ per-pair Python loop is what makes it unusable, not the order axis.
   against this config as-is fails with a missing-file error. **Do not
   silently revert — check with the user first**; it may reflect intent to
   wire up a real train split. `ann_file_val`/`ann_file_test` are fine.
+- **`../carla_test` has no train split.** It is 3795 `test` tiles with the
+  driving/curb taxonomy (2026-08-20 section) and is the only class-carrying
+  dataset here with a real tile count. Both `_2cls` configs name a
+  `carla_map_infos_train_30m_tc_2cls.pkl` that does not exist; convert one,
+  or repoint `data.train.ann_file`, before any run whose numbers matter.
 - **Only the local 259-tile test subset exists.** The full dataset is 4103
   tiles / 5 towns with no `train`/`val` split yet — one is needed (by town
   or stride) before a real run. Converting it needs no code changes, just

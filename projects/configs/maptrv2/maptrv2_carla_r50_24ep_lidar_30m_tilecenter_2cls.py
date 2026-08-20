@@ -14,7 +14,8 @@ deliberate choice to maximise GT density on the tiny local subset. This
 config instead trains two classes, in this order (the order IS the label
 order):
 
-    0 = driving   <- the export's `driving_centerline` polylines
+    0 = driving   <- the export's `driving` polylines
+                     (`driving_centerline` on the older grid export)
     1 = curb      <- the export's `curb` polylines
 
 That requires four things to agree, and they are all set below:
@@ -31,13 +32,14 @@ That requires four things to agree, and they are all set below:
   two-class predictions against one-class GT.
 
 Note the classes are NOT a subset relabelling of the old `divider` set: with
-`--map-classes` only the two named export classes are kept, so
-`road_edge`, `lane_divider`, `center_divider`, `sidewalk_edge`, `median`
-and `crosswalk` polylines are dropped entirely. On the Town10HD grid export
-that is 299 driving_centerline + 135 curb kept out of 1251 polylines. If
-curbs should also absorb road edges, say so in the converter flag --
-`curb=curb,road_edge` -- and regenerate; nothing in this file needs to
-change for that, since the grouping lives in the pkl.
+`--map-classes` only the two NAMED export classes are kept, and anything else
+the export carries is dropped rather than merged. `../carla_test` publishes
+exactly these two, so nothing is lost there; on the Town10HD grid export,
+which also has `road_edge`, `lane_divider`, `center_divider`,
+`sidewalk_edge`, `median` and `crosswalk`, it keeps 299 + 135 of 1251
+polylines. To fold road edges into curbs, say `curb=curb,road_edge` in the
+converter flag and regenerate; nothing in this file changes, since the
+grouping lives in the pkl.
 
 `aux_seg` is left at `seg_classes=1` on purpose. That is the BEV auxiliary
 segmentation head, whose channel count is independent of `num_classes`
@@ -54,16 +56,29 @@ The class taxonomy is a property of the DATA, so this pkl is shared with
 single-class tile-centre pkl is shared with its HM sibling::
 
     python tools/maptrv2/custom_carla_map_converter.py \\
-        --data-root <30m export> --split test \\
+        --data-root ../carla_test --split test \\
         --gt-frame tile_center \\
-        --map-classes driving=driving_centerline curb=curb \\
+        --map-classes driving curb \\
         --out-dir data/carla/ --out-tag 30m_tc_2cls
 
-    python tools/maptrv2/custom_carla_map_converter.py \\
-        --data-root <30m export> --split train \\
-        --gt-frame tile_center \\
-        --map-classes driving=driving_centerline curb=curb \\
-        --out-dir data/carla/ --out-tag 30m_tc_2cls
+`driving` and `curb` are that export's OWN class names, so the bare-name
+shorthand applies; on an export that spells them differently, name the
+mapping (`--map-classes driving=driving_centerline curb=curb`). Note it also
+ships two polyline directories -- an unclassified `reference_lines/` and a
+classified `reference_curb_driving_lines/` -- and the converter switches to
+the classified one because `--map-classes` needs a taxonomy, printing the
+`[ref]` line that says so. Pass `--reference-dir` to override.
+
+**There is no train split yet.** `../carla_test` is test-only, so
+`ann_file_train` below names a pkl that does not exist; convert one the same
+way (`--split train`) or repoint it before a real run. Training with
+train == val scores nothing meaningful.
+
+Verified on `../carla_test` (3795 tiles, `tile_side` 30.0): 0 tiles dropped,
+median 100% range coverage, 9458 `driving` + 3819 `curb` instances. The
+tile-centre frame is doing real work there -- the same export converted in
+the `offset` frame drops 75 tiles outright and leaves 1282 of the rest under
+90% coverage, because `|offset - tile_center|` reaches 117 m on some blocks.
 
 `--out-tag` is what makes `--out-dir data/carla/` safe: the output filename
 is otherwise a function of `--split` alone, so a second dataset written
