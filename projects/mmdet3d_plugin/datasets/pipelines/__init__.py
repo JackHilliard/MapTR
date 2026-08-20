@@ -1,11 +1,13 @@
 from .transform_3d import (
     PadMultiViewImage, PadMultiViewImageDepth, NormalizeMultiviewImage, 
-    PhotoMetricDistortionMultiViewImage, CustomCollect3D, RandomScaleImageMultiViewImage, CustomPointsRangeFilter)
+    PhotoMetricDistortionMultiViewImage, CustomCollect3D, RandomScaleImageMultiViewImage, CustomPointsRangeFilter,
+    CarlaActorPaste)
 from .formating import CustomDefaultFormatBundle3D
 
 from .loading import CustomLoadPointsFromFile, CustomLoadPointsFromMultiSweeps, CustomLoadMultiViewImageFromFiles, CustomPointToMultiViewDepth, LoadCarlaPointsFromFile, GridSamplePoints, EmptyLidarTileError
 __all__ = [
     'PadMultiViewImage', 'NormalizeMultiviewImage',
     'PhotoMetricDistortionMultiViewImage', 'CustomDefaultFormatBundle3D', 'CustomCollect3D', 'RandomScaleImageMultiViewImage',
-    'LoadCarlaPointsFromFile', 'GridSamplePoints', 'EmptyLidarTileError'
+    'LoadCarlaPointsFromFile', 'GridSamplePoints', 'EmptyLidarTileError',
+    'CarlaActorPaste'
 ]

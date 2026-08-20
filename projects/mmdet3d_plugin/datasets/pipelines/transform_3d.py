@@ -411,3 +411,197 @@ class CustomPointsRangeFilter:
         clean_points = points[points_mask]
         data["points"] = clean_points
         return data
+
+
+@PIPELINES.register_module()
+class CarlaActorPaste:
+    """Paste scanned CARLA vehicles/pedestrians into a CARLA tile.
+
+    The CARLA towns are captured empty, so a model trained on them never sees
+    traffic.  Re-running the simulator per augmentation is prohibitively
+    expensive, so ``point2vector_data/carla_actor_scan.py`` scans a catalogue of
+    actors once with the same 60 m aerial LiDAR rig, and this transform drops
+    them into tiles at load time -- on lane centrelines facing along the lane
+    for vehicles, on sidewalks/crosswalks for pedestrians -- while carving out
+    the ground returns each actor's measured shadow removes.
+
+    GT polylines are deliberately left untouched: the model is meant to infer
+    map elements hidden under traffic.
+
+    Must run **after** ``LoadCarlaPointsFromFile`` and **before**
+    ``GridSamplePoints``, so pasted and real points get the same voxel
+    decimation.
+
+    Frames: the placement sidecars are written in the ``tile_center`` frame
+    (world - tile_center).  That is what ``LoadCarlaPointsFromFile`` produces
+    with ``recenter=True`` (it adds ``lidar_recenter_shift = offset -
+    tile_center`` to points stored relative to ``offset``).  Under an
+    ``offset``-frame config the two origins differ by 1-2 m on the 25 m export
+    and up to ~17 m on the 60 m one -- enough to park a car on the pavement --
+    so the candidates are shifted to match.  Which of the two applies is read
+    off the sample's ``gt_frame``, so this works under either config family
+    without a flag that can silently disagree with the loader.
+
+    Args:
+        catalogue (str): path to the scanned catalogue's ``catalogue.json``.
+        placements_dir (str | None): directory of ``*_placements.json``
+            sidecars.  Defaults to ``<tile dir>/../placements``.
+        n_vehicles (tuple[int, int]): inclusive range of vehicles to paste.
+        n_pedestrians (tuple[int, int]): inclusive range of pedestrians.
+        prob (float): probability of augmenting a given sample at all.
+        recentered (bool | None): override the frame detection; ``None``
+            (default) reads it from the sample's ``gt_frame``.
+        paste_module_dir (str | None): directory holding ``actor_paste.py``
+            (the ``point2vector_data`` checkout).  Defaults to
+            ``$POINT2VECTOR_DATA`` and then to a sibling checkout.
+    """
+
+    def __init__(self,
+                 catalogue,
+                 placements_dir=None,
+                 n_vehicles=(0, 5),
+                 n_pedestrians=(0, 6),
+                 prob=1.0,
+                 carve=True,
+                 recentered=None,
+                 seed=None,
+                 paste_module_dir=None):
+        self.catalogue = catalogue
+        self.placements_dir = placements_dir
+        self.n_vehicles = tuple(n_vehicles)
+        self.n_pedestrians = tuple(n_pedestrians)
+        self.prob = float(prob)
+        self.carve = bool(carve)
+        self.recentered = recentered if recentered is None else bool(recentered)
+        self._rng = np.random.default_rng(seed)
+        self._paste_module_dir = paste_module_dir
+        self._lib = None
+        self._paste = None
+
+    def _lazy_init(self):
+        """Import ``actor_paste`` and open the catalogue on first use.
+
+        Deferred so each dataloader worker gets its own file handles and LRU
+        cache, and so a config that references the transform still imports on a
+        machine where the catalogue has not been scanned yet.
+        """
+        if self._lib is not None:
+            return
+        import os
+        import sys
+        d = self._paste_module_dir or os.environ.get('POINT2VECTOR_DATA')
+        if d is None:
+            d = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                '..', '..', '..', '..', '..', 'point2vector_data')
+        d = os.path.abspath(d)
+        if d not in sys.path:
+            sys.path.insert(0, d)
+        from actor_paste import ActorLibrary, load_placements, paste_actors
+        self._lib = ActorLibrary(self.catalogue)
+        self._paste = paste_actors
+        self._load_placements = load_placements
+
+    def _placements_path(self, pts_filename):
+        import os
+        name = os.path.splitext(os.path.basename(pts_filename))[0]
+        d = self.placements_dir
+        if d is None:
+            d = os.path.join(os.path.dirname(os.path.dirname(pts_filename)),
+                             'placements')
+        return os.path.join(d, f'{name}_placements.json')
+
+    def _frame_shift(self, results):
+        """``offset - tile_center``, or None when the points are tile-centred.
+
+        Prefers the pkl's own ``lidar_recenter_shift``; pkls predating that
+        field still carry both origins in the tile npz, so fall back to those
+        rather than refusing to run.
+        """
+        recentered = self.recentered
+        if recentered is None:
+            recentered = results.get('gt_frame', 'offset') == 'tile_center'
+        if recentered:
+            return None
+        shift = results.get('lidar_recenter_shift')
+        if shift is None:
+            block = np.load(results['pts_filename'])
+            if 'offset' not in block or 'tile_center' not in block:
+                raise KeyError(
+                    'CarlaActorPaste needs `lidar_recenter_shift` (or an '
+                    '`offset`/`tile_center` pair in the tile npz) to move '
+                    'placements into the offset frame. Re-run '
+                    'custom_carla_map_converter.py to regenerate the pkl.')
+            shift = (np.asarray(block['offset'], dtype=np.float32)
+                     - np.asarray(block['tile_center'], dtype=np.float32))
+        return np.asarray(shift, dtype=np.float32)[:3]
+
+    def _to_point_frame(self, placements, results):
+        """Move candidates from the sidecar's tile_center frame to the points'.
+
+        A no-op when the points are already tile-centred; otherwise they are
+        relative to ``offset`` and ``p_offset = p_tile_center - shift``.
+        """
+        shift = self._frame_shift(results)
+        if shift is None:
+            return placements
+        sx, sy, sz = [float(v) for v in shift]
+        moved = dict(placements)
+        moved['candidates'] = [
+            dict(c, x=c['x'] - sx, y=c['y'] - sy, z=c['z'] - sz)
+            for c in placements.get('candidates', [])
+        ]
+        bounds = placements.get('tile_bounds_local')
+        if bounds is not None:
+            x0, y0, x1, y1 = bounds
+            moved['tile_bounds_local'] = [x0 - sx, y0 - sy, x1 - sx, y1 - sy]
+        return moved
+
+    def __call__(self, results):
+        import os
+        if self._rng.random() > self.prob:
+            return results
+        self._lazy_init()
+        if len(self._lib) == 0:
+            return results
+
+        path = self._placements_path(results['pts_filename'])
+        if not os.path.exists(path):
+            return results
+        placements = self._to_point_frame(self._load_placements(path), results)
+
+        points = results['points']
+        arr = points.tensor.numpy()
+        xyz = arr[:, :3]
+        strength = (arr[:, 3:4] if arr.shape[1] > 3
+                    else np.zeros((arr.shape[0], 1), np.float32))
+
+        # The library keeps RGB; the tile only kept BT.709 luma. Pasted points
+        # are given the same luma so both branches stay on one scale.
+        rgb = np.repeat(strength.astype(np.float32), 3, axis=1)
+        out_xyz, out_rgb, meta = self._paste(
+            xyz, rgb, placements, self._lib, self._rng,
+            n_vehicles=self.n_vehicles,
+            n_pedestrians=self.n_pedestrians,
+            tile_bounds=placements.get('tile_bounds_local'),
+            carve=self.carve)
+        if not meta:
+            return results
+
+        # BT.709 luma, matching LoadCarlaPointsFromFile. The tile's own points
+        # round-trip exactly (their three channels are already that luma).
+        w = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+        out_strength = (out_rgb.astype(np.float32) @ w).reshape(-1, 1)
+        new = np.concatenate([out_xyz.astype(np.float32), out_strength], axis=1)
+        results['points'] = type(points)(
+            torch.from_numpy(new), points_dim=new.shape[-1], attribute_dims=None)
+        results['pasted_actors'] = meta
+        return results
+
+    def __repr__(self):
+        return (f'{self.__class__.__name__}('
+                f'catalogue={self.catalogue}, '
+                f'n_vehicles={self.n_vehicles}, '
+                f'n_pedestrians={self.n_pedestrians}, '
+                f'prob={self.prob}, carve={self.carve}, '
+                f'recentered={self.recentered})')

@@ -267,6 +267,24 @@ file_client_args = dict(backend='disk')
 # counts, silently incorrect -- see CLAUDE.md) LiDAR voxelizer ever sees
 # them. grid_size matches lidar_voxel_size exactly so this adds no
 # spatial precision loss beyond what the voxelizer already imposes.
+# --- actor augmentation ---------------------------------------------------
+# Paste scanned CARLA vehicles/pedestrians into the tile at load time, carving
+# the ground shadow each one removes. Set actor_catalogue to the scanned
+# catalogue.json to enable (None disables); the tiles need matching
+# `placements/*_placements.json` sidecars from point2vector_data's
+# tile_placements.py. Runs after LoadCarlaPointsFromFile and before
+# GridSamplePoints, so pasted points get the same voxel decimation as real
+# ones, and it reads the sample's `gt_frame` so it works in either the offset
+# or the tile_center frame. GT polylines are left untouched on purpose: the
+# model must infer map elements hidden under traffic.
+actor_catalogue = None
+actor_paste = dict(
+    type='CarlaActorPaste',
+    catalogue=actor_catalogue,
+    n_vehicles=(0, 5),
+    n_pedestrians=(0, 6),
+    prob=0.8)
+
 train_pipeline = [
     dict(
         type='LoadCarlaPointsFromFile',
@@ -386,3 +404,6 @@ log_config = dict(
 fp16 = dict(loss_scale=512.)
 checkpoint_config = dict(max_keep_ckpts=1, interval=2)
 find_unused_parameters=True
+
+if actor_catalogue is not None:
+    train_pipeline.insert(1, actor_paste)
