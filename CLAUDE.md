@@ -680,6 +680,74 @@ Dominating both effects in practice: `../carla_test` is 3795 tiles against
 the old 259, i.e. ~65 min/epoch at 1.03 s/iter and batch 1, ~26 h for 24
 epochs on this 3070. Tile count, not class count, sets the wall clock.
 
+## Point colour: what it is, and the `_nocolour` configs (2026-08-20)
+
+**Colour IS used by default**, which is easy to miss because the configs say
+`load_dim=4` while the `.npz` stores 6 columns. `features` is `(N, 6)` --
+xyz plus RGB in [0, 1] -- and `LoadCarlaPointsFromFile._load_points` collapses
+the RGB to ONE scalar "strength" channel with ITU-R BT.709 luma weights
+(`rgb @ [0.2126, 0.7152, 0.0722]`), inherited from the Pointcept
+`CarlaSegDataset` this was ported from. Hue and saturation are gone at that
+point; brightness is not.
+
+It survives all the way in: `GridSamplePoints` keeps whole points (the
+representative is the FIRST point in each cell by index, not an average),
+`voxelize()` mean-reduces the points in each voxel, and
+`SparseEncoder(in_channels=4)` consumes `[x, y, z, strength]`. The config
+comment says as much: `# CARLA points are xyz + strength (not nuScenes'
+xyz+intensity+ring=5)`.
+
+What that channel contains, measured:
+
+- On `../carla_test`: ~940 distinct values, std 0.205, deciles 0.11 / 0.25 /
+  0.63. Real variation, not a dead channel.
+- On the 25m export -- the only one with per-point `labels` -- mean strength
+  by class is 0.592 (driving surface) / 0.622 / 0.600 / 0.592 against a
+  within-class std of ~0.20. So brightness alone barely separates road from
+  non-road; whether the network uses it in spatial context is a different
+  question, which is what the configs below exist to answer.
+- **`../carla_test`'s `labels` are entirely -1** (all 1.78M points sampled),
+  where the 25m export had 0/2/6/8. Nothing in the map-vector path reads
+  `labels`, so this is inert today -- but the viewer's lane-label colouring
+  and any future per-point supervision have nothing to work with there.
+
+### The `_nocolour` configs
+
+Four overlays, one per tile-centre config, dropping the channel entirely:
+
+    maptrv2_carla_r50_24ep_lidar_30m_tilecenter_nocolour.py
+    maptrv2_carla_r50_24ep_lidar_30m_HM_tilecenter_nocolour.py
+    maptrv2_carla_r50_24ep_lidar_30m_tilecenter_2cls_nocolour.py
+    maptrv2_carla_r50_24ep_lidar_30m_HM_tilecenter_2cls_nocolour.py
+
+It is a two-line change and **both lines are load-bearing**: `use_dim=3` on
+the loader (keep `[x, y, z]`; `load_dim` stays 4 because the loader builds
+the strength column before selecting) and `in_channels=3` on the
+`SparseEncoder`. Set one without the other and the first sparse conv sees a
+3-channel input against a 4-channel weight. Verified that the coupling is
+real rather than cosmetic: the parent's 4-channel model raises on
+3-channel points, while the overlay's forward returns `(1, 3200, 38, 38)`.
+
+`sparse_shape` and `lidar_bev_proj.in_channels` (3200) do **not** move --
+the first is a function of range and voxel size, the second of
+`output_channels` x the z-extent after downsampling, neither of the input
+width. Confirmed with a dummy `extract_lidar_feat()` rather than reasoned
+about, per gotcha #4.
+
+The pkl and `map_ann_file` are **shared with the parent** on purpose: colour
+is dropped at load time, so GT, tiles and frame are identical, and
+`_format_gt()` would write a byte-identical file. `evaluation` is restated
+in each overlay purely to re-point it at the no-colour `test_pipeline` --
+without it the eval loads 4-channel points into a 3-channel model and dies
+at the first validation, the same trap the tile-centre overlays document.
+Checkpoints are not comparable with the parent's (different first-layer
+width).
+
+Verified: 83/83 assertions across all four (in_channels, all four pipelines
+including `evaluation`, inherited ann_file/map_ann_file/map_classes,
+unchanged sparse_shape/lidar_bev_proj, model otherwise byte-identical to the
+parent) plus a 1-epoch train+eval smoke run on real tiles.
+
 ## The converter is tile-size agnostic (2026-08-10)
 
 `custom_carla_map_converter.py` had three hardcoded assumptions from the
