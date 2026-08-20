@@ -89,6 +89,22 @@ map_ann_file = data_root + 'tile_center/carla_map_gt.json'
 # Same steps as the base, with recenter=True on the loader. mmcv replaces
 # list-valued keys wholesale rather than merging them, so the pipelines are
 # restated in full.
+# --- actor augmentation ---------------------------------------------------
+# Paste scanned CARLA vehicles/pedestrians into the tile at load time, carving
+# the ground shadow each one removes. Set actor_catalogue to the scanned
+# catalogue.json to enable (None disables). Runs after LoadCarlaPointsFromFile
+# (in its tile-centred frame, which is why this lives in the tile_center
+# configs) and before GridSamplePoints, so pasted points get the same voxel
+# decimation as real ones. GT polylines are left untouched on purpose: the
+# model must infer map elements hidden under traffic.
+actor_catalogue = None
+actor_paste = dict(
+    type='CarlaActorPaste',
+    catalogue=actor_catalogue,
+    n_vehicles=(0, 5),
+    n_pedestrians=(0, 6),
+    prob=0.8)
+
 train_pipeline = [
     dict(
         type='LoadCarlaPointsFromFile',
@@ -153,3 +169,6 @@ data = dict(
 
 evaluation = dict(interval=2, pipeline=test_pipeline, metric='chamfer',
                   save_best='CarlaMap_chamfer/mAP', rule='greater')
+
+if actor_catalogue is not None:
+    train_pipeline.insert(1, actor_paste)
