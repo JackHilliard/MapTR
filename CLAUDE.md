@@ -1599,6 +1599,109 @@ axis, ~50 solves — not worth it). If `cwot` is ever wanted as a cost, it needs
 a different fix: batching Sinkhorn over the pair axis on GPU, since its
 per-pair Python loop is what makes it unusable, not the order axis.
 
+## Three-class configs: driving / curb / crosswalk (2026-08-23)
+
+Two colour-free 30 m tile-centre configs at `num_classes=3`:
+
+    maptrv2_carla_r50_24ep_lidar_30m_tilecenter_3cls_nocolour.py
+    maptrv2_carla_r50_24ep_lidar_30m_HM_tilecenter_3cls_nocolour.py
+
+`map_classes = ['driving', 'curb', 'crosswalk']`, sharing one pkl tagged
+`30m_tc_3cls` and their own `carla_map_gt_30m_tc_3cls.json`.
+
+**They hang off the `_nocolour` configs, not off a `_3cls` one** — the
+opposite nesting order from the two-class family, which goes taxonomy first
+(`_2cls`) and colour second (`_2cls_nocolour`). Both orders compose to the
+same config because the two changes are independent, and this way the
+load-bearing two-line colour change (`use_dim=3` **and** `in_channels=3`,
+which must move together) stays in exactly one file instead of being copied
+into a new branch of the tree. The cost is that there is no colour-carrying
+three-class sibling; add one only if it is actually wanted.
+
+Neither restates the pipelines, following the `_2cls` precedent, so
+`DefaultFormatBundle3D`'s `class_names` still reads `['divider']` in both.
+That is inert — `formating.py` reads it only under `with_gt and with_label`,
+both False throughout these configs — and verified so: the resolved pipelines
+are byte-identical to their parents' while `data.*.map_classes` carries the
+real three.
+
+**`max_num` differs between the two, per gotcha #15.** The plain chain keeps
+`num_vec_one2one=50`, so the one2one branch flattens to 50 × 3 = 150 and the
+inherited `max_num=50` is untouched. The HM chain cuts queries to 25, so the
+bound is 25 × 3 = 75 and the config raises `max_num` from the 1-class
+parent's 25 back to `min(50, 75) = 50`. Raising is the safe direction; the
+crash from lowering it only appears at the first validation, after a full
+epoch has trained.
+
+### No export here has a crosswalk class
+
+**The pkl these configs name cannot be generated from the data on this
+machine.** Checked directly against every polyline json in every export:
+
+| export | tiles | classes present |
+|---|---|---|
+| `../carla_test` (30 m) | 3795 | `driving` 9458, `curb` 3819 — taxonomy `{"0": "driving", "1": "curb"}`, all 3795 tiles agreeing. **No crosswalk.** |
+| Town10HD `grid_tiles` (60 m) | 33 | the full 8-class lookup, **crosswalk 32** — but 60 m tiles, the wrong geometry for this chain |
+| `../carla` (25 m) | 4362 | no `class_lookup` at all; cannot be split |
+
+So the only export carrying crosswalk is the wrong tile size, and the only
+one at the right tile size lacks it.
+
+**This fails loudly, which is the good case.** Verified by running the
+converter:
+
+    ValueError: unknown class 'crosswalk'; this export has: 0=driving, 1=curb
+
+`resolve_classes()` raises on a name the export's taxonomy does not carry —
+deliberately, because the old `--lane-types` flag silently kept nothing and
+produced an empty pkl with no indication why (2026-08-10 section). You hit
+this at convert time, not after a night of training. Note it does **not**
+cover a class that resolves but never occurs; that is what the converter's
+`[class] ... is EMPTY` line is for, so read those before training.
+
+Once a crosswalk-carrying 30 m export exists, nothing in either config
+changes — only this starts succeeding:
+
+```bash
+python tools/maptrv2/custom_carla_map_converter.py \
+    --data-root <30m export with crosswalk> --split test \
+    --gt-frame tile_center \
+    --map-classes driving curb crosswalk \
+    --out-dir data/carla/ --out-tag 30m_tc_3cls
+```
+
+### Verification status — static only
+
+**68 assertions pass** through `Config.fromfile` on both configs:
+`num_classes=3` on head *and* coder; `max_num` correct and within
+`num_vec_one2one × num_classes` for each; `map_classes` on all three data
+splits; `in_channels=3`; `use_dim=3` **and** `recenter=True` on train, val,
+test *and* `evaluation` pipelines; `ann_file`/`map_ann_file` tagged `3cls`
+and distinct from the parents'; `sparse_shape` `[301,301,421]` and
+`lidar_bev_proj.in_channels` unmoved; `pc_range` ±15; `aux_seg.seg_classes`
+still 1; `optimizer`/`lr_config`/`total_epochs`/all four pipelines
+byte-identical to the parent; `model` identical apart from the class knobs;
+and for the HM one, `loss_pts` still `PolylineGeomLoss` identical to its
+parent with `PolylineGeomCost` intact.
+
+**The train smoke run did NOT complete** — the local RTX 3070 was occupied
+(CARLA sim ~2.0 GB plus another user's python3 at ~2.8 GB, leaving ~430 MiB),
+and all three attempts died with `torch.cuda.OutOfMemoryError` needing
+another 76 MiB, including one with
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. What it *did* get through
+before dying is still worth recording: the config resolved, the dataset built
+on a 3-class pkl **with no warnings** (no missing-key, wrong-order or
+empty-class warning fired), the model constructed at `num_classes=3`, the
+LiDAR encoder produced BEV features, and execution reached multi-head
+attention inside the decoder. A shape error from the class count would have
+surfaced at construction or in the classification branch, not there. **Re-run
+the smoke test on a free GPU before trusting these end to end.**
+
+That run used a **synthetic** pkl — 24 tiles from the real 2-class one with
+every other `curb` polyline relabelled `crosswalk` (70 driving / 35 curb /
+30 crosswalk). The geometry is fictional; it exists only to give the plumbing
+three non-empty classes. Do not read anything into a checkpoint from it.
+
 ## HM predictions have scrambled vertex order (2026-08-23)
 
 The HM configs' predicted polylines zigzag: the vertices lie on roughly the
@@ -1725,6 +1828,15 @@ lexicographically smallest — purely so reruns reproduce.
 - **Decide what to do with the 15 genuinely degenerate cap tiles** — named
   by the `degenerate` chip / `effective_over_raw` in `/stats.csv`. They
   cost a full load+decompress for ~4k usable points each.
+- **The three-class configs have no crosswalk data to train on.** Both
+  `..._30m_tilecenter_3cls_nocolour.py` and its HM sibling name a
+  `carla_map_infos_*_30m_tc_3cls.pkl` that cannot be produced here: the 30 m
+  `../carla_test` export publishes only `driving`/`curb`, and the only
+  crosswalk-carrying export (Town10HD `grid_tiles`, 32 crosswalk polylines)
+  is 60 m tiles. The converter raises rather than emitting an empty class,
+  so this is a blocked convert, not a silent one. Their train smoke run is
+  also still outstanding — it was blocked by an occupied GPU, not by the
+  configs. See the 2026-08-23 section.
 - **The HM configs' `loss_dir` weight is 0.0, so vertex order is
   unsupervised.** See the 2026-08-23 section: the predictions zigzag, and
   `reorder_results.py` only patches it after the fact. The source fix is a
