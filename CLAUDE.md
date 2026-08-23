@@ -1599,6 +1599,260 @@ axis, ~50 solves — not worth it). If `cwot` is ever wanted as a cost, it needs
 a different fix: batching Sinkhorn over the pair axis on GPU, since its
 per-pair Python loop is what makes it unusable, not the order axis.
 
+## Three-class configs: driving / curb / crosswalk (2026-08-23)
+
+Two colour-free 30 m tile-centre configs at `num_classes=3`:
+
+    maptrv2_carla_r50_24ep_lidar_30m_tilecenter_3cls_nocolour.py
+    maptrv2_carla_r50_24ep_lidar_30m_HM_tilecenter_3cls_nocolour.py
+
+`map_classes = ['driving', 'curb', 'crosswalk']`, sharing one pkl tagged
+`30m_tc_3cls` and their own `carla_map_gt_30m_tc_3cls.json`.
+
+**They hang off the `_nocolour` configs, not off a `_3cls` one** — the
+opposite nesting order from the two-class family, which goes taxonomy first
+(`_2cls`) and colour second (`_2cls_nocolour`). Both orders compose to the
+same config because the two changes are independent, and this way the
+load-bearing two-line colour change (`use_dim=3` **and** `in_channels=3`,
+which must move together) stays in exactly one file instead of being copied
+into a new branch of the tree. The cost is that there is no colour-carrying
+three-class sibling; add one only if it is actually wanted.
+
+Neither restates the pipelines, following the `_2cls` precedent, so
+`DefaultFormatBundle3D`'s `class_names` still reads `['divider']` in both.
+That is inert — `formating.py` reads it only under `with_gt and with_label`,
+both False throughout these configs — and verified so: the resolved pipelines
+are byte-identical to their parents' while `data.*.map_classes` carries the
+real three.
+
+**`max_num` differs between the two, per gotcha #15.** The plain chain keeps
+`num_vec_one2one=50`, so the one2one branch flattens to 50 × 3 = 150 and the
+inherited `max_num=50` is untouched. The HM chain cuts queries to 25, so the
+bound is 25 × 3 = 75 and the config raises `max_num` from the 1-class
+parent's 25 back to `min(50, 75) = 50`. Raising is the safe direction; the
+crash from lowering it only appears at the first validation, after a full
+epoch has trained.
+
+### The crosswalk data arrived, in a third polyline directory (2026-08-23)
+
+`../carla_test` now ships **three** reference-line directories, not two:
+
+| directory | polylines/tile | taxonomy |
+|---|---|---|
+| `reference_lines/` | 2.5 | none (the historical unclassified set) |
+| `reference_curb_driving_lines/` | 3.5 | `{0: driving, 1: curb}` |
+| **`reference_driving_curb_crosswalk/`** | 3.7 | `{0: driving, 1: curb, 2: crosswalk}` |
+
+The new one holds **9458 driving + 3819 curb + 576 crosswalk = 13853**
+polylines over the same 3795 tiles, declared identically in every tile's
+json. Driving and curb are unchanged from the two-class directory; crosswalk
+is purely additive.
+
+**Crosswalk is sparse and clustered**: 0.2 polylines per tile against
+driving's 2.5, and present on only **257 of 3795 tiles** (250 carrying all
+three classes, 7 carrying crosswalk with driving but no curb). Expect the
+majority-class collapse the 2-class run documented, harder — at one epoch
+every class score sits in a narrow band and the most common class takes every
+decoded slot. Do not read `crosswalk_AP` before the classifier separates the
+classes.
+
+**The converter could not see this directory**, and the failure was
+misleading rather than silent. `reference_dir_candidates()` matched
+`reference*` **and** required `'lines'` in the name; the new directory is
+`reference_driving_curb_crosswalk`, so it was invisible, the scan fell back to
+the two-class directory, and the run died with `unknown class 'crosswalk'` —
+which reads as missing data while the data sat right there. Two fixes, both
+2026-08-23:
+
+1. The scan now matches any `reference*` directory. `reference_lines` still
+   sorts first, so the no-taxonomy default is untouched.
+2. **Selection is now by taxonomy CONTENT, not by "has any taxonomy".** With
+   several classified siblings the first one won, which is wrong as soon as
+   they hold different taxonomies. `resolve_reference_dir` takes
+   `required_tokens` (from `required_class_tokens()`, which reads the
+   **members** of `--map-classes name=a,b` entries, never the label name) and
+   picks the first candidate whose lookup covers them all. When nothing
+   covers them the run is going to die in `resolve_classes()` regardless, so
+   it hands back the **richest** taxonomy available purely so the error names
+   the real problem (`unknown class 'median'; this export has: 0=driving,
+   1=curb, 2=crosswalk`) instead of the unclassified directory's misleading
+   "this export has no class_lookup".
+
+Verified, 12 assertions against the real export: the new directory is
+discoverable and `reference_lines` still sorts first; token extraction
+handles bare names, `name=member,member` and `--classes`; `--map-classes
+driving curb crosswalk` selects `reference_driving_curb_crosswalk`;
+**`--map-classes driving curb` still selects `reference_curb_driving_lines`
+and a run with no taxonomy still selects `reference_lines`** (both
+unchanged); an explicit `--reference-dir` still wins; an unsatisfiable class
+lands on the richest taxonomy; and a bad `--reference-dir` raises listing all
+three candidates.
+
+The pkl these configs name now exists:
+
+```bash
+python tools/maptrv2/custom_carla_map_converter.py \
+    --data-root ../carla_test --split test --gt-frame tile_center \
+    --map-classes driving curb crosswalk \
+    --out-dir data/carla/ --out-tag 30m_tc_3cls
+```
+
+No `--reference-dir` needed — the pick is automatic and printed. Result:
+**3795 tiles, 0 dropped, 9458 + 3819 + 576 = 13853 instances**, `pc_range`
+resolved to ±15 unaided, median **100%** range coverage (worst tile 99.8%),
+`gt_frame` `tile_center`, and `tile_geometry.reference_dir` recording
+`reference_driving_curb_crosswalk`.
+
+### Verification status
+
+**68 assertions** pass through `Config.fromfile` on both configs:
+`num_classes=3` on head *and* coder; `max_num` correct and within
+`num_vec_one2one × num_classes` for each; `map_classes` on all three data
+splits; `in_channels=3`; `use_dim=3` **and** `recenter=True` on train, val,
+test *and* `evaluation` pipelines; `ann_file`/`map_ann_file` tagged `3cls`
+and distinct from the parents'; `sparse_shape` `[301,301,421]` and
+`lidar_bev_proj.in_channels` unmoved; `pc_range` ±15; `aux_seg.seg_classes`
+still 1; `optimizer`/`lr_config`/`total_epochs`/all four pipelines
+byte-identical to the parent; `model` identical apart from the class knobs;
+and for the HM one, `loss_pts` still `PolylineGeomLoss` identical to its
+parent with `PolylineGeomCost` intact.
+
+**A no-grad forward pass runs end to end on both configs**, on the real
+converted data (a 24-tile subset carrying all three classes: 127 driving /
+99 curb / 54 crosswalk). Per config: the dataset builds with
+`CLASS2LABEL == {'driving': 0, 'curb': 1, 'crosswalk': 2}`, the classification
+branch is 3 wide, the `SparseEncoder` takes 3 channels at
+`sparse_shape=[301,301,421]`, and `MapTRNMSFreeCoder.decode_single` returns
+exactly `max_num` = 50 detections of shape `(50, 20, 2)` whose label set is
+`{0, 1, 2}` — i.e. **label 2 is genuinely emitted**, so the gotcha #15 topk
+arithmetic is right at three classes in both the 50-query and 25-query chains.
+
+**The 1-epoch TRAIN smoke run is still outstanding.** Four attempts all hit
+`torch.cuda.OutOfMemoryError` 76 MiB short: the local RTX 3070 is occupied by
+the CARLA sim (~2.0 GB) plus another user's python3 (~2.7 GB), leaving
+~430 MiB against the ~3.3 GB a training step needs.
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` did not close the gap.
+Inference fits because there is no backward pass or optimizer state, which is
+why the forward check above was possible at all. **Run the train smoke test
+on a free GPU before trusting the loss/assigner path at three classes** —
+nothing above exercises `PolylineGeomCost` or the Hungarian assignment.
+Harness: `/gel/usr/johil9/.claude/jobs/*/tmp/smoke3.sh` (takes the config
+basename as its one argument).
+
+
+## HM predictions have scrambled vertex order (2026-08-23)
+
+The HM configs' predicted polylines zigzag: the vertices lie on roughly the
+right line, but their *index order* walks back and forth along it. Visible
+immediately in the dataset viewer, and it is a property of the predictions,
+not of the rendering — `_render_tile` does a plain `ax.plot(pts[:,0],
+pts[:,1])` in stored order, with no reordering or smoothing.
+
+Measured over one HM run's 94,875 predictions
+(`maptrv2_HM-carla_dataset_30m_dense_aligned-V2/Thu_Aug_20_18_27_34_2026`)
+against the 25 m baseline run:
+
+| | HM (emd) | baseline (L1+dir) |
+|---|---|---|
+| path length in index order ÷ shortest ordering | **3.35×** (p90 6.17) | 1.00× |
+| mean turning angle per vertex | **117°** | 33° |
+| fraction of vertices turning >90° | **0.99** | 0.03 |
+| vertex spacing CV along the line | 0.91 | 0.23 |
+
+The point *set* is fine — perpendicular RMS to the fitted axis is 0.60 m over
+a ~15 m extent (4.4%; baseline 1.4%). Only the permutation is wrong.
+
+**Cause**: `loss_mode = 'emd'` with
+`loss_dir=dict(type='PtsDirCosLoss', loss_weight=0.0)`
+(`maptrv2_carla_r50_24ep_lidar_HM.py:270`). `exact_emd_loss` is a balanced
+assignment over point **sets**, hence permutation-invariant — the same fact
+that justifies `dedup_gt_slices` ("forward/flipped are permutations of each
+other — verified bit-identical", 2026-08-12 section). With the direction loss
+zeroed, **nothing in the HM objective constrains vertex order at all**, so the
+model has no reason to produce a monotone one. Zeroing `loss_dir` was
+deliberate — it mirrors the Pointcept config, where `loss_dir_weight` is dead
+code — but the consequence for anything reading the output as a *curve* was
+not anticipated.
+
+The fix at source is to give `loss_dir` a non-zero weight, or add a small
+per-index L1 alongside the EMD. Neither will move AP — see below.
+
+### Reordering LOWERS chamfer AP, and that is the metric's fault
+
+`tools/maptrv2/reorder_results.py` rewrites a `carlamap_results.json` with
+each polyline's vertices put into traversal order. Host-side (json + numpy
+only — no torch, no mmdet3d, no container, like `dataset_viewer.py`), 50 s for
+3795 tiles / 94,875 polylines. Point the viewer's `--work-dir` at the output
+tree to see the difference.
+
+```bash
+python3 tools/maptrv2/reorder_results.py \
+    <work_dir>/results/pts_bbox/carlamap_results.json \
+    -o <work_dir>/results_reordered/pts_bbox/carlamap_results.json --report
+```
+
+On the real HM file: zigzag ratio **3.82 → 1.00**, mean turn **117.4° →
+56.2°** (the residual 56° is the vertex cloud's genuine noise, not zigzag —
+the ratio is already optimal at 1.00).
+
+**`-m path` (default) solves a shortest OPEN path** through the 20 vertices —
+nearest-neighbour seeded from both principal-axis extremes, then vectorised
+2-opt. `-m pca` (sort along the first principal axis) is kept only for
+comparison and is **provably wrong for any line that doubles back**: on a
+synthetic hairpin `path` recovers the true 21.95 m length while `pca` returns
+52.23 m. Do not reach for the projection; it was the first thing tried and it
+is the wrong tool.
+
+**The AP drops, and this is expected**, measured against
+`carla_map_infos_test_30m_tc_2cls.pkl` (pooled over classes):
+
+    original     AP@0.5=0.20985  AP@1.0=0.42186  AP@1.5=0.55333  mAP=0.39501
+    reordered    AP@0.5=0.19097  AP@1.0=0.36655  AP@1.5=0.50938  mAP=0.35563
+
+A permutation of an identical point set moving the score looks like a bug, and
+it was initially predicted not to. **The chamfer eval is not set-based**: it
+resamples each polyline to 100 points **by arc length along the stored
+order** (`get_cls_results()`, `eval_use_same_gt_sample_num_flag`, which every
+CARLA config sets), so the order decides where the samples land.
+
+The mechanism, measured over 4,025 predictions as perpendicular RMS to each
+line's own fitted axis:
+
+| | perp RMS |
+|---|---|
+| raw vertices | 1.0920 m |
+| resampled **zigzag** | **0.9064 m** |
+| resampled **ordered** | 1.0861 m |
+
+The HM vertex cloud is noisy. A zigzag's long chords cut back and forth
+*through the middle* of that cloud, and because those chords dominate the arc
+length they carry most of the 100 samples — so resampling a zigzag
+incidentally **denoises** it toward a central axis. The ordered path instead
+hops between neighbours and traces the noise faithfully. Chamfer rewards the
+smoother locus, so the scrambled version scores ~0.04 mAP higher.
+
+Corroboration that this is systematic to ordering rather than to how well it
+is done: the crude principal-axis sort scores **0.35655** and the proper
+shortest-path ordering **0.35563** — indistinguishable, despite one of them
+mangling every curve.
+
+**Consequences**: do not use a reordered file to compare against published AP
+numbers, and do not read the ~10% relative drop as damage. Conversely, a
+converged HM checkpoint's AP is *flattered* by this effect, and fixing
+`loss_dir` at source will not show up as an AP gain — judge that change by the
+rendering and by downstream usability, not by the score.
+
+Verified with 22 assertions (`--report` on synthetic and real data): scrambled
+straight lines, arcs and hairpins all recover their exact true path length;
+never produces an ordering longer than the input's over 300 random clouds;
+output is always a permutation; n = 0/1/2/3 and all-identical-points handled;
+end-to-end through the CLI the `meta` block, tile order, sample tokens,
+`pts_num`, `cls_name`, `type` and `confidence_level` are preserved and the
+vertex set is bit-identical; idempotent; refuses to overwrite its input
+without `--force`. Traversal direction is arbitrary upstream (nothing in the
+EMD loss fixes one), so it is pinned deterministically — first endpoint
+lexicographically smallest — purely so reruns reproduce.
+
 ## Open items / next steps
 
 - **`lidar_point_cloud_range`'s z lower bound is too high.** 98 tiles have
@@ -1612,6 +1866,21 @@ per-pair Python loop is what makes it unusable, not the order axis.
 - **Decide what to do with the 15 genuinely degenerate cap tiles** — named
   by the `degenerate` chip / `effective_over_raw` in `/stats.csv`. They
   cost a full load+decompress for ~4k usable points each.
+- **The three-class configs' train smoke run is still outstanding.** The
+  `30m_tc_3cls` pkl now exists (3795 tiles, 13853 instances) and a no-grad
+  forward passes on both configs, but four 1-epoch train attempts died on
+  CUDA OOM against an occupied GPU — so nothing has yet exercised the
+  assigner or `PolylineGeomCost` at three classes. Re-run
+  `smoke3.sh` on a free GPU. See the 2026-08-23 section.
+- **Crosswalk is present on only 257 of 3795 tiles** (576 polylines, 0.2 per
+  tile). A 3-class run will show the majority-class collapse harder than the
+  2-class one did; `crosswalk_AP` is not readable at low epoch counts.
+- **The HM configs' `loss_dir` weight is 0.0, so vertex order is
+  unsupervised.** See the 2026-08-23 section: the predictions zigzag, and
+  `reorder_results.py` only patches it after the fact. The source fix is a
+  non-zero `loss_dir` weight or a small per-index L1 alongside the EMD.
+  **It will not show up as an AP gain** — chamfer is order-sensitive in the
+  wrong direction — so it needs judging by rendering and downstream use.
 - **`carlasim_map.py`'s `ann_file_train` is stale.** It points at
   `data/carla/carla_map_infos_train.pkl`, which has never been generated
   locally (the converter has only run with `--split test`), so training
