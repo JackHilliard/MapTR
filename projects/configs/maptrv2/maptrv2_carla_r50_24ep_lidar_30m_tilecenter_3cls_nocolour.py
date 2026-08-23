@@ -19,37 +19,33 @@ independent -- and this way the load-bearing two-line colour change
 conv gets a 3-channel input against a 4-channel weight) lives in exactly one
 file instead of being copied into a new branch of the tree.
 
---- READ THIS BEFORE RUNNING: no export here has a crosswalk class ---
+--- The data: ../carla_test's THIRD polyline directory (2026-08-23) ---
 
-The pkl these configs name CANNOT be generated from the data on this
-machine today. Checked directly, every polyline json in every export:
+`../carla_test` now ships a third reference-line directory,
+`reference_driving_curb_crosswalk/`, alongside the historical unclassified
+`reference_lines/` and the two-class `reference_curb_driving_lines/`. It
+declares `{"0": "driving", "1": "curb", "2": "crosswalk"}` per tile,
+identically across all 3795 tiles, and holds 9458 driving + 3819 curb + 576
+crosswalk = 13853 polylines. Driving and curb are unchanged from the
+two-class directory; crosswalk is new.
 
-    ../carla_test            30m, 3795 tiles  ->  driving 9458, curb 3819
-                             taxonomy {"0": "driving", "1": "curb"}, all
-                             3795 tiles agreeing. NO crosswalk.
-    Town10HD grid_tiles      60m, 33 tiles    ->  crosswalk 32, and the full
-                             8-class lookup -- but 60m tiles, so the wrong
-                             geometry for this config chain entirely.
-    ../carla (local 25m)     no `class_lookup` at all; cannot be split.
+Crosswalk is SPARSE and unevenly spread -- 0.2 polylines per tile against
+driving's 2.5, present on only 257 of 3795 tiles (250 with all three classes,
+7 with driving alone). Expect the same majority-class collapse the two-class
+run documented, more strongly: at one epoch every class score sits in a
+narrow band and the most common class takes every decoded slot. Read
+`crosswalk_AP` only after the classifier has actually separated the classes.
 
-So the only export that HAS crosswalk is the wrong tile size, and the only
-export at the right tile size does not have it.
+Note the directory is named `reference_driving_curb_crosswalk`, with no
+"lines" in it. The converter's directory scan used to require
+`reference*lines*`, so it could not see this one at all and fell back to the
+two-class directory -- which then failed with `unknown class 'crosswalk'`
+while the data sat right there. Fixed 2026-08-23: the scan now matches any
+`reference*` directory, and when several carry taxonomies it picks the one
+that actually holds the classes the run asked for. So no `--reference-dir` is
+needed below; the choice is printed either way.
 
-This fails loudly rather than silently, which is the good case. Verified by
-running it::
-
-    ValueError: unknown class 'crosswalk'; this export has: 0=driving, 1=curb
-
-`resolve_classes()` raises on a name the export's taxonomy does not carry --
-deliberately, because the old `--lane-types` flag silently kept nothing and
-produced an empty pkl with no indication why. You will hit this the moment
-you try to convert, not after a night of training.
-
-What this config is therefore FOR: a 30m export that publishes crosswalk
-polylines, whenever one exists. Nothing about the file changes when it does
--- only the converter run below starts succeeding.
-
---- Generating the pkl (once a crosswalk-carrying 30m export exists) ---
+--- Generating the pkl ---
 
 The taxonomy is a property of the DATA, so this pkl is shared with
 `maptrv2_carla_r50_24ep_lidar_30m_HM_tilecenter_3cls_nocolour.py`, exactly as
@@ -58,17 +54,26 @@ carrying self too, since colour is dropped at load time and does not touch
 the GT::
 
     python tools/maptrv2/custom_carla_map_converter.py \\
-        --data-root <30m export with crosswalk> --split test \\
+        --data-root ../carla_test --split test \\
         --gt-frame tile_center \\
         --map-classes driving curb crosswalk \\
         --out-dir data/carla/ --out-tag 30m_tc_3cls
 
-The bare-name shorthand assumes the export spells them exactly `driving`,
-`curb` and `crosswalk`; if it uses the older grid-export names, name the
-mapping instead (`--map-classes driving=driving_centerline curb=curb
-crosswalk=crosswalk`). To fold sidewalk edges into crosswalks, or road edges
-into curbs, extend the group (`curb=curb,road_edge`) and reconvert -- the
-grouping lives in the pkl, not in this file.
+Verified, exactly that command: 3795 tiles, **0 dropped**, 9458 driving +
+3819 curb + 576 crosswalk = 13853 instances -- matching a direct count over
+the jsons -- with `pc_range` resolved to +/-15 unaided and median 100% range
+coverage (worst tile 99.8%). The `[ref]` line confirms the pick::
+
+    [ref] reference_lines/ carries no class taxonomy; using
+          reference_driving_curb_crosswalk/ instead, which declares
+          0=driving, 1=curb, 2=crosswalk
+
+The bare-name shorthand works because those are the export's OWN class
+names; an export spelling them differently needs the mapping named
+(`--map-classes driving=driving_centerline curb=curb crosswalk=crosswalk`).
+To fold sidewalk edges into crosswalks, or road edges into curbs, extend the
+group (`curb=curb,road_edge`) and reconvert -- the grouping lives in the pkl,
+not in this file.
 
 Do NOT pass `--lidar-point-cloud-range`: the converter derives xy from the
 manifest's own `tile_radius`/`tile_side` and prints what it resolved, which
@@ -81,9 +86,9 @@ nothing. A class that resolves but never occurs is the one failure mode the
 ValueError above does not cover.
 
 **There is still no train split.** `../carla_test` is test-only, so
-`ann_file_train` names a pkl that will not exist even once crosswalk data
-arrives; convert one the same way (`--split train`) or repoint it. Training
-with train == val scores nothing meaningful.
+`ann_file_train` names a pkl that does not exist; convert one the same way
+(`--split train`) or repoint it. Training with train == val scores nothing
+meaningful.
 
 --- What has to agree, and does below ---
 

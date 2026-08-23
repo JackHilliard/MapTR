@@ -1633,46 +1633,79 @@ parent's 25 back to `min(50, 75) = 50`. Raising is the safe direction; the
 crash from lowering it only appears at the first validation, after a full
 epoch has trained.
 
-### No export here has a crosswalk class
+### The crosswalk data arrived, in a third polyline directory (2026-08-23)
 
-**The pkl these configs name cannot be generated from the data on this
-machine.** Checked directly against every polyline json in every export:
+`../carla_test` now ships **three** reference-line directories, not two:
 
-| export | tiles | classes present |
+| directory | polylines/tile | taxonomy |
 |---|---|---|
-| `../carla_test` (30 m) | 3795 | `driving` 9458, `curb` 3819 — taxonomy `{"0": "driving", "1": "curb"}`, all 3795 tiles agreeing. **No crosswalk.** |
-| Town10HD `grid_tiles` (60 m) | 33 | the full 8-class lookup, **crosswalk 32** — but 60 m tiles, the wrong geometry for this chain |
-| `../carla` (25 m) | 4362 | no `class_lookup` at all; cannot be split |
+| `reference_lines/` | 2.5 | none (the historical unclassified set) |
+| `reference_curb_driving_lines/` | 3.5 | `{0: driving, 1: curb}` |
+| **`reference_driving_curb_crosswalk/`** | 3.7 | `{0: driving, 1: curb, 2: crosswalk}` |
 
-So the only export carrying crosswalk is the wrong tile size, and the only
-one at the right tile size lacks it.
+The new one holds **9458 driving + 3819 curb + 576 crosswalk = 13853**
+polylines over the same 3795 tiles, declared identically in every tile's
+json. Driving and curb are unchanged from the two-class directory; crosswalk
+is purely additive.
 
-**This fails loudly, which is the good case.** Verified by running the
-converter:
+**Crosswalk is sparse and clustered**: 0.2 polylines per tile against
+driving's 2.5, and present on only **257 of 3795 tiles** (250 carrying all
+three classes, 7 carrying crosswalk with driving but no curb). Expect the
+majority-class collapse the 2-class run documented, harder — at one epoch
+every class score sits in a narrow band and the most common class takes every
+decoded slot. Do not read `crosswalk_AP` before the classifier separates the
+classes.
 
-    ValueError: unknown class 'crosswalk'; this export has: 0=driving, 1=curb
+**The converter could not see this directory**, and the failure was
+misleading rather than silent. `reference_dir_candidates()` matched
+`reference*` **and** required `'lines'` in the name; the new directory is
+`reference_driving_curb_crosswalk`, so it was invisible, the scan fell back to
+the two-class directory, and the run died with `unknown class 'crosswalk'` —
+which reads as missing data while the data sat right there. Two fixes, both
+2026-08-23:
 
-`resolve_classes()` raises on a name the export's taxonomy does not carry —
-deliberately, because the old `--lane-types` flag silently kept nothing and
-produced an empty pkl with no indication why (2026-08-10 section). You hit
-this at convert time, not after a night of training. Note it does **not**
-cover a class that resolves but never occurs; that is what the converter's
-`[class] ... is EMPTY` line is for, so read those before training.
+1. The scan now matches any `reference*` directory. `reference_lines` still
+   sorts first, so the no-taxonomy default is untouched.
+2. **Selection is now by taxonomy CONTENT, not by "has any taxonomy".** With
+   several classified siblings the first one won, which is wrong as soon as
+   they hold different taxonomies. `resolve_reference_dir` takes
+   `required_tokens` (from `required_class_tokens()`, which reads the
+   **members** of `--map-classes name=a,b` entries, never the label name) and
+   picks the first candidate whose lookup covers them all. When nothing
+   covers them the run is going to die in `resolve_classes()` regardless, so
+   it hands back the **richest** taxonomy available purely so the error names
+   the real problem (`unknown class 'median'; this export has: 0=driving,
+   1=curb, 2=crosswalk`) instead of the unclassified directory's misleading
+   "this export has no class_lookup".
 
-Once a crosswalk-carrying 30 m export exists, nothing in either config
-changes — only this starts succeeding:
+Verified, 12 assertions against the real export: the new directory is
+discoverable and `reference_lines` still sorts first; token extraction
+handles bare names, `name=member,member` and `--classes`; `--map-classes
+driving curb crosswalk` selects `reference_driving_curb_crosswalk`;
+**`--map-classes driving curb` still selects `reference_curb_driving_lines`
+and a run with no taxonomy still selects `reference_lines`** (both
+unchanged); an explicit `--reference-dir` still wins; an unsatisfiable class
+lands on the richest taxonomy; and a bad `--reference-dir` raises listing all
+three candidates.
+
+The pkl these configs name now exists:
 
 ```bash
 python tools/maptrv2/custom_carla_map_converter.py \
-    --data-root <30m export with crosswalk> --split test \
-    --gt-frame tile_center \
+    --data-root ../carla_test --split test --gt-frame tile_center \
     --map-classes driving curb crosswalk \
     --out-dir data/carla/ --out-tag 30m_tc_3cls
 ```
 
-### Verification status — static only
+No `--reference-dir` needed — the pick is automatic and printed. Result:
+**3795 tiles, 0 dropped, 9458 + 3819 + 576 = 13853 instances**, `pc_range`
+resolved to ±15 unaided, median **100%** range coverage (worst tile 99.8%),
+`gt_frame` `tile_center`, and `tile_geometry.reference_dir` recording
+`reference_driving_curb_crosswalk`.
 
-**68 assertions pass** through `Config.fromfile` on both configs:
+### Verification status
+
+**68 assertions** pass through `Config.fromfile` on both configs:
 `num_classes=3` on head *and* coder; `max_num` correct and within
 `num_vec_one2one × num_classes` for each; `map_classes` on all three data
 splits; `in_channels=3`; `use_dim=3` **and** `recenter=True` on train, val,
@@ -1684,23 +1717,28 @@ byte-identical to the parent; `model` identical apart from the class knobs;
 and for the HM one, `loss_pts` still `PolylineGeomLoss` identical to its
 parent with `PolylineGeomCost` intact.
 
-**The train smoke run did NOT complete** — the local RTX 3070 was occupied
-(CARLA sim ~2.0 GB plus another user's python3 at ~2.8 GB, leaving ~430 MiB),
-and all three attempts died with `torch.cuda.OutOfMemoryError` needing
-another 76 MiB, including one with
-`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. What it *did* get through
-before dying is still worth recording: the config resolved, the dataset built
-on a 3-class pkl **with no warnings** (no missing-key, wrong-order or
-empty-class warning fired), the model constructed at `num_classes=3`, the
-LiDAR encoder produced BEV features, and execution reached multi-head
-attention inside the decoder. A shape error from the class count would have
-surfaced at construction or in the classification branch, not there. **Re-run
-the smoke test on a free GPU before trusting these end to end.**
+**A no-grad forward pass runs end to end on both configs**, on the real
+converted data (a 24-tile subset carrying all three classes: 127 driving /
+99 curb / 54 crosswalk). Per config: the dataset builds with
+`CLASS2LABEL == {'driving': 0, 'curb': 1, 'crosswalk': 2}`, the classification
+branch is 3 wide, the `SparseEncoder` takes 3 channels at
+`sparse_shape=[301,301,421]`, and `MapTRNMSFreeCoder.decode_single` returns
+exactly `max_num` = 50 detections of shape `(50, 20, 2)` whose label set is
+`{0, 1, 2}` — i.e. **label 2 is genuinely emitted**, so the gotcha #15 topk
+arithmetic is right at three classes in both the 50-query and 25-query chains.
 
-That run used a **synthetic** pkl — 24 tiles from the real 2-class one with
-every other `curb` polyline relabelled `crosswalk` (70 driving / 35 curb /
-30 crosswalk). The geometry is fictional; it exists only to give the plumbing
-three non-empty classes. Do not read anything into a checkpoint from it.
+**The 1-epoch TRAIN smoke run is still outstanding.** Four attempts all hit
+`torch.cuda.OutOfMemoryError` 76 MiB short: the local RTX 3070 is occupied by
+the CARLA sim (~2.0 GB) plus another user's python3 (~2.7 GB), leaving
+~430 MiB against the ~3.3 GB a training step needs.
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` did not close the gap.
+Inference fits because there is no backward pass or optimizer state, which is
+why the forward check above was possible at all. **Run the train smoke test
+on a free GPU before trusting the loss/assigner path at three classes** —
+nothing above exercises `PolylineGeomCost` or the Hungarian assignment.
+Harness: `/gel/usr/johil9/.claude/jobs/*/tmp/smoke3.sh` (takes the config
+basename as its one argument).
+
 
 ## HM predictions have scrambled vertex order (2026-08-23)
 
@@ -1828,15 +1866,15 @@ lexicographically smallest — purely so reruns reproduce.
 - **Decide what to do with the 15 genuinely degenerate cap tiles** — named
   by the `degenerate` chip / `effective_over_raw` in `/stats.csv`. They
   cost a full load+decompress for ~4k usable points each.
-- **The three-class configs have no crosswalk data to train on.** Both
-  `..._30m_tilecenter_3cls_nocolour.py` and its HM sibling name a
-  `carla_map_infos_*_30m_tc_3cls.pkl` that cannot be produced here: the 30 m
-  `../carla_test` export publishes only `driving`/`curb`, and the only
-  crosswalk-carrying export (Town10HD `grid_tiles`, 32 crosswalk polylines)
-  is 60 m tiles. The converter raises rather than emitting an empty class,
-  so this is a blocked convert, not a silent one. Their train smoke run is
-  also still outstanding — it was blocked by an occupied GPU, not by the
-  configs. See the 2026-08-23 section.
+- **The three-class configs' train smoke run is still outstanding.** The
+  `30m_tc_3cls` pkl now exists (3795 tiles, 13853 instances) and a no-grad
+  forward passes on both configs, but four 1-epoch train attempts died on
+  CUDA OOM against an occupied GPU — so nothing has yet exercised the
+  assigner or `PolylineGeomCost` at three classes. Re-run
+  `smoke3.sh` on a free GPU. See the 2026-08-23 section.
+- **Crosswalk is present on only 257 of 3795 tiles** (576 polylines, 0.2 per
+  tile). A 3-class run will show the majority-class collapse harder than the
+  2-class one did; `crosswalk_AP` is not readable at low epoch counts.
 - **The HM configs' `loss_dir` weight is 0.0, so vertex order is
   unsupervised.** See the 2026-08-23 section: the predictions zigzag, and
   `reorder_results.py` only patches it after the fact. The source fix is a

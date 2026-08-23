@@ -18,21 +18,20 @@ and the number of classes does not enter that derivation anywhere. Restating
 `point_cloud_range` here would not re-derive them in any case: mmcv evaluates
 each config file in isolation, so it would only look as though it had.
 
---- READ THIS BEFORE RUNNING: no export here has a crosswalk class ---
+--- The data ---
 
-Same blocker as the non-HM sibling, whose docstring has the full survey.
-In short: `../carla_test` (30m, 3795 tiles) publishes only
-`{"0": "driving", "1": "curb"}`; the only export carrying crosswalk is the
-60m Town10HD grid one (32 crosswalk polylines, 33 tiles), which is the wrong
-tile geometry for this chain. Converting anyway fails immediately and
-loudly -- verified::
+`../carla_test` gained a third reference-line directory on 2026-08-23,
+`reference_driving_curb_crosswalk/`, declaring
+`{"0": "driving", "1": "curb", "2": "crosswalk"}` across all 3795 tiles:
+9458 driving + 3819 curb + 576 crosswalk. The non-HM sibling's docstring has
+the full survey, including why the converter's directory scan had to be
+widened to see a `reference*` directory with no "lines" in its name.
 
-    ValueError: unknown class 'crosswalk'; this export has: 0=driving, 1=curb
+Crosswalk is sparse -- 0.2 polylines per tile, present on 257 of 3795 --
+so treat a zero `crosswalk_AP` at low epoch counts as the documented
+majority-class collapse rather than a decoding fault.
 
-This config is ready for a 30m export that publishes crosswalks; nothing in
-it changes when one appears.
-
---- Generating the pkl (once such an export exists) ---
+--- Generating the pkl ---
 
 Shared with `maptrv2_carla_r50_24ep_lidar_30m_tilecenter_3cls_nocolour.py`:
 the taxonomy and the frame are properties of the data, the loss is not, and
@@ -40,10 +39,13 @@ this config leaves `fixed_ptsnum_per_gt_line` at the parent's 20, so
 `_format_gt()` would write byte-identical GT either way::
 
     python tools/maptrv2/custom_carla_map_converter.py \\
-        --data-root <30m export with crosswalk> --split test \\
+        --data-root ../carla_test --split test \\
         --gt-frame tile_center \\
         --map-classes driving curb crosswalk \\
         --out-dir data/carla/ --out-tag 30m_tc_3cls
+
+Verified: 3795 tiles, 0 dropped, 13853 instances, median 100% range
+coverage.
 
 Two configs with DIFFERENT line counts must not share a `map_ann_file`,
 since `_format_gt()` bakes the resampling into a json it writes once and

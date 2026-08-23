@@ -267,8 +267,16 @@ def reference_dir_candidates(tile_dir):
     """Directories that could hold per-tile polyline jsons, preferred first.
 
     ``reference_lines`` is the name every export has used for the unclassified
-    set, so it stays first; anything else matching ``reference*lines*`` is a
-    variant (this dataset ships ``reference_curb_driving_lines``).
+    set, so it stays first; any other ``reference*`` directory is a variant
+    (this dataset ships ``reference_curb_driving_lines`` and
+    ``reference_driving_curb_crosswalk``).
+
+    The match is deliberately just the ``reference`` prefix and NOT
+    ``reference*lines*``: the crosswalk-carrying directory added on
+    2026-08-23 is named ``reference_driving_curb_crosswalk``, with no
+    "lines" in it, and the narrower pattern made it invisible -- so
+    ``--map-classes ... crosswalk`` fell back to the two-class directory and
+    died with "unknown class 'crosswalk'" while the data sat right there.
     """
     try:
         entries = sorted(os.listdir(tile_dir))
@@ -276,14 +284,45 @@ def reference_dir_candidates(tile_dir):
         return []
     found = [
         d for d in entries
-        if d.startswith('reference') and 'lines' in d
+        if d.startswith('reference')
         and os.path.isdir(os.path.join(tile_dir, d))
     ]
     found.sort(key=lambda d: (d != 'reference_lines', d))
     return found
 
 
-def resolve_reference_dir(tile_dir, manifest, requested, need_classes):
+def required_class_tokens(classes, map_classes):
+    """The export-class names/ids a run needs a directory's taxonomy to hold.
+
+    ``--classes`` entries are ids or names directly. ``--map-classes`` entries
+    are ``name=member,member`` or a bare ``name`` (which means ``name=name``),
+    so it is the MEMBERS that must exist in the export, never the label name.
+    Returned as raw strings; a candidate satisfies a token if the token is one
+    of its class names or one of its ids.
+    """
+    tokens = set()
+    for entry in classes or []:
+        tokens.add(str(entry))
+    for entry in map_classes or []:
+        entry = str(entry)
+        name, sep, members = entry.partition('=')
+        if sep and members.strip():
+            tokens.update(m.strip() for m in members.split(',') if m.strip())
+        else:
+            tokens.add(name.strip())
+    return {t for t in tokens if t}
+
+
+def _lookup_satisfies(lookup, tokens):
+    if not lookup:
+        return False
+    names = set(lookup.values())
+    ids = set(lookup)
+    return all(t in names or t in ids for t in tokens)
+
+
+def resolve_reference_dir(tile_dir, manifest, requested, need_classes,
+                          required_tokens=None):
     """Pick the polyline directory to convert, and its class lookup.
 
     Returns ``(ref_dir, class_lookup)``. The lookup comes from the manifest
@@ -321,16 +360,46 @@ def resolve_reference_dir(tile_dir, manifest, requested, need_classes):
 
     chosen = candidates[0]
     lookup = lookup_for(chosen)
-    if need_classes and not lookup:
-        # Only now is it worth looking past the default directory.
+    if need_classes and not _lookup_satisfies(lookup, required_tokens or set()):
+        # Only now is it worth looking past the default directory. An export
+        # can ship SEVERAL classified siblings holding different taxonomies
+        # (`../carla_test` has a two-class one and a three-class one), so the
+        # test is not "has any taxonomy" but "has the classes this run asked
+        # for" -- otherwise the first classified directory wins and a request
+        # naming a class only the second one carries fails with `unknown
+        # class`, which reads as missing data rather than a wrong directory.
         for alt in candidates[1:]:
             alt_lookup = lookup_for(alt)
-            if alt_lookup:
-                stated = ', '.join(
-                    f'{k}={v}' for k, v in sorted(alt_lookup.items()))
-                print(f'  [ref] {chosen}/ carries no class taxonomy; using '
-                      f'{alt}/ instead, which declares {stated}')
-                return alt, alt_lookup
+            if not alt_lookup:
+                continue
+            if required_tokens and not _lookup_satisfies(alt_lookup,
+                                                         required_tokens):
+                continue
+            stated = ', '.join(
+                f'{k}={v}' for k, v in sorted(alt_lookup.items()))
+            why = ('carries no class taxonomy' if not lookup
+                   else 'does not carry '
+                        + ', '.join(sorted(
+                            t for t in (required_tokens or set())
+                            if not _lookup_satisfies(lookup, {t}))))
+            print(f'  [ref] {chosen}/ {why}; using '
+                  f'{alt}/ instead, which declares {stated}')
+            return alt, alt_lookup
+        # Nothing carries everything that was asked for, so this run is going
+        # to die in resolve_classes() no matter which directory is picked.
+        # Hand it the RICHEST taxonomy available anyway: the choice cannot
+        # change the outcome, only the error message, and "unknown class
+        # 'median'; this export has: 0=driving, 1=curb, 2=crosswalk" points at
+        # the real problem where the unclassified directory's "this export has
+        # no class_lookup" would send the reader hunting for missing data.
+        classified = [(alt, lookup_for(alt)) for alt in candidates[1:]]
+        classified = [(a, l) for a, l in classified if l]
+        if classified:
+            alt, alt_lookup = max(classified, key=lambda kv: len(kv[1]))
+            stated = ', '.join(f'{k}={v}' for k, v in sorted(alt_lookup.items()))
+            print(f'  [ref] no directory carries every requested class; '
+                  f'reporting against {alt}/, which declares {stated}')
+            return alt, alt_lookup
     print(f'  [ref] reading polylines from {chosen}/'
           + (f' (classes: {", ".join(sorted(lookup.values()))})'
              if lookup else ' (no class taxonomy)'))
@@ -576,7 +645,8 @@ def convert_carla_tiles(data_root,
     tile_dir, manifest = load_manifest(data_root, split)
     ref_dir, class_lookup = resolve_reference_dir(
         tile_dir, manifest, reference_dir,
-        need_classes=bool(classes or map_classes))
+        need_classes=bool(classes or map_classes),
+        required_tokens=required_class_tokens(classes, map_classes))
     # The lookup may have come from the polyline jsons rather than the
     # manifest; resolve_classes() only ever reads it off the manifest, so put
     # it there. A copy -- the caller's dict is not ours to edit.
