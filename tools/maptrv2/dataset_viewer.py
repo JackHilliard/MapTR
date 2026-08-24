@@ -899,6 +899,62 @@ VIEW_Z_PAD = 1.0
 # apart; they used to hardcode 0.30 and 0.15 in three places.
 LINE_WIDTH_DEFAULT = 0.27
 
+# ---------------------------------------------------------------- density
+#
+# The density heat map used to normalise against EACH TILE'S OWN maximum, so
+# the brightest cell was full-scale on every tile and the colour meant a
+# different number on each one -- two tiles could look identical while
+# differing 100x, which is the opposite of what a heat map is for. The scale
+# is now shared across the whole dataset.
+#
+# It has to be a QUANTILE, not the maximum. Measured over 150 random
+# `../carla_test` tiles, the per-tile max cell runs 61..43,846 -- a 90x
+# spread between the median tile and the worst -- and the 25m export is far
+# worse: its 15 degenerate tiles put ~99.9% of up to 5,000,000 points in a
+# SINGLE cell (see "CARLA data facts"). Scaling to the true max would map
+# every ordinary tile to the bottom of the colormap and undo the fix. So the
+# shared ceiling is a high quantile of the per-tile maxima and the colorbar
+# is drawn with extend='max', which states outright that some cells clip.
+DENSITY_QUANTILE = 0.99
+# Tiles read to estimate the ceiling when the deep scan has not run. 64 takes
+# ~1.8 s on this dataset; the deep scan supersedes it with the exact figure.
+DENSITY_SAMPLE = 64
+DENSITY_FLOOR = 1.0        # a cell with one point is the bottom of the scale
+
+
+def density_norm(H, vmax, log=True):
+    """The colour normalisation for one density map, and its ceiling.
+
+    Split out from the renderer so the property that matters can be asserted
+    directly: with a shared `vmax`, equal counts on DIFFERENT tiles map to
+    equal colours. Returns (norm, vmax_used, n_clipped).
+    """
+    from matplotlib.colors import LogNorm, Normalize
+    shared = float(vmax) if vmax else 0.0
+    top = shared if shared > 0 else max(float(H.max()) if H.size else 0.0, 2.0)
+    clipped = int((H > top).sum()) if H.size else 0
+    if log and H.size and H.max() > 0:
+        return (LogNorm(vmin=DENSITY_FLOOR, vmax=max(top, DENSITY_FLOOR * 2)),
+                top, clipped)
+    if shared > 0:
+        return Normalize(vmin=0.0, vmax=top), top, clipped
+    return None, top, clipped
+
+
+def density_hist(xy, center, radius):
+    """Points per 1 m^2 cell, binned from the TILE's own edges.
+
+    Shared by the renderer and by scan_tile() so the number the heat map
+    shows and the number the shared ceiling is derived from are the same
+    quantity. Anchoring on the tile rather than the origin is what keeps a
+    cell exactly 1 m^2 of ground and the counts comparable between tiles.
+    """
+    nbins = max(1, int(round(2 * radius)))
+    xedges = np.linspace(center[0] - radius, center[0] + radius, nbins + 1)
+    yedges = np.linspace(center[1] - radius, center[1] + radius, nbins + 1)
+    H, xe, ye = np.histogram2d(xy[:, 0], xy[:, 1], bins=[xedges, yedges])
+    return H, xe, ye
+
 
 def project_view(xyz, view):
     """Project (N, 3) world points onto one view's 2D screen plane.
@@ -1776,7 +1832,7 @@ def render_tile(*args, **kwargs):
 def _render_tile(name, mode, show_polylines,
                   point_size, max_points, log_density=True, ds=None,
                   results_path=None, score_thresh=0.3, classes=None,
-                  top_n=None, frame='offset', view='top'):
+                  top_n=None, frame='offset', view='top', density_max=None):
     block = load_block(name, ds)
     if block is None:
         return None
@@ -1870,23 +1926,36 @@ def _render_tile(name, mode, show_polylines,
         # dataset (the degenerate 5,000,000-point tiles put ~99.9% of their
         # points in a single cell, so a linear scale maps every other cell
         # to the colormap's zero end and the map reads as blank).
-        norm = None
-        if log_density and H.max() > 0:
-            from matplotlib.colors import LogNorm
-            norm = LogNorm(vmin=max(H[H > 0].min(), 1) if (H > 0).any() else 1,
-                            vmax=max(H.max(), 2))
+        #
+        # The CEILING is shared across the dataset (density_ceiling()), so a
+        # colour means the same count on every tile and two heat maps can be
+        # compared by eye. Passing density_max=0 restores the old per-tile
+        # normalisation, where the brightest cell was full-scale everywhere.
+        shared = float(density_max) if density_max else 0.0
+        norm, vmax, clipped = density_norm(H, shared, log=log_density)
         im = ax.imshow(H.T, origin='lower',
                         extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
                         cmap=DENSITY_CMAP, aspect='equal', norm=norm,
                         interpolation='nearest', zorder=1)
-        cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        cb.set_label('points / m²' + (' (log)' if norm is not None else ''),
+        # extend='max' only when something actually exceeds the ceiling --
+        # an arrow on every tile would cry wolf, and its absence is then a
+        # real statement that this tile fits the shared scale.
+        cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04,
+                           extend='max' if clipped else 'neither')
+        cb.set_label('points / m²' + (' (log)' if norm is not None
+                                       and log_density else '')
+                      + (f' — shared 0–{vmax:,.0f}' if shared > 0
+                         else ' — this tile only'),
                       color=TEXT, fontsize=8)
         cb.ax.tick_params(colors=TEXT_MUTED, labelsize=7)
         cb.outline.set_edgecolor(BORDER)
         occ = int((H > 0).sum())
+        if clipped:
+            title_extra_extra = f', {clipped} cell(s) over the shared max'
+        else:
+            title_extra_extra = ''
         title_extra = (f'max {H.max():,.0f} pts/m², median {np.median(H):,.0f}, '
-                        f'{occ}/{H.size} cells occupied')
+                        f'{occ}/{H.size} cells occupied{title_extra_extra}')
     elif mode == 'rgb':
         # features[:, 3:6] are per-point RGB in 0..1
         rgb = np.clip(feat[:, 3:6], 0.0, 1.0)
@@ -2156,6 +2225,7 @@ PAGE = """<!doctype html>
   {n_tiles:,} tiles across {n_towns} towns<br>
   showing <b>{town}</b> (<b>{town_split}</b>) tiles {start}&ndash;{end} &mdash;
   representation: <b>{mode}</b>, view: <b>{view}</b><br>{class_summary}
+  <br>density scale: <b>{dmax_note}</b>
   <br>tags &rarr; <code>{tags_path}</code>{tag_error}</div>
 
 <form method="get">
@@ -2188,6 +2258,11 @@ PAGE = """<!doctype html>
     <label class="top">Point size</label>
     <input type="number" name="point_size" value="{point_size}" min="0.1"
            max="20" step="0.1">
+  </fieldset>
+  <fieldset>
+    <label class="top">Density max (pts/m²)</label>
+    <input type="number" name="dmax" value="{dmax}" min="0" step="1"
+           title="Shared across every tile so colours are comparable. 0 = scale each tile to its own maximum.">
   </fieldset>
   <fieldset class="checks">
     <label class="top">Overlays</label>
@@ -2673,6 +2748,19 @@ def index():
     if frame_arg not in ('auto',) + FRAMES:
         frame_arg = 'auto'
 
+    # One density ceiling for the whole page -- and, because it is derived
+    # from the dataset rather than from what happens to be on screen, the
+    # same one on every page. Resolved here and passed down each image URL,
+    # since /tile.png renders each figure in its own request and cannot share
+    # state with its siblings. `?dmax=` overrides per page; 0 means "per
+    # tile", the old behaviour.
+    dmax_arg = request.args.get('dmax')
+    if dmax_arg is not None and dmax_arg != '':
+        density_max = max(0.0, _safe_float(dmax_arg, 0.0))
+        dmax_src = 'set on this page'
+    else:
+        density_max, dmax_src = density_ceiling()
+
     # Read each dataset's tag store ONCE per page rather than once per tile:
     # a 60-tile gallery would otherwise re-open and re-parse the same json 60
     # times.
@@ -2688,6 +2776,7 @@ def index():
             ('ds', t['_ds']),
             ('mode', mode),
             ('view', view),
+            ('dmax', f'{density_max:g}'),
             ('point_size', point_size),
             ('frame', frame_arg),
             ('v', cachebust),
@@ -2760,6 +2849,12 @@ def index():
         n_tiles=len(STATE['tiles']), n_towns=len(towns),
         town=group['town'], town_split=town_split, mode=mode,
         view=VIEW_LABELS[view], tag_js=TAG_JS,
+        dmax=f'{density_max:g}',
+        dmax_note=html.escape(
+            f'shared 0–{density_max:,.0f} pts/m² ({dmax_src})'
+            if density_max > 0 else
+            'per tile — each tile scaled to its own maximum, so colours are '
+            'NOT comparable between tiles'),
         tags_path=html.escape(
             STATE.get('tags_file')
             or osp.join('<dataset dir>', TAGS_FILENAME)),
@@ -2870,6 +2965,7 @@ def tile_png():
         frame=resolve_frame(request.args.get('frame'),
                              _known_gt(request.args.get('gt'))),
         view=request.args.get('view', 'top'),
+        density_max=_safe_float(request.args.get('dmax'), 0.0),
     )
     if buf is None:
         abort(404)
@@ -3005,6 +3101,15 @@ def scan_tile(t, grid):
                 rec['z_mean'] = float(z.mean()) + float(origin[2])
                 rec['n_effective'] = unique_cells(xyz, grid)
                 rec['n_xy_cells'] = unique_cells(xyz[:, :2], grid)
+                # Busiest 1 m^2 cell, binned exactly as the browse tab's heat
+                # map bins it, so the shared colour ceiling is derived from
+                # the same quantity the map displays. `xyz` is in the offset
+                # frame and `ctr` is the tile centre in that same frame, so
+                # these are the same physical cells the renderer draws --
+                # only the axis labels differ between the two frames.
+                if radius is not None and ctr is not None:
+                    H, _xe, _ye = density_hist(xyz[:, :2], ctr, radius)
+                    rec['cell_max'] = float(H.max()) if H.size else 0.0
             else:
                 rec['n_effective'] = rec['n_xy_cells'] = 0
             if 'labels' in block:
@@ -3041,8 +3146,12 @@ def scan_tile(t, grid):
 # "already scanned", and the charts that need the new field render empty --
 # the silent-staleness failure this file keeps running into. A mismatch
 # drops the cache and re-scans, which is a minute for 4,362 tiles.
-#   1 -> original; 2 -> adds z_median / z_mean; 3 -> those in WORLD z
-CACHE_VERSION = 3
+#   1 -> original; 2 -> adds z_median / z_mean; 3 -> those in WORLD z;
+#   4 -> adds cell_max (busiest 1 m^2 cell), which feeds the SHARED density
+#        colour scale -- without the bump a warm v3 cache leaves every tile
+#        looking scanned while density_ceiling() finds no cell_max at all and
+#        silently falls back to the sampled estimate.
+CACHE_VERSION = 4
 
 
 def cache_path_for(ds):
@@ -3157,6 +3266,85 @@ def start_scan(rescan=False):
 def scan_running():
     th = SCAN['thread']
     return th is not None and th.is_alive()
+
+
+def sample_cell_max(n=DENSITY_SAMPLE):
+    """Estimate per-tile max cell counts by reading a random sample of tiles.
+
+    The fallback for when the deep scan has not run. Seeded with `hashlib`,
+    not `hash()`, so the ceiling is stable across restarts -- the built-in is
+    salted per process and would silently re-roll the colour scale every time
+    the viewer came up, which is exactly the kind of "the same tile looks
+    different today" confusion this whole change exists to remove.
+    """
+    tiles = STATE.get('tiles') or []
+    if not tiles:
+        return []
+    seed = int(hashlib.sha1(
+        ','.join(sorted(STATE.get('datasets', {}))).encode()).hexdigest()[:8],
+        16)
+    rng = np.random.default_rng(seed)
+    pick = [tiles[i] for i in rng.permutation(len(tiles))[:n]]
+    out = []
+    for t in pick:
+        block = load_block(t['name'], t['_ds'])
+        if block is None:
+            continue
+        try:
+            feat = block['features']
+            if not len(feat):
+                continue
+            origin, shift, center = tile_frame(
+                block, 'tile_center', t['name'], t['_ds'])
+            xy = feat[:, :2] + shift[:2]
+            radius = (float(block['tile_radius'])
+                       if 'tile_radius' in block else 12.5)
+            H, _xe, _ye = density_hist(xy, center, radius)
+            if H.size:
+                out.append(float(H.max()))
+        except Exception:                          # noqa: BLE001
+            continue
+        finally:
+            block.close()
+    return out
+
+
+def density_ceiling():
+    """(vmax, source) for the SHARED density colour scale.
+
+    Resolution order, most authoritative first:
+
+    1. an explicit ``--density-max`` / ``?density_max=``, used verbatim;
+    2. the deep scan's recorded per-tile ``cell_max``, if it has run;
+    3. a sampled estimate over DENSITY_SAMPLE tiles, computed once and kept
+       in STATE.
+
+    All three give ONE ceiling for every tile, which is the point; they
+    differ only in how well they know the dataset, and the colorbar says
+    which was used so a number read off it is never mistaken for exact.
+    """
+    # `is not None`, not a truth test: 0 is a MEANING here (scale each tile to
+    # its own maximum), not "unset", and the two are both falsy.
+    explicit = STATE.get('density_max')
+    if explicit is not None:
+        return float(explicit), '--density-max'
+
+    deep = [rec.get('cell_max') for rec in STATE.get('deep', {}).values()
+            if isinstance(rec, dict) and rec.get('cell_max')]
+    if deep:
+        return (float(np.quantile(deep, DENSITY_QUANTILE)),
+                f'scan of {len(deep):,} tiles')
+
+    cached = STATE.get('density_ceiling_cache')
+    if cached is None:
+        vals = sample_cell_max()
+        cached = ((float(np.quantile(vals, DENSITY_QUANTILE)), len(vals))
+                  if vals else (0.0, 0))
+        STATE['density_ceiling_cache'] = cached
+    vmax, n = cached
+    if not vmax:
+        return 0.0, 'unavailable'
+    return vmax, f'{n}-tile sample'
 
 
 def stat_rows():
@@ -6428,6 +6616,14 @@ def parse_args():
                          'preferring a pkl, since a freshly converted '
                          'dataset has no json yet and an existing json is '
                          'never regenerated')
+    p.add_argument('--density-max', type=float, default=None,
+                    help='ceiling for the density heat map, in points per '
+                         'square metre, shared by every tile so the colours '
+                         'are comparable. Default: the %g quantile of '
+                         'per-tile maxima, taken from the deep scan if it '
+                         'has run and otherwise from a %d-tile sample. Pass '
+                         '0 to scale each tile to its own maximum instead.'
+                         % (DENSITY_QUANTILE, DENSITY_SAMPLE))
     p.add_argument('--tags-file', default=None,
                     help='write per-tile tags to this one json instead of a '
                          f'{TAGS_FILENAME} inside each dataset directory. '
@@ -6467,6 +6663,10 @@ def main():
     STATE['pc_range_z'] = tuple(args.pc_range_z)
     STATE['num_pts_per_vec'] = args.num_pts_per_vec
     STATE['tags_file'] = osp.abspath(args.tags_file) if args.tags_file else None
+    # None = derive it; 0 = explicitly per-tile. Both are falsy, so they are
+    # distinguished here rather than with a truth test later.
+    STATE['density_max'] = args.density_max
+    STATE['density_ceiling_cache'] = None
     STATE['cache_dir'] = args.stats_cache or osp.join(
         osp.expanduser('~'), '.cache', 'maptr_dataset_viewer')
     if args.work_dir is not None and not osp.isdir(args.work_dir):
