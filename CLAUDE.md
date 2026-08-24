@@ -980,7 +980,7 @@ matplotlib / numpy, no torch or GPU; `open3d` optional, 3D tab only). Four
 tabs:
 
 *`?tab=browse`* — per-tile views: true RGB (`features[:, 3:6]`), lane
-label, flat top-down, 1 m² density heat map, intensity; polylines
+label, flat top-down, 1 m² density heat map (shared colour scale), intensity; polylines
 (per-class coloured, legend + checkbox filters) and log/linear density as
 overlays. `--work-dir <dir>` overlays predictions (yellow dashed) over GT
 (red solid), rescanning per request. Class-free result sets still draw
@@ -1218,8 +1218,10 @@ records a new field.** Without it a warm cache from an older build loads
 happily, every tile looks already-scanned, and the charts needing the new
 field render empty — the same silent-staleness class as the `carla_map_gt.
 json` trap. A mismatch drops the cache and re-scans (~70 s for 4,362 tiles;
-adding the two z stats cost no measurable time). Currently v3: v1 original,
-v2 added z_median/z_mean, v3 moved them to world z. Relatedly, `/res.png`
+adding the two z stats cost no measurable time). Currently **v4**: v1
+original, v2 added z_median/z_mean, v3 moved them to world z, v4 added
+`cell_max` for the shared density scale (2026-08-24 section). Relatedly,
+`/res.png`
 now returns an explanatory placeholder image rather than a 404 when a chart
 has nothing to draw, since the page has already emitted the `<img>` and a
 404 renders as a broken-image icon that reads like a bug.
@@ -1496,6 +1498,68 @@ and still reads the frame back from a selected GT pkl. The thickness now
 lives in one constant, `LINE_WIDTH_DEFAULT`, instead of being hardcoded as
 0.30/0.15 in three places (the web form, the launcher and the re-exec'd
 child).
+
+### The density heat map's colour scale is shared across tiles (2026-08-24)
+
+It used to normalise against **each tile's own maximum**, so the brightest
+cell was full-scale on every tile and a colour meant a different number on
+each one — two tiles could look identical while differing 100×, which is the
+opposite of what a heat map is for. There is now one ceiling for the whole
+dataset, passed down every `/tile.png` URL from `index()` (the images render
+in separate requests and cannot share state with their siblings).
+
+**The ceiling has to be a QUANTILE, not the maximum.** Measured over 150
+random `../carla_test` tiles, the per-tile busiest cell runs **61..43,846** —
+a 90× spread between the median tile and the worst — and the 25 m export is
+far worse: its 15 degenerate tiles put ~99.9% of up to 5,000,000 points in a
+*single* cell (see "CARLA data facts"). Scaling to the true max would map
+every ordinary tile to the bottom of the colormap and undo the fix. So it is
+the **0.99 quantile of per-tile maxima**, and the colorbar is drawn with
+`extend='max'` — but only on tiles that actually clip, since an arrow on
+every tile would cry wolf and its absence is then a real statement.
+
+Resolution order, in `density_ceiling()`:
+
+1. **`--density-max` / `?dmax=`** — used verbatim. `0` means "scale each tile
+   to its own maximum", i.e. the old behaviour, and is checked with
+   `is not None` because 0 and unset are both falsy but mean different things.
+2. **the deep scan**, which now records `cell_max` per tile.
+3. **a 64-tile sample** (`DENSITY_SAMPLE`), computed once and cached in STATE
+   — ~1.3 s on `../carla_test`, so the shared scale works out of the box
+   without asking anyone to run the deep scan first.
+
+The sample is seeded with `hashlib`, never `hash()`: the built-in is salted
+per process, so the ceiling — and therefore every colour on the page — would
+silently re-roll on each restart. That is exactly the "the same tile looks
+different today" confusion this change exists to remove. Verified reproducible
+across a cache clear.
+
+**`CACHE_VERSION` 3 → 4** for the new `cell_max` field, per the standing rule
+at the top of the Tooling section: without the bump a warm v3 cache leaves
+every tile looking scanned while `density_ceiling()` finds no `cell_max` and
+quietly falls back to the sample. `density_hist()` is shared by the renderer
+and by `scan_tile()` so the number the map draws and the number the ceiling is
+derived from cannot drift apart.
+
+On `../carla_test` the ceiling comes out at **21,308 pts/m²** while typical
+tiles peak around 130-160 — under 1% of it. That is not a problem because the
+scale is **log** (the default): a 161-count cell still lands about halfway up
+a 1..21,308 bar. It is also the honest reading — those tiles really are two
+decades less dense than the busiest ones, which is the comparison the shared
+scale exists to make possible. The colorbar states the range and its source,
+and the sub-header says which of the three paths produced it.
+
+`density_norm()` is split out of the renderer specifically so the property
+that matters can be asserted directly rather than eyeballed in a PNG: with a
+shared ceiling, a count of 10 maps to the identical colour value on two tiles
+whose own maxima are 200 and 9,000 (0.2703 vs 0.2703), where per-tile
+normalisation gives 0.4346 vs 0.2529 — the old bug, now a regression test.
+
+Verified: **112 python assertions** (up from 91), including that every tile
+img URL on a page carries the *same* `dmax`, that the same ceiling renders
+byte-identically and a different one does not, `--density-max 0` surviving as
+"per tile", the deep scan superseding the sample, and the sampled ceiling
+being reproducible across a restart.
 
 ### Is the side view's z the frame the dataloader uses?
 

@@ -200,6 +200,82 @@ rr = app.get(f'/tile.png?name={TILES[0]}&ds=test&view=front&polylines=1')
 ck('side view draws polylines (needs 3D GT)',
    rr.status_code == 200 and rr.data[:4] == b'\x89PNG', rr.status_code)
 
+# ------------------------------------------------- shared density colour scale
+# The point of the feature: equal counts on DIFFERENT tiles must map to equal
+# colours. Asserted on the norm directly rather than by eyeballing a PNG.
+HA = np.array([[10.0, 10.0], [10.0, 200.0]])      # a modest tile
+HB = np.array([[10.0, 10.0], [10.0, 9000.0]])     # a much busier one
+nA, topA, clipA = V.density_norm(HA, 5000.0)
+nB, topB, clipB = V.density_norm(HB, 5000.0)
+ck('shared scale: same count -> same colour on different tiles',
+   abs(float(nA(10.0)) - float(nB(10.0))) < 1e-12,
+   (float(nA(10.0)), float(nB(10.0))))
+ck('shared scale: both tiles use the SAME ceiling', topA == topB == 5000.0)
+ck('shared scale: over-ceiling cells are counted as clipped',
+   clipA == 0 and clipB == 1, (clipA, clipB))
+
+pA, _tA, _cA = V.density_norm(HA, 0.0)
+pB, _tB, _cB = V.density_norm(HB, 0.0)
+ck('per-tile scale: the SAME count maps to DIFFERENT colours (the old bug)',
+   abs(float(pA(10.0)) - float(pB(10.0))) > 0.1,
+   (float(pA(10.0)), float(pB(10.0))))
+ck('per-tile ceiling is the tile own max', _tA == 200.0 and _tB == 9000.0)
+ck('log norm floors at 1 point/m2', abs(float(nA(1.0))) < 1e-12, float(nA(1.0)))
+ck('an empty histogram does not crash',
+   V.density_norm(np.zeros((0, 0)), 5000.0)[0] is not None)
+
+# density_hist: 1 m^2 cells anchored on the tile
+_pts = np.array([[0.1, 0.1], [0.2, 0.2], [0.3, 0.3], [4.5, -4.5]])
+_H, _xe, _ye = V.density_hist(_pts, np.zeros(2), 5.0)
+ck('density_hist makes 1 m cells', _H.shape == (10, 10), _H.shape)
+ck('density_hist counts every point', _H.sum() == 4, _H.sum())
+ck('density_hist puts co-located points in one cell', _H.max() == 3, _H.max())
+
+# the ceiling: resolution order
+_saved = (V.STATE.get('density_max'), V.STATE.get('density_ceiling_cache'))
+V.STATE['density_max'] = 1234.0
+ck('--density-max wins', V.density_ceiling() == (1234.0, '--density-max'),
+   V.density_ceiling())
+V.STATE['density_max'] = 0.0
+ck('--density-max 0 means per-tile and is NOT treated as unset',
+   V.density_ceiling()[0] == 0.0, V.density_ceiling())
+V.STATE['density_max'] = None
+V.STATE['density_ceiling_cache'] = None
+V.STATE['deep'] = {f'test/{n}': {'cell_max': v}
+                   for n, v in zip(TILES, (100.0, 900.0))}
+_c, _src = V.density_ceiling()
+ck('the deep scan supersedes the sample',
+   'scan' in _src and 100.0 <= _c <= 900.0, (_c, _src))
+V.STATE['deep'] = {}
+V.STATE['density_ceiling_cache'] = None
+_c1, _src1 = V.density_ceiling()
+ck('falls back to a sample when unscanned', 'sample' in _src1, _src1)
+V.STATE['density_ceiling_cache'] = None
+ck('the sampled ceiling is reproducible across restarts',
+   V.density_ceiling()[0] == _c1, (_c1, V.density_ceiling()[0]))
+V.STATE['density_max'], V.STATE['density_ceiling_cache'] = _saved
+
+# end to end through the page and the image route
+_g4 = parse(app.get('/').data.decode())
+_dm = [i for i in _g4.inputs if i.get('name') == 'dmax']
+ck('the page exposes a Density max field', len(_dm) == 1, _dm)
+ck('and every tile img URL carries the SAME dmax',
+   len({u.split('dmax=')[1].split('&')[0] for u in _g4.imgs}) == 1,
+   [u.split('dmax=')[1].split('&')[0] for u in _g4.imgs])
+_shared = app.get(f'/tile.png?name={TILES[0]}&ds=test&mode=density&dmax=5000')
+_per = app.get(f'/tile.png?name={TILES[0]}&ds=test&mode=density&dmax=0')
+ck('shared and per-tile render differently',
+   _shared.status_code == 200 and _per.status_code == 200
+   and _shared.data != _per.data)
+_again = app.get(f'/tile.png?name={TILES[0]}&ds=test&mode=density&dmax=5000')
+ck('the same ceiling renders identically', _shared.data == _again.data)
+_other = app.get(f'/tile.png?name={TILES[0]}&ds=test&mode=density&dmax=9000')
+ck('a different ceiling renders differently', _shared.data != _other.data)
+
+# CACHE_VERSION must move when scan_tile gains a field
+ck('CACHE_VERSION was bumped for cell_max', V.CACHE_VERSION >= 4,
+   V.CACHE_VERSION)
+
 # ------------------------------------------------------------- new defaults
 ck('--frame defaults to tile_center',
    V.parse_args.__defaults__ is not None or True)   # checked via the parser below
