@@ -194,18 +194,54 @@ rr = app.get(f'/tile.png?name={TILES[0]}&ds=test&view=front&polylines=1')
 ck('side view draws polylines (needs 3D GT)',
    rr.status_code == 200 and rr.data[:4] == b'\x89PNG', rr.status_code)
 
-# ------------------------------------------------- prediction plane (side view)
-# The fixture's reference lines sit at world z == 0 while `offset[2]` is 5,
-# so the GT lands at stored z == -5 and a naive "-origin[2]" would agree by
-# luck. Shift the polyline z to mimic a TERRAIN export (like ../carla_test,
-# 147..376 m) and the two answers separate: only reading the stored GT z
-# keeps predictions on the road.
+# ------------------------------------------ prediction height on a side view
+# Predictions carry no z, so a side view lifts each vertex onto the GT lines:
+# the closest point on the nearest GT segment, interpolated ALONG it, so a
+# prediction runs with the road's slope instead of flat across it.
 blk = V.load_block(TILES[0], 'test')
 origin, shift, _c = V.tile_frame(blk, 'offset')
 xyz = blk['features'][:, :3]
-ck('pred plane follows the GT z, not -origin[2]',
-   abs(V._pred_plane_z(TILES[0], origin, 'test', xyz) - (-5.0)) < 1e-6,
-   V._pred_plane_z(TILES[0], origin, 'test', xyz))
+
+# One sloping GT segment, from z=0 up to z=10 along x.
+ramp = [(np.array([[-10.0, 0.0, 0.0], [10.0, 0.0, 10.0]]), 0, 'driving')]
+q = np.array([[-10.0, 0.0], [0.0, 0.0], [5.0, 0.0], [10.0, 0.0]])
+z = V.gt_z_at(q, ramp, fallback=-999.0)
+ck('height is interpolated along the segment, not snapped to a vertex',
+   np.allclose(z, [0.0, 5.0, 7.5, 10.0]), z.tolist())
+ck('a prediction on a ramp is NOT flat', z.max() - z.min() > 9.0)
+
+# Off the end of the segment the projection clamps to the endpoint.
+ck('beyond the end clamps to the endpoint height',
+   np.allclose(V.gt_z_at(np.array([[50.0, 0.0]]), ramp, -999.0), [10.0]))
+# Lateral offset does not change the height, only which segment wins.
+ck('height ignores perpendicular distance',
+   np.allclose(V.gt_z_at(np.array([[0.0, 8.0]]), ramp, -999.0), [5.0]))
+
+# With two GT lines at different heights, each vertex takes the NEARER one.
+two = [(np.array([[-10.0, -5.0, 1.0], [10.0, -5.0, 1.0]]), 0, 'a'),
+       (np.array([[-10.0, 5.0, 20.0], [10.0, 5.0, 20.0]]), 1, 'b')]
+ck('each vertex follows the nearest GT line',
+   np.allclose(V.gt_z_at(np.array([[0.0, -4.0], [0.0, 4.0]]), two, -999.0),
+               [1.0, 20.0]))
+
+ck('degenerate zero-length segment does not divide by zero',
+   np.isfinite(V.gt_z_at(np.array([[0.0, 0.0]]),
+                          [(np.array([[1.0, 1.0, 3.0], [1.0, 1.0, 3.0]]), 0, 'x')],
+                          -999.0)).all())
+ck('no GT at all -> the fallback', np.allclose(
+   V.gt_z_at(np.array([[0.0, 0.0]]), [], fallback=-42.0), [-42.0]))
+ck('no vertices -> empty, no crash',
+   len(V.gt_z_at(np.zeros((0, 2)), ramp, 0.0)) == 0)
+
+# ...and the real thing: the fixture's GT is at world z == 0 with offset[2]
+# == 5, so a prediction laid on it must come out at stored z == -5. A naive
+# "-origin[2]" agrees here by luck, so shift the GT to mimic a TERRAIN export
+# (../carla_test runs 147..376 m) and the two answers separate.
+gt3 = V.load_polylines(TILES[0], origin, 'test', ndim=3)
+ck('pred height follows GT z, not -origin[2]',
+   np.allclose(V.gt_z_at(np.array([[100.0, 200.0]]), gt3,
+                          V._pred_fallback_z(gt3, xyz)), -5.0),
+   V.gt_z_at(np.array([[100.0, 200.0]]), gt3, 0.0))
 
 _rl = os.path.join(DS, 'reference_lines', f'{TILES[0]}_reference_lines.json')
 _orig = json.load(open(_rl))
@@ -214,17 +250,18 @@ for _p in _terrain['polylines']:
     _p['points'] = [[x, y, 300.0] for x, y, _z in _p['points']]
 with open(_rl, 'w') as f:
     json.dump(_terrain, f)
+gt_t = V.load_polylines(TILES[0], origin, 'test', ndim=3)
 ck('terrain GT z is followed (295 = 300 - offset 5)',
-   abs(V._pred_plane_z(TILES[0], origin, 'test', xyz) - 295.0) < 1e-6,
-   V._pred_plane_z(TILES[0], origin, 'test', xyz))
+   np.allclose(V.gt_z_at(np.array([[100.0, 200.0]]), gt_t, 0.0), 295.0),
+   V.gt_z_at(np.array([[100.0, 200.0]]), gt_t, 0.0))
 with open(_rl, 'w') as f:
     json.dump(_orig, f)
 
 _gtless = os.path.join(DS, 'reference_lines', f'{TILES[1]}_reference_lines.json')
 os.rename(_gtless, _gtless + '.bak')
+gt_none = V.load_polylines(TILES[1], origin, 'test', ndim=3)
 ck('no GT -> falls back to the cloud median, not 0 or -origin[2]',
-   abs(V._pred_plane_z(TILES[1], origin, 'test', xyz)
-       - float(np.median(xyz[:, 2]))) < 1e-6)
+   abs(V._pred_fallback_z(gt_none, xyz) - float(np.median(xyz[:, 2]))) < 1e-6)
 os.rename(_gtless + '.bak', _gtless)
 
 # ------------------------------------------------------------------- tags

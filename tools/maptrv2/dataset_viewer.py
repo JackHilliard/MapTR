@@ -1676,24 +1676,60 @@ def tile_frame(block, frame):
     return origin, shift, center
 
 
-def _pred_plane_z(name, origin, ds, xyz):
-    """The height to draw z-less predictions at, in the current frame.
+def gt_segments(gt3):
+    """All GT polyline segments as (A, B) arrays of 3D endpoints."""
+    a, b = [], []
+    for pl, _cid, _cname in gt3:
+        if len(pl) >= 2:
+            a.append(pl[:-1])
+            b.append(pl[1:])
+    if not a:
+        return None, None
+    return (np.concatenate(a).astype(np.float64),
+            np.concatenate(b).astype(np.float64))
+
+
+def gt_z_at(xy, gt3, fallback):
+    """Height of the GT surface under each (N, 2) point.
 
     Predictions come from a results json, which stores 2D polylines only, so
-    a side view needs a plane to lay them on. The tile's own GT polylines are
-    that plane: measured over 60 `../carla_test` tiles / 148 polylines, the
-    reference-line z sits a median +0.16 m from the nearest cloud return, and
-    its world range (147..376 m) matches the road's (146..377 m).
+    a side view has to give them a height. Rather than one flat plane per
+    tile, each vertex takes the z of the CLOSEST POINT ON the GT lines --
+    projected onto the nearest segment and interpolated along it, so a
+    predicted line follows the road's slope instead of cutting across it.
 
-    Falls back to the cloud's median z when a tile has no reference lines --
-    a rough centre of mass rather than the road, but on-screen, which the
-    alternative of a fixed 0 or -origin[2] is not on a terrain export.
+    Projecting onto segments rather than snapping to the nearest GT VERTEX
+    matters here: `../carla_test`'s reference lines average about 3.5
+    vertices over a 30 m tile, so vertex snapping would draw a flat stair
+    where the road is a ramp.
+
+    `fallback` (a scalar) is used where the tile has no GT at all.
     """
-    try:
-        gt = load_polylines(name, origin, ds, ndim=3)
-    except Exception:
-        gt = []
-    zs = [float(np.median(pl[:, 2])) for pl, _cid, _cn in gt if len(pl)]
+    xy = np.asarray(xy, dtype=np.float64)
+    A, B = gt_segments(gt3)
+    if A is None or not len(xy):
+        return np.full(len(xy), float(fallback))
+    ab = B[:, :2] - A[:, :2]                       # (S, 2)
+    denom = (ab * ab).sum(1)
+    denom[denom == 0] = 1.0                        # degenerate segment
+    # t[s, p]: where p projects onto segment s, clamped to the segment
+    d = xy[None, :, :] - A[:, None, :2]            # (S, N, 2)
+    t = np.clip((d * ab[:, None, :]).sum(2) / denom[:, None], 0.0, 1.0)
+    proj = A[:, None, :2] + t[:, :, None] * ab[:, None, :]
+    dist = np.linalg.norm(xy[None, :, :] - proj, axis=2)   # (S, N)
+    best = dist.argmin(0)
+    idx = np.arange(len(xy))
+    # z interpolated along the winning segment, not taken from an endpoint
+    return A[best, 2] + t[best, idx] * (B[best, 2] - A[best, 2])
+
+
+def _pred_fallback_z(gt3, xyz):
+    """One height for a tile with no GT: the cloud's median z.
+
+    A rough centre of mass rather than the road, but on-screen -- which a
+    fixed 0 or `-origin[2]` is not on a terrain export (see load_polylines).
+    """
+    zs = [float(np.median(pl[:, 2])) for pl, _cid, _cn in gt3 if len(pl)]
     if zs:
         return float(np.median(zs))
     return float(np.median(xyz[:, 2])) if len(xyz) else 0.0
@@ -1856,12 +1892,14 @@ def _render_tile(name, mode, show_polylines,
                 pe.Normal()]
     overlay_handles = []
 
+    # 3D on every view: the side views need the export's real z (the road
+    # surface -- NOT world zero on a terrain export, see load_polylines), and
+    # the top view discards it as it always did. Loaded even when the overlay
+    # is off, because z-less predictions take their height from it.
+    gt3 = load_polylines(name, origin, ds, ndim=3)
+
     if show_polylines:
-        # 3D on every view: the side views need the export's real z (CARLA's
-        # ground plane, so the lines land at -origin[2] -- the true height of
-        # the road relative to the cloud), and the top view discards it as
-        # it always did.
-        gt = load_polylines(name, origin, ds, ndim=3)
+        gt = gt3
         drawn = {}
         for pl3, cid, cname in gt:
             if classes is not None and class_key(cid) not in classes:
@@ -1907,23 +1945,24 @@ def _render_tile(name, mode, show_polylines,
             kept.sort(key=lambda k: -k[1])
             n_trimmed = len(kept) - top_n
             kept = kept[:top_n]
-        # The results json carries no z, so a side view has to invent one.
+        # The results json carries no z, so a side view has to supply one.
+        # Each vertex is lifted onto the GT lines -- the closest point on the
+        # nearest GT segment, interpolated along it -- so a prediction runs
+        # ALONG the road's slope rather than flat across it, and sits level
+        # with the GT it should have matched.
         #
-        # NOT -origin[2]: that is only the road plane on an export whose
+        # NOT -origin[2]: that is the road plane only on an export whose
         # reference lines sit at world z == 0, which the 25m one does and
         # `../carla_test` does NOT -- its terrain runs 147..376 m, so
         # -origin[2] would drop every prediction a few hundred metres below
-        # the cloud and straight off the axis. Measured instead: this tile's
-        # own GT polyline height, which tracks the road to a median 0.16 m
-        # over 60 tiles, falling back to the cloud's median z where a tile
-        # has no GT at all.
+        # the cloud and straight off the axis.
         #
-        # So a side view shows a prediction's SHAPE and never its elevation:
-        # they are one flat line at road level by construction.
-        pred_z = _pred_plane_z(name, origin, ds, xyz)
+        # The height is therefore GT's, never the model's: a side view shows
+        # a prediction's xy SHAPE and can say nothing about its elevation.
+        fallback_z = _pred_fallback_z(gt3, xyz)
         for pts, score, cls, cid in kept:
             p3 = np.column_stack([pts[:, 0], pts[:, 1],
-                                   np.full(len(pts), pred_z)])
+                                   gt_z_at(pts[:, :2], gt3, fallback_z)])
             pts = project_view(p3, view)
             ax.plot(pts[:, 0], pts[:, 1],
                      color=class_color(cid, mode) if cid is not None else '#ffd60a',

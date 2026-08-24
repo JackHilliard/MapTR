@@ -1525,25 +1525,37 @@ would re-render up to 60 matplotlib figures to record one checkbox. The
 handlers are delegated from `document`, so a checkbox the JS creates for a
 new tag is live immediately.
 
-**Predictions on a side view are drawn at the tile's own GT polyline
-height**, and getting this wrong is easy: the obvious `-origin[2]` is only
-the road plane on an export whose reference lines sit at world z == 0. The
-25 m export is like that; **`../carla_test` is not** — it is real terrain
-running 147..376 m, so `-origin[2]` puts every prediction a few hundred
-metres below the cloud and straight off the axis. This corrects
-`load_polylines()`'s docstring, which claimed reference-line z is always
-CARLA's ground plane at world zero. Measured over 60 `../carla_test` tiles /
-148 polylines: GT z sits a median **+0.16 m** from the nearest cloud return,
-and the world ranges agree (GT 146.8..376.4, cloud 145.7..376.7). So trust
-the stored z. A tile with no reference lines falls back to the cloud's median
-z — a rough centre of mass, but on-screen.
+**Predictions on a side view are lifted onto the GT lines** — per vertex, not
+per tile. `gt_z_at()` projects each predicted vertex onto the nearest GT
+segment and interpolates z **along** that segment, so a prediction runs with
+the road's slope and sits level with the GT it should have matched. Projecting
+onto segments rather than snapping to the nearest GT *vertex* is what makes
+that work here: `../carla_test`'s reference lines average about 3.5 vertices
+across a 30 m tile, so vertex snapping would draw a flat stair where the road
+is a ramp. Where a tile has no GT at all it falls back to the cloud's median z
+— a rough centre of mass, but on-screen.
 
-A side view therefore shows a prediction's **shape and never its elevation**:
-the results json has no z, so they are one flat line at road level by
-construction.
+Getting the height wrong is easy: the obvious `-origin[2]` is only the road
+plane on an export whose reference lines sit at world z == 0. The 25 m export
+is like that; **`../carla_test` is not** — it is real terrain running
+147..376 m, so `-origin[2]` puts every prediction a few hundred metres below
+the cloud and straight off the axis. This corrects `load_polylines()`'s
+docstring, which claimed reference-line z is always CARLA's ground plane at
+world zero. Measured over 60 `../carla_test` tiles / 148 polylines: GT z sits
+a median **+0.16 m** from the nearest cloud return, and the world ranges agree
+(GT 146.8..376.4, cloud 145.7..376.7). So trust the stored z.
 
-**Verified**: 68 python assertions (projection maths including the
-front/back and left/right mirror pairs; the emitted page's selects and
+The height is therefore **GT's, never the model's**: the results json has no
+z, so a side view shows a prediction's xy **shape** and can say nothing at all
+about its elevation. Verified on a real tile: every predicted vertex lands
+inside both the cloud's z range and the GT's, spanning the GT's 0.228 m range
+exactly.
+
+**Verified**: 76 python assertions (projection maths including the
+front/back and left/right mirror pairs; prediction height interpolated along
+a ramp rather than stepped, clamped past a segment's end, taken from the
+nearer of two GT lines, and surviving a zero-length segment; the emitted
+page's selects and
 img URLs; all five views rendering and being pairwise distinct; `top`
 byte-identical to omitting the parameter; every representation composing with
 a side view; the full tag lifecycle — create, tick, untick, vocabulary
