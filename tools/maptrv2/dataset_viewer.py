@@ -309,7 +309,8 @@ matplotlib.use('Agg')
 # of images is fine for a local viewer.
 import numpy as np
 import matplotlib.patheffects as pe
-from flask import Flask, abort, make_response, redirect, request, send_file
+from flask import (Flask, abort, jsonify, make_response, redirect, request,
+                   send_file)
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
@@ -557,6 +558,170 @@ def load_block(name, ds):
     return np.load(path)
 
 
+# ------------------------------------------------------------------- tags
+#
+# Free-form per-tile labels ("corrupted", and anything else you invent),
+# written as json INSIDE the dataset directory so they travel with the data
+# rather than with this checkout or with a cache. One file per dataset
+# directory, `tile_tags.json`:
+#
+#     {"version": 1, "tags": ["corrupted"],
+#      "tiles": {"town12_chunk_21_tile_00194": ["corrupted"]}}
+#
+# `tags` is the VOCABULARY and `tiles` the assignments; they are separate so
+# a tag you create survives untagging the last tile that used it, and so the
+# checkbox row is the same on every tile.
+#
+# Per dataset rather than one global file because tile names are unique only
+# within a directory -- every town has a `tile_00000` -- which is the same
+# reason the tile index is keyed `<dataset>/<name>`. `--tags-file` overrides
+# with a single file for every dataset, for the case the dataset directory
+# is read-only (the container workflow mounts it `:ro`; the viewer runs on
+# the host, where it usually is not).
+TAGS_FILENAME = 'tile_tags.json'
+DEFAULT_TAGS = ('corrupted',)
+TAGS_LOCK = threading.Lock()
+
+
+def tags_path(ds):
+    """Where this dataset's tags live, or None if the directory is unknown."""
+    override = STATE.get('tags_file')
+    if override:
+        return override
+    d = ds_dir(ds)
+    return osp.join(d, TAGS_FILENAME) if d else None
+
+
+def load_tags(ds):
+    """{'tags': [...vocabulary...], 'tiles': {name: [tags]}} for one dataset.
+
+    Never raises: a missing file is simply an empty store, and a corrupt one
+    is reported through the UI rather than taking the page down. Read on
+    every request instead of cached -- the file is a few KB and being able
+    to edit it by hand while the viewer runs is worth more than the read.
+    """
+    path = tags_path(ds)
+    blob = {}
+    if path and osp.isfile(path):
+        try:
+            with open(path) as f:
+                blob = json.load(f)
+        except (OSError, ValueError) as exc:
+            return {'tags': list(DEFAULT_TAGS), 'tiles': {},
+                    'error': f'{osp.basename(path)}: {exc}'}
+    if not isinstance(blob, dict):
+        return {'tags': list(DEFAULT_TAGS), 'tiles': {},
+                'error': f'{path}: expected a json object'}
+    tiles = blob.get('tiles')
+    tiles = tiles if isinstance(tiles, dict) else {}
+    vocab = blob.get('tags')
+    vocab = [str(t) for t in vocab] if isinstance(vocab, list) else []
+    # Anything a tile actually carries is part of the vocabulary whether or
+    # not the file said so, otherwise a hand-edited file could hold a tag
+    # the UI never offers a way to remove.
+    for names in tiles.values():
+        if isinstance(names, list):
+            vocab.extend(str(n) for n in names)
+    for t in DEFAULT_TAGS:
+        vocab.append(t)
+    seen, ordered = set(), []
+    for t in vocab:
+        if t and t not in seen:
+            seen.add(t)
+            ordered.append(t)
+    clean = {k: sorted({str(n) for n in v})
+             for k, v in tiles.items() if isinstance(v, list) and v}
+    return {'tags': ordered, 'tiles': clean}
+
+
+def save_tags(ds, store):
+    """Write a dataset's tag store, atomically. Raises OSError on failure."""
+    path = tags_path(ds)
+    if not path:
+        raise OSError(f'no directory known for dataset {ds!r}')
+    payload = {'version': 1,
+               'tags': list(store['tags']),
+               'tiles': {k: sorted(v) for k, v in sorted(store['tiles'].items())
+                          if v}}
+    d = osp.dirname(path) or '.'
+    # Same directory as the target so the replace is atomic (a rename across
+    # filesystems is not), and so a read-only dataset dir fails HERE rather
+    # than after the old file has been unlinked.
+    fd, tmp = tempfile.mkstemp(dir=d, prefix='.tile_tags-', suffix='.json')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(payload, f, indent=1, sort_keys=True)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def tile_tags(uid):
+    """Tags on one tile, by `<dataset>/<name>` uid."""
+    t = tile_by_uid(uid)
+    if t is None:
+        return []
+    return load_tags(t['_ds'])['tiles'].get(t['name'], [])
+
+
+def tag_vocabulary():
+    """Every tag name offered in the UI, across all datasets.
+
+    Unioned so the checkbox row does not change shape as you page from one
+    town to another; the ASSIGNMENTS stay per dataset.
+    """
+    vocab, seen = [], set()
+    for ds in STATE.get('datasets', {}):
+        for t in load_tags(ds)['tags']:
+            if t not in seen:
+                seen.add(t)
+                vocab.append(t)
+    for t in DEFAULT_TAGS:
+        if t not in seen:
+            seen.add(t)
+            vocab.append(t)
+    return vocab
+
+
+def set_tile_tag(uid, tag, on):
+    """Add or remove one tag on one tile, and persist. Returns its new tags.
+
+    Creating a tag and applying it are the same operation on purpose: the
+    tag row's text box adds a name that is immediately ticked, so there is
+    no separate "manage vocabulary" step to forget.
+    """
+    t = tile_by_uid(uid)
+    if t is None:
+        raise KeyError(uid)
+    tag = str(tag).strip()
+    if not tag:
+        raise ValueError('empty tag')
+    if len(tag) > 64:
+        raise ValueError('tag longer than 64 characters')
+    ds, name = t['_ds'], t['name']
+    with TAGS_LOCK:
+        store = load_tags(ds)
+        if store.get('error'):
+            raise OSError(store['error'])
+        have = set(store['tiles'].get(name, []))
+        if on:
+            have.add(tag)
+            if tag not in store['tags']:
+                store['tags'].append(tag)
+        else:
+            have.discard(tag)
+        if have:
+            store['tiles'][name] = sorted(have)
+        else:
+            store['tiles'].pop(name, None)
+        save_tags(ds, store)
+        return sorted(have)
+
+
 def load_polylines(name, origin, ds, ndim=2):
     """Returns list of (pts, class_id, class_name), where pts is an
     (N, ndim) array in the same frame as the block's `features` xyz (given
@@ -566,11 +731,18 @@ def load_polylines(name, origin, ds, ndim=2):
     field; those callers get a single unclassified set.
 
     `ndim=3` keeps the z the export actually stores, which every 2D caller
-    throws away. It is not filler: reference-line z is CARLA's ground plane
-    (world z == 0), so in either tile frame the polylines land at
-    `-origin[2]` -- the real height of the road surface relative to the
-    point cloud. That is what makes the 3D view's GT sit ON the road rather
-    than at an arbitrary height.
+    throws away. It is not filler: reference-line z is the road surface, so
+    the 3D view's GT and the side views' GT sit ON the road rather than at
+    an arbitrary height.
+
+    **That z is NOT always world zero.** The 25m export is flat and puts its
+    reference lines at world z == 0, so there the polylines land at exactly
+    `-origin[2]` -- but `../carla_test` is real terrain running 147..376 m,
+    and its lines carry that elevation. Measured over 60 of its tiles / 148
+    polylines: GT z sits a median +0.16 m from the nearest cloud return, and
+    the two world ranges agree (GT 146.8..376.4, cloud 145.7..376.7). So
+    trust the stored z; do not reconstruct it as `-origin[2]`, which is a
+    few hundred metres wrong on any export with terrain.
     """
     d = ds_dir(ds)
     path = osp.join(d, 'reference_lines',
@@ -679,6 +851,63 @@ FRAME_LABELS = {
     'offset': "offset — the block's own frame (MapTRv2 default)",
     'tile_center': 'tile_center — tile centred on 0 (GeMap)',
 }
+
+# ------------------------------------------------------------- view angle
+#
+# The camera direction is a SEPARATE axis from the representation (colour
+# scheme). It used to be neither: 'top-down (flat colour)' was one of the
+# `mode` options, which conflated "how are the points coloured" with "where
+# is the camera" and made every other representation implicitly top-down.
+# `mode` now names only the colouring and `view` only the direction, so any
+# pair composes -- RGB from the side, density from the side, and so on.
+#
+# Each view is (h_col, h_sign, v_col, v_sign, h_label, v_label): which
+# column of the xyz array becomes the horizontal screen axis and with what
+# sign, likewise vertical. Derived the standard way, right = forward x up
+# with up = +z, so a tile's left-right does not mirror as you walk around
+# it:
+#
+#   front  camera at -y, forward (0,1,0)   -> right = +x
+#   back   camera at +y, forward (0,-1,0)  -> right = -x
+#   left   camera at -x, forward (1,0,0)   -> right = -y
+#   right  camera at +x, forward (-1,0,0)  -> right = +y
+#
+# 'top' keeps the historical x-right/y-up projection exactly, so it is a
+# no-op against every render this tab produced before.
+VIEWS = ('top', 'front', 'back', 'left', 'right')
+VIEW_PROJ = {
+    'top':   (0, +1.0, 1, +1.0, 'x (m)', 'y (m)'),
+    'front': (0, +1.0, 2, +1.0, 'x (m)', 'z (m)'),
+    'back':  (0, -1.0, 2, +1.0, '−x (m)', 'z (m)'),
+    'left':  (1, -1.0, 2, +1.0, '−y (m)', 'z (m)'),
+    'right': (1, +1.0, 2, +1.0, 'y (m)', 'z (m)'),
+}
+VIEW_LABELS = {
+    'top': 'top-down (x–y)',
+    'front': 'side — from −y (x–z)',
+    'back': 'side — from +y (x–z, mirrored)',
+    'left': 'side — from −x (y–z, mirrored)',
+    'right': 'side — from +x (y–z)',
+}
+# Padding above and below the point cloud on a side view, in metres, so the
+# highest returns are not clipped by the axis line itself.
+VIEW_Z_PAD = 1.0
+
+
+def project_view(xyz, view):
+    """Project (N, 3) world points onto one view's 2D screen plane.
+
+    Returns an (N, 2) array of (horizontal, vertical). Accepts (N, 2) input
+    only for the top view, where z is never read -- every side view needs a
+    real z and it is a programming error to have thrown it away.
+    """
+    h_col, h_sgn, v_col, v_sgn, _, _ = VIEW_PROJ[view]
+    xyz = np.asarray(xyz)
+    if xyz.shape[1] <= max(h_col, v_col):
+        raise ValueError(
+            f'view {view!r} needs column {max(h_col, v_col)} but the array '
+            f'has {xyz.shape[1]}; pass 3D points for a side view')
+    return np.column_stack([h_sgn * xyz[:, h_col], v_sgn * xyz[:, v_col]])
 
 
 def tile_center_origin(tile_center, offset):
@@ -1376,17 +1605,29 @@ def tick_steps(span):
     return 50, 10
 
 
-def style_axes(ax, center, radius, grid=True):
+def style_axes(ax, xlim, ylim, grid=True):
+    """Frame and grid one tile plot.
+
+    Takes explicit (lo, hi) limits per axis rather than a centre and a
+    radius: a side view is not square -- its horizontal span is the tile
+    width while its vertical span is however tall the point cloud happens
+    to be -- and forcing one radius on both would either crop the cloud or
+    pad the tile out to the z range. The aspect stays 'equal' in every view,
+    because both axes are metres and a stretched one would misreport slope.
+    """
     ax.set_facecolor(BG)
-    ax.set_xlim(center[0] - radius, center[0] + radius)
-    ax.set_ylim(center[1] - radius, center[1] + radius)
+    ax.set_xlim(*xlim)
+    ax.set_ylim(*ylim)
     ax.set_aspect('equal')
     ax.tick_params(colors=TEXT_MUTED, labelsize=7)
     for spine in ax.spines.values():
         spine.set_color(BORDER)
     if not grid:
         return
-    major, minor = tick_steps(2 * radius)
+    # One ladder for both axes, chosen off the WIDER span, so the grid stays
+    # a single ruler rather than two rules of different pitch meeting at the
+    # corner.
+    major, minor = tick_steps(max(xlim[1] - xlim[0], ylim[1] - ylim[0]))
     for axis in (ax.xaxis, ax.yaxis):
         axis.set_major_locator(MultipleLocator(major))
         axis.set_minor_locator(MultipleLocator(minor))
@@ -1398,18 +1639,16 @@ def style_axes(ax, center, radius, grid=True):
     # BELOW the polylines (GT_ZORDER, 5), faint enough not to compete with
     # either. ax.grid()'s own zorder argument is not honoured reliably and
     # set_axisbelow only offers "all the way under".
-    def ticks_along(c, step):
-        lo, hi = c - radius, c + radius
+    def ticks_along(lim, step):
+        lo, hi = lim
         t = np.arange(np.ceil(lo / step) * step, hi + step * 0.5, step)
         return t[(t > lo) & (t < hi)]
 
     for step, width, alpha in ((minor, 0.5, 0.28), (major, 1.0, 0.55)):
         style = dict(colors=GRID_COLOR, linewidths=width, alpha=alpha,
                       zorder=GRID_ZORDER)
-        ax.vlines(ticks_along(center[0], step),
-                   center[1] - radius, center[1] + radius, **style)
-        ax.hlines(ticks_along(center[1], step),
-                   center[0] - radius, center[0] + radius, **style)
+        ax.vlines(ticks_along(xlim, step), ylim[0], ylim[1], **style)
+        ax.hlines(ticks_along(ylim, step), xlim[0], xlim[1], **style)
 
 
 def tile_frame(block, frame):
@@ -1437,6 +1676,29 @@ def tile_frame(block, frame):
     return origin, shift, center
 
 
+def _pred_plane_z(name, origin, ds, xyz):
+    """The height to draw z-less predictions at, in the current frame.
+
+    Predictions come from a results json, which stores 2D polylines only, so
+    a side view needs a plane to lay them on. The tile's own GT polylines are
+    that plane: measured over 60 `../carla_test` tiles / 148 polylines, the
+    reference-line z sits a median +0.16 m from the nearest cloud return, and
+    its world range (147..376 m) matches the road's (146..377 m).
+
+    Falls back to the cloud's median z when a tile has no reference lines --
+    a rough centre of mass rather than the road, but on-screen, which the
+    alternative of a fixed 0 or -origin[2] is not on a terrain export.
+    """
+    try:
+        gt = load_polylines(name, origin, ds, ndim=3)
+    except Exception:
+        gt = []
+    zs = [float(np.median(pl[:, 2])) for pl, _cid, _cn in gt if len(pl)]
+    if zs:
+        return float(np.median(zs))
+    return float(np.median(xyz[:, 2])) if len(xyz) else 0.0
+
+
 def render_tile(*args, **kwargs):
     """Thread-safe wrapper -- see RENDER_LOCK's comment at the top."""
     with RENDER_LOCK:
@@ -1446,7 +1708,7 @@ def render_tile(*args, **kwargs):
 def _render_tile(name, mode, show_polylines,
                   point_size, max_points, log_density=True, ds=None,
                   results_path=None, score_thresh=0.3, classes=None,
-                  top_n=None, frame='offset'):
+                  top_n=None, frame='offset', view='top'):
     block = load_block(name, ds)
     if block is None:
         return None
@@ -1459,15 +1721,37 @@ def _render_tile(name, mode, show_polylines,
     # stored in, and (since the converter fix) the frame the training pkl's
     # GT is built in too. `tile_center` is NOT interchangeable: it differs
     # by a mean of ~2.4m, which is what the old converter got wrong.
+    if view not in VIEW_PROJ:
+        view = 'top'
     origin, shift, center = tile_frame(block, frame)
     # `shift` is exactly zero in the 'offset' frame, and these arrays run to
     # 5M points, so skip the copy rather than adding zero to all of them.
-    xy = feat[:, :2] + shift[:2] if shift.any() else feat[:, :2]
+    # All three columns are carried now, not just xy: a side view reads z,
+    # and under a 3D tile_center the shift has a z component too.
+    xyz = feat[:, :3] + shift if shift.any() else feat[:, :3]
     # The VIEW is centred on (0, 0) either way -- the frame the points, the
     # GT and the predictions share -- with the radius grown by the tile's
     # displacement so an off-centre tile is not cropped. See the
     # "Coordinate frames" section of the module docstring.
     view_radius = radius + float(np.abs(center).max())
+    xy = project_view(xyz, view)
+
+    # Horizontal is always a tile axis, so it keeps the centred +/-radius
+    # box. Vertical is a tile axis only in the top view; on a side view it
+    # is z, whose extent is a property of the terrain (this dataset spans
+    # roughly -8..15 m on a normal tile and reaches -97 m on the town03
+    # overpasses), so it is measured from the data rather than assumed.
+    xlim = (-view_radius, view_radius)
+    if view == 'top':
+        ylim = (-view_radius, view_radius)
+    elif xy.shape[0]:
+        lo, hi = float(xy[:, 1].min()), float(xy[:, 1].max())
+        if hi - lo < 2 * VIEW_Z_PAD:      # a perfectly flat tile
+            mid = 0.5 * (lo + hi)
+            lo, hi = mid - VIEW_Z_PAD, mid + VIEW_Z_PAD
+        ylim = (lo - VIEW_Z_PAD, hi + VIEW_Z_PAD)
+    else:
+        ylim = (-VIEW_Z_PAD, VIEW_Z_PAD)
 
     fig = Figure(figsize=(6, 6))
     FigureCanvasAgg(fig)
@@ -1476,7 +1760,9 @@ def _render_tile(name, mode, show_polylines,
     # No grid over the density heat map: its cells are 1 m^2 too, but binned
     # from the tile's own edge rather than from the origin, so the two rules
     # sit a fraction of a metre apart and read as a rendering fault.
-    style_axes(ax, np.zeros(2), view_radius, grid=(mode != 'density'))
+    style_axes(ax, xlim, ylim, grid=(mode != 'density'))
+    ax.set_xlabel(VIEW_PROJ[view][4], color=TEXT_MUTED, fontsize=7)
+    ax.set_ylabel(VIEW_PROJ[view][5], color=TEXT_MUTED, fontsize=7)
 
     n_raw = xy.shape[0]
     subsampled = False
@@ -1493,10 +1779,24 @@ def _render_tile(name, mode, show_polylines,
 
     if mode == 'density':
         # points per 1 m^2 cell -- uses every point, never the subsample,
-        # so the counts stay quantitatively correct
-        nbins = max(1, int(round(2 * radius)))
-        xedges = np.linspace(center[0] - radius, center[0] + radius, nbins + 1)
-        yedges = np.linspace(center[1] - radius, center[1] + radius, nbins + 1)
+        # so the counts stay quantitatively correct.
+        #
+        # Top-down bins from the tile's own edges, which is what keeps a
+        # cell exactly 1 m^2 of ground and the counts comparable between
+        # tiles. A side view has no such anchor on the vertical axis, so it
+        # bins the z extent actually being drawn; cells stay 1 m x 1 m
+        # either way, only the phase differs.
+        if view == 'top':
+            c_h, c_v = float(center[0]), float(center[1])
+            h_lo, h_hi = c_h - radius, c_h + radius
+            v_lo, v_hi = c_v - radius, c_v + radius
+        else:
+            h_lo, h_hi = xlim
+            v_lo, v_hi = ylim
+        nb_h = max(1, int(round(h_hi - h_lo)))
+        nb_v = max(1, int(round(v_hi - v_lo)))
+        xedges = np.linspace(h_lo, h_hi, nb_h + 1)
+        yedges = np.linspace(v_lo, v_hi, nb_v + 1)
         H, xe, ye = np.histogram2d(xy[:, 0], xy[:, 1], bins=[xedges, yedges])
         # Log norm by default: density spans a huge dynamic range on this
         # dataset (the degenerate 5,000,000-point tiles put ~99.9% of their
@@ -1549,19 +1849,24 @@ def _render_tile(name, mode, show_polylines,
     else:  # 'points', and 'label' on a block with no labels array
         ax.scatter(xy_plot[:, 0], xy_plot[:, 1], s=point_size,
                     c='#58a6ff', linewidths=0, alpha=0.6, zorder=2)
-        title_extra = ('top-down' if mode != 'label'
-                        else 'top-down (no labels in this block)')
+        title_extra = ('flat colour' if mode != 'label'
+                        else 'flat colour (no labels in this block)')
 
     outline = [pe.Stroke(linewidth=3.0, foreground='#000000', alpha=0.6),
                 pe.Normal()]
     overlay_handles = []
 
     if show_polylines:
-        gt = load_polylines(name, origin, ds)
+        # 3D on every view: the side views need the export's real z (CARLA's
+        # ground plane, so the lines land at -origin[2] -- the true height of
+        # the road relative to the cloud), and the top view discards it as
+        # it always did.
+        gt = load_polylines(name, origin, ds, ndim=3)
         drawn = {}
-        for pl, cid, cname in gt:
+        for pl3, cid, cname in gt:
             if classes is not None and class_key(cid) not in classes:
                 continue
+            pl = project_view(pl3, view)
             ax.plot(pl[:, 0], pl[:, 1], color=class_color(cid, mode),
                      linewidth=1.8, alpha=0.98, zorder=GT_ZORDER,
                      path_effects=outline)
@@ -1602,7 +1907,24 @@ def _render_tile(name, mode, show_polylines,
             kept.sort(key=lambda k: -k[1])
             n_trimmed = len(kept) - top_n
             kept = kept[:top_n]
+        # The results json carries no z, so a side view has to invent one.
+        #
+        # NOT -origin[2]: that is only the road plane on an export whose
+        # reference lines sit at world z == 0, which the 25m one does and
+        # `../carla_test` does NOT -- its terrain runs 147..376 m, so
+        # -origin[2] would drop every prediction a few hundred metres below
+        # the cloud and straight off the axis. Measured instead: this tile's
+        # own GT polyline height, which tracks the road to a median 0.16 m
+        # over 60 tiles, falling back to the cloud's median z where a tile
+        # has no GT at all.
+        #
+        # So a side view shows a prediction's SHAPE and never its elevation:
+        # they are one flat line at road level by construction.
+        pred_z = _pred_plane_z(name, origin, ds, xyz)
         for pts, score, cls, cid in kept:
+            p3 = np.column_stack([pts[:, 0], pts[:, 1],
+                                   np.full(len(pts), pred_z)])
+            pts = project_view(p3, view)
             ax.plot(pts[:, 0], pts[:, 1],
                      color=class_color(cid, mode) if cid is not None else '#ffd60a',
                      linewidth=2.0, alpha=1.0, zorder=PRED_ZORDER,
@@ -1643,7 +1965,8 @@ def _render_tile(name, mode, show_polylines,
 
     sub_note = f', showing {max_points:,}' if subsampled else ''
     ax.set_title(f'{name}  [{split}]  ({frame} frame)\n'
-                  f'{n_raw:,} pts{sub_note} — {title_extra}',
+                  f'{n_raw:,} pts{sub_note} — {title_extra}'
+                  f' — {VIEW_LABELS[view]}',
                   color=TEXT, fontsize=9)
     fig.tight_layout()
 
@@ -1720,6 +2043,20 @@ STYLE_TMPL = """
   .prog > div {{ height: 100%; background: {accent}; }}
   .swatch {{ display: inline-block; width: 0.7em; height: 0.7em;
              border-radius: 2px; margin-right: 0.35em; }}
+  .tags {{ margin-top: 0.45em; padding-top: 0.4em;
+           border-top: 1px solid {border}; display: flex; flex-wrap: wrap;
+           align-items: center; gap: 0.1em 0.55em; }}
+  .taglabel {{ font-size: 0.9em; text-transform: uppercase;
+               letter-spacing: 0.06em; color: {muted}; }}
+  label.tag {{ display: inline-flex; align-items: center; gap: 0.25em;
+               font-size: 0.95em; color: {text}; cursor: pointer;
+               white-space: nowrap; }}
+  input.tagnew {{ background: {bg}; color: {text};
+                  border: 1px solid {border}; border-radius: 4px;
+                  padding: 0.1em 0.35em; font-size: 0.95em; }}
+  .tagmsg {{ font-size: 0.9em; color: {muted}; }}
+  .tagmsg.err {{ color: #f85149; }}
+  .warnbar {{ color: #f85149; }}
 """
 
 CSS = STYLE_TMPL.format(bg=BG, panel=BG_PANEL, border=BORDER, text=TEXT,
@@ -1747,7 +2084,8 @@ PAGE = """<!doctype html>
 <div class="sub">{data_root} &mdash; datasets: <code>{split}</code> &mdash;
   {n_tiles:,} tiles across {n_towns} towns<br>
   showing <b>{town}</b> (<b>{town_split}</b>) tiles {start}&ndash;{end} &mdash;
-  representation: <b>{mode}</b><br>{class_summary}</div>
+  representation: <b>{mode}</b>, view: <b>{view}</b><br>{class_summary}
+  <br>tags &rarr; <code>{tags_path}</code>{tag_error}</div>
 
 <form method="get">
   <input type="hidden" name="submitted" value="1">
@@ -1766,6 +2104,10 @@ PAGE = """<!doctype html>
   <fieldset>
     <label class="top">Representation</label>
     <select name="mode">{mode_opts}</select>
+  </fieldset>
+  <fieldset>
+    <label class="top">View angle</label>
+    <select name="view">{view_opts}</select>
   </fieldset>
   <fieldset>
     <label class="top">Tile frame</label>
@@ -1791,7 +2133,95 @@ PAGE = """<!doctype html>
 <div class="gallery">
 {gallery}
 </div>
+<script>{tag_js}</script>
 </body></html>
+"""
+
+
+# Tagging is the one thing on this page that must NOT go through the form:
+# a form submit re-renders every figure in the gallery (up to 60 matplotlib
+# renders) just to record one checkbox. So the boxes POST to /tag directly
+# and the page never reloads.
+#
+# Written against the DOM rather than with a framework, and delegated from
+# `document` so the handlers survive the rows being rewritten when a new tag
+# is created.
+TAG_JS = """
+(function () {
+  function post(uid, tag, on, box, msg) {
+    return fetch('/tag', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({uid: uid, tag: tag, on: on ? 1 : 0})
+    }).then(function (r) { return r.json(); }).then(function (d) {
+      if (!d.ok) { throw new Error(d.error || 'failed'); }
+      if (msg) { msg.textContent = ''; msg.className = 'tagmsg'; }
+      return d;
+    }).catch(function (e) {
+      // Put the checkbox back where it was: leaving it ticked would claim a
+      // tag had been saved when the write failed (a read-only dataset dir
+      // is the common case, and the message says so).
+      if (box) { box.checked = !on; }
+      if (msg) { msg.textContent = String(e.message || e); msg.className = 'tagmsg err'; }
+      throw e;
+    });
+  }
+
+  document.addEventListener('change', function (ev) {
+    var box = ev.target;
+    if (!box.classList || !box.classList.contains('tagbox')) { return; }
+    var row = box.closest('.tags');
+    // post() rethrows so the new-tag path below can skip its follow-up work
+    // on failure; here there is no follow-up and the message is already
+    // shown, so swallow it rather than leave an unhandled rejection.
+    post(box.dataset.uid, box.dataset.tag, box.checked, box,
+         row && row.querySelector('.tagmsg')).catch(function () {});
+  });
+
+  // A new tag has to appear on EVERY tile, not just the one that created
+  // it, or the vocabulary silently differs per row until the next reload.
+  function addEverywhere(tag, uid) {
+    document.querySelectorAll('.tags').forEach(function (row) {
+      // Scanned rather than matched with an attribute selector: a tag is
+      // free text, so building a selector from it would need escaping and
+      // would break on a quote or a space.
+      var already = null;
+      row.querySelectorAll('input.tagbox').forEach(function (b) {
+        if (b.dataset.tag === tag) { already = b; }
+      });
+      if (already) {
+        if (row.dataset.uid === uid) { already.checked = true; }
+        return;
+      }
+      var label = document.createElement('label');
+      label.className = 'tag';
+      var box = document.createElement('input');
+      box.type = 'checkbox';
+      box.className = 'tagbox';
+      box.dataset.uid = row.dataset.uid;
+      box.dataset.tag = tag;
+      box.checked = (row.dataset.uid === uid);
+      label.appendChild(box);
+      label.appendChild(document.createTextNode(tag));
+      row.insertBefore(label, row.querySelector('.tagnew'));
+    });
+  }
+
+  document.addEventListener('keydown', function (ev) {
+    var inp = ev.target;
+    if (ev.key !== 'Enter' || !inp.classList ||
+        !inp.classList.contains('tagnew')) { return; }
+    ev.preventDefault();          // never submit the surrounding form
+    var tag = (inp.value || '').trim();
+    if (!tag) { return; }
+    var row = inp.closest('.tags');
+    post(inp.dataset.uid, tag, true, null,
+         row && row.querySelector('.tagmsg')).then(function () {
+      addEverywhere(tag, inp.dataset.uid);
+      inp.value = '';
+    }).catch(function () { /* message already shown */ });
+  });
+})();
 """
 
 
@@ -1930,6 +2360,32 @@ def selected_classes(args):
     if not args.get('submitted'):
         return None
     return set(args.getlist('cls'))
+
+
+def tag_row_html(uid, vocab, tags_by_ds):
+    """The per-tile tag controls: a checkbox per known tag, plus "+ new".
+
+    Every tag in the vocabulary gets a box on every tile, so ticking one is
+    a single click with no menu. The text box creates a tag AND applies it,
+    because those are never separately useful here.
+    """
+    t = tile_by_uid(uid)
+    store = tags_by_ds.get(t['_ds']) if t else None
+    have = set((store or {}).get('tiles', {}).get(t['name'], []) if t else [])
+    esc_uid = html.escape(uid, quote=True)
+    boxes = []
+    for tag in vocab:
+        boxes.append(
+            f'<label class="tag"><input type="checkbox" class="tagbox" '
+            f'data-uid="{esc_uid}" data-tag="{html.escape(tag, quote=True)}"'
+            f'{" checked" if tag in have else ""}>'
+            f'{html.escape(tag)}</label>')
+    return (
+        f'<div class="tags" data-uid="{esc_uid}">'
+        f'<span class="taglabel">tags</span>{"".join(boxes)}'
+        f'<input class="tagnew" type="text" placeholder="+ new tag" '
+        f'size="9" data-uid="{esc_uid}">'
+        f'<span class="tagmsg"></span></div>')
 
 
 def class_boxes_html(selected):
@@ -2105,6 +2561,11 @@ def index():
     count = max(1, min(60, int(request.args.get('count', 6))))
     start = max(0, int(request.args.get('start', 0)))
     mode = request.args.get('mode', 'rgb')
+    # Top-down stays the default, so a bare /?tab=browse renders exactly what
+    # it always did.
+    view = request.args.get('view', 'top')
+    if view not in VIEWS:
+        view = 'top'
     point_size = request.args.get('point_size', '1.5')
     polylines = '1' if request.args.get('polylines') else ''
     linear_density = '1' if request.args.get('linear_density') else ''
@@ -2141,12 +2602,21 @@ def index():
     if frame_arg not in ('auto',) + FRAMES:
         frame_arg = 'auto'
 
+    # Read each dataset's tag store ONCE per page rather than once per tile:
+    # a 60-tile gallery would otherwise re-open and re-parse the same json 60
+    # times.
+    tag_vocab = tag_vocabulary()
+    tags_by_ds = {ds: load_tags(ds) for ds in {t['_ds'] for t in tiles}}
+    tag_error = next((s['error'] for s in tags_by_ds.values()
+                      if s.get('error')), '')
+
     figs = []
     for t in tiles:
         params = [
             ('name', t['name']),
             ('ds', t['_ds']),
             ('mode', mode),
+            ('view', view),
             ('point_size', point_size),
             ('frame', frame_arg),
             ('v', cachebust),
@@ -2203,6 +2673,7 @@ def index():
                 for k, why in tile_flags(row))
             if flags:
                 cap += f'<br>{flags}'
+        cap += tag_row_html(t['_uid'], tag_vocab, tags_by_ds)
         figs.append(
             f'<figure><a href="/tile.png{q_attr}" target="_blank">'
             f'<img src="/tile.png{q_attr}"></a>'
@@ -2217,6 +2688,12 @@ def index():
         split=', '.join(STATE['datasets'].keys()),
         n_tiles=len(STATE['tiles']), n_towns=len(towns),
         town=group['town'], town_split=town_split, mode=mode,
+        view=VIEW_LABELS[view], tag_js=TAG_JS,
+        tags_path=html.escape(
+            STATE.get('tags_file')
+            or osp.join('<dataset dir>', TAGS_FILENAME)),
+        tag_error=(f'<br><span class="warnbar">tag file: '
+                    f'{html.escape(tag_error)}</span>' if tag_error else ''),
         end=start + len(tiles),
         class_summary=STATE['class_summary'],
         town_opts=_opts(towns, town,
@@ -2227,11 +2704,16 @@ def index():
         class_fields=CLASS_FIELDS.format(
             class_boxes=class_boxes_html(classes)),
         count=count, start=start, point_size=point_size,
+        # 'points' used to be labelled "top-down (flat colour)", which put
+        # the camera direction in the colour menu; the direction is the
+        # separate "View angle" control now and this option names only what
+        # it does to the colour.
         mode_opts=_opts(['rgb', 'label', 'points', 'density', 'intensity'],
                          mode,
                          ['true RGB colour', 'lane label',
-                          'top-down (flat colour)',
+                          'flat colour (single hue)',
                           'density heat map (1 m² bins)', 'intensity']),
+        view_opts=_opts(VIEWS, view, [VIEW_LABELS[v] for v in VIEWS]),
         frame_opts=_opts(('auto',) + FRAMES, frame_arg,
                           [FRAME_LABELS[k] for k in ('auto',) + FRAMES]),
         pl_checked='checked' if polylines else '',
@@ -2251,6 +2733,38 @@ def index():
     resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
     resp.headers['Pragma'] = 'no-cache'
     return resp
+
+
+@app.route('/tag', methods=['POST'])
+def tag_route():
+    """Toggle one tag on one tile. Returns the tile's new tags + vocabulary.
+
+    POST rather than a link because it writes, and json rather than a form
+    redirect because a redirect would re-render the whole gallery (up to 60
+    matplotlib figures) just to tick a box.
+    """
+    payload = request.get_json(silent=True) or request.form
+    uid = payload.get('uid') or ''
+    tag = payload.get('tag') or ''
+    on = str(payload.get('on', '1')) not in ('0', 'false', 'False', '')
+    # Same validation as /tile.png: `uid` reaches a filesystem join through
+    # ds_dir(), so it only ever gets there via the tile index.
+    if tile_by_uid(uid) is None:
+        return jsonify(ok=False, error=f'unknown tile {uid!r}'), 404
+    try:
+        tags = set_tile_tag(uid, tag, on)
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
+    except OSError as exc:
+        # By far the likeliest failure: the dataset directory is read-only.
+        # Say which file and offer the flag rather than just "permission
+        # denied", since the viewer is often pointed at a `:ro` mount.
+        t = tile_by_uid(uid)
+        return jsonify(
+            ok=False,
+            error=f'cannot write {tags_path(t["_ds"])}: {exc}. '
+                  f'Pass --tags-file <path> to store tags elsewhere.'), 500
+    return jsonify(ok=True, uid=uid, tags=tags, vocab=tag_vocabulary())
 
 
 @app.route('/tile.png')
@@ -2284,6 +2798,7 @@ def tile_png():
         # viewer discovered -- same rule /res.png applies.
         frame=resolve_frame(request.args.get('frame'),
                              _known_gt(request.args.get('gt'))),
+        view=request.args.get('view', 'top'),
     )
     if buf is None:
         abort(404)
@@ -5839,6 +6354,13 @@ def parse_args():
                          'preferring a pkl, since a freshly converted '
                          'dataset has no json yet and an existing json is '
                          'never regenerated')
+    p.add_argument('--tags-file', default=None,
+                    help='write per-tile tags to this one json instead of a '
+                         f'{TAGS_FILENAME} inside each dataset directory. '
+                         'Use when the dataset directory is read-only. Note '
+                         'tile names are unique only within a dataset, so a '
+                         'shared file merges tags between datasets that '
+                         'reuse a name.')
     p.add_argument('--num-pts-per-vec', type=int, default=20,
                     help='the model\'s fixed polyline resampling length, '
                          'marked on the vertices-per-polyline chart')
@@ -5870,6 +6392,7 @@ def main():
     STATE['scan_stride'] = max(1, args.scan_stride)
     STATE['pc_range_z'] = tuple(args.pc_range_z)
     STATE['num_pts_per_vec'] = args.num_pts_per_vec
+    STATE['tags_file'] = osp.abspath(args.tags_file) if args.tags_file else None
     STATE['cache_dir'] = args.stats_cache or osp.join(
         osp.expanduser('~'), '.cache', 'maptr_dataset_viewer')
     if args.work_dir is not None and not osp.isdir(args.work_dir):

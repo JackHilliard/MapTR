@@ -1458,6 +1458,126 @@ class, lane label), reusing the browse tab's `CLASS_COLORS`/`LABEL_COLORS`;
 the effective-vs-raw scatter uses emphasis (one muted hue + a status colour
 for flagged points) rather than colouring by town.
 
+### View angle is separate from representation, and per-tile tags (2026-08-24)
+
+Two additions to the browse tab.
+
+**1. View angle.** `?view=` selects the camera direction: `top` (default),
+`front`, `back`, `left`, `right`. It used to be conflated with the colour
+scheme — `top-down (flat colour)` was one of the `mode` options, which made
+every *other* representation implicitly top-down and left no way to look at a
+tile from the side. `mode` now names only the colouring and `view` only the
+direction, so any pair composes (RGB from the side, density from the side).
+The `points` mode key is unchanged and simply relabelled **"flat colour
+(single hue)"**; nothing was removed.
+
+Directions are derived the standard way, `right = forward × up` with up = +z,
+so left-right does not mirror as you walk around a tile:
+
+| view | camera at | horizontal | vertical |
+|---|---|---|---|
+| `top` | above, looking −z | x | y |
+| `front` | −y | x | z |
+| `back` | +y | −x | z |
+| `left` | −x | −y | z |
+| `right` | +x | y | z |
+
+`top` is byte-identical to the old render (verified), and omitting `view`
+gives `top`, so every existing URL behaves exactly as before. The only
+cosmetic change to the top view is x/y axis labels, which the side views
+need.
+
+Three things had to change underneath:
+
+* **`style_axes()` now takes explicit `(lo, hi)` limits per axis** instead of
+  a centre and a radius. A side view is not square: horizontal is the tile
+  width, vertical is however tall the cloud happens to be. The aspect stays
+  `equal` in every view — both axes are metres, and stretching one would
+  misreport slope.
+* **The vertical extent is measured, not assumed.** Tiles here run roughly
+  −8..15 m and reach −34 m on town12's multi-level chunks, so the z limits
+  come from the data with a 1 m pad.
+* **GT polylines are loaded `ndim=3`** so a side view has a real height. The
+  top view discards z as it always did.
+
+**2. Per-tile tags.** A checkbox row under every tile in the gallery, with
+`corrupted` offered by default and a `+ new tag` box that creates a tag and
+applies it in one step. Stored as json **inside the dataset directory**, one
+`tile_tags.json` per dataset dir:
+
+```json
+{"version": 1, "tags": ["corrupted"],
+ "tiles": {"town12_chunk_21_tile_00194": ["corrupted"]}}
+```
+
+`tags` is the vocabulary and `tiles` the assignments, kept separate so a tag
+survives untagging the last tile that used it and so the checkbox row is the
+same shape on every tile. Per dataset directory rather than one global file
+because **tile names are unique only within a directory** — every town has a
+`tile_00000` — the same reason the tile index is keyed `<dataset>/<name>`.
+`--tags-file` overrides with a single file, for a read-only dataset dir (the
+container workflow mounts it `:ro`; the viewer runs on the host, where it
+usually is not). A failed write returns the path and that flag rather than a
+traceback, and the checkbox reverts rather than falsely showing as saved.
+
+Writes go through `POST /tag` and the page never reloads — a form submit
+would re-render up to 60 matplotlib figures to record one checkbox. The
+handlers are delegated from `document`, so a checkbox the JS creates for a
+new tag is live immediately.
+
+**Predictions on a side view are drawn at the tile's own GT polyline
+height**, and getting this wrong is easy: the obvious `-origin[2]` is only
+the road plane on an export whose reference lines sit at world z == 0. The
+25 m export is like that; **`../carla_test` is not** — it is real terrain
+running 147..376 m, so `-origin[2]` puts every prediction a few hundred
+metres below the cloud and straight off the axis. This corrects
+`load_polylines()`'s docstring, which claimed reference-line z is always
+CARLA's ground plane at world zero. Measured over 60 `../carla_test` tiles /
+148 polylines: GT z sits a median **+0.16 m** from the nearest cloud return,
+and the world ranges agree (GT 146.8..376.4, cloud 145.7..376.7). So trust
+the stored z. A tile with no reference lines falls back to the cloud's median
+z — a rough centre of mass, but on-screen.
+
+A side view therefore shows a prediction's **shape and never its elevation**:
+the results json has no z, so they are one flat line at road level by
+construction.
+
+**Verified**: 68 python assertions (projection maths including the
+front/back and left/right mirror pairs; the emitted page's selects and
+img URLs; all five views rendering and being pairwise distinct; `top`
+byte-identical to omitting the parameter; every representation composing with
+a side view; the full tag lifecycle — create, tick, untick, vocabulary
+survival, hand-edited files, corrupt files, path traversal, empty and
+over-long tags, read-only dirs, `--tags-file`) plus **15 jsdom assertions**
+for the browser half (POST payloads, checkbox revert and error message on a
+failed write, new-tag creation propagating to every tile, `Enter` not
+submitting the form, event delegation reaching JS-created boxes). Plus a real
+render of all five views × both frames on `../carla_test`.
+
+Two things the test pass caught that are worth keeping in mind:
+
+* The **HTML is parsed with `html.parser`**, never curled — the `&gt_frame=`
+  entity trap in "Transferable debugging lessons" is why.
+* The jsdom pass found an **unhandled promise rejection** on the failed-write
+  path and a dependency on **`CSS.escape`** (absent in jsdom, and wrong
+  anyway for free-text tags containing a quote or space). Neither is visible
+  from any server-side test. Regenerate `page.html` from the server before
+  re-running the jsdom file, or it tests a stale copy of the script.
+
+Note the host's system python has **matplotlib 3.1.2**, too old for the
+`labelcolor=` argument this file has always passed to `ax.legend()`, so any
+legend-drawing path raises there. That is pre-existing and unrelated to these
+changes (it fails identically on `view='top'`); run the viewer and its tests
+under the container's matplotlib 3.10, or any matplotlib >= 3.3.
+
+**Still `reference_lines/`-only**: `load_polylines()` reads that directory by
+name, so the browse tab draws the historical unclassified GT even on
+`../carla_test`, which now also ships `reference_curb_driving_lines/` and
+`reference_driving_curb_crosswalk/`. That predates these changes and is the
+same gap `shape_counts()` has; the fix is to thread the pkl's
+`tile_geometry.reference_dir` through, which is recorded for exactly this
+reason.
+
 ## Transferable debugging lessons
 
 - **`&gt_frame=` in an HTML attribute parses as `>_frame=`.** Browsers

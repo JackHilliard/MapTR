@@ -1,0 +1,355 @@
+"""Tests for the browse tab's view-angle and tagging features.
+
+Drives the real Flask app through its test client and PARSES the emitted
+HTML with html.parser -- never by curling a URL assembled here. That rule is
+in CLAUDE.md for a concrete reason: `&gt_frame=` in an HTML attribute is
+parsed by browsers as `>_frame=`, and curl can never reproduce it because
+nothing HTML-parses a URL you built yourself.
+"""
+import json, os, shutil, sys, tempfile
+from html.parser import HTMLParser
+
+# host path when run directly; /MapTR/tools/maptrv2 inside the container
+# the viewer lives one directory up from this tests/ dir
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import numpy as np
+import dataset_viewer as V
+
+fails = []
+def ck(name, cond, extra=''):
+    print(('PASS ' if cond else 'FAIL ') + name + (('  ' + str(extra)) if extra else ''))
+    if not cond:
+        fails.append(name)
+
+
+class Grab(HTMLParser):
+    """Collect selects/options, img srcs, inputs, and the <title>."""
+    def __init__(self):
+        super().__init__()
+        self.selects = {}
+        self._cur = None
+        self.imgs = []
+        self.inputs = []
+        self.title = ''
+        self._in_title = False
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == 'select':
+            self._cur = a.get('name')
+            self.selects[self._cur] = []
+        elif tag == 'option' and self._cur:
+            self.selects[self._cur].append(
+                (a.get('value'), 'selected' in a))
+        elif tag == 'img':
+            self.imgs.append(a.get('src'))
+        elif tag == 'input':
+            self.inputs.append(a)
+        elif tag == 'title':
+            self._in_title = True
+
+    def handle_endtag(self, tag):
+        if tag == 'select':
+            self._cur = None
+        elif tag == 'title':
+            self._in_title = False
+
+    def handle_data(self, d):
+        if self._in_title:
+            self.title += d
+
+
+def parse(html_text):
+    g = Grab()
+    g.feed(html_text)
+    return g
+
+
+# --------------------------------------------------------------- fixtures
+DATA = tempfile.mkdtemp(prefix='viewer_tags_')
+DS = os.path.join(DATA, 'test')
+os.makedirs(os.path.join(DS, 'blocks'))
+os.makedirs(os.path.join(DS, 'reference_lines'))
+
+rng = np.random.RandomState(0)
+TILES = ['tile_00000', 'tile_00001']
+manifest = {'split': 'test', 'tile_radius': 15.0, 'tiles': []}
+for i, nm in enumerate(TILES):
+    n = 4000
+    xy = rng.uniform(-15, 15, size=(n, 2))
+    # A z range wide enough that a side view is visibly different from a
+    # top-down one, and asymmetric so a mirrored view is detectable.
+    z = rng.uniform(-3, 9, size=(n, 1))
+    rgb = rng.uniform(0, 1, size=(n, 3))
+    feat = np.hstack([xy, z, rgb]).astype(np.float32)
+    np.savez(os.path.join(DS, 'blocks', f'{nm}.npz'),
+             features=feat, labels=np.zeros(n, dtype=np.int32) - 1,
+             offset=np.array([100.0, 200.0, 5.0], dtype=np.float32),
+             tile_center=np.array([101.0, 199.0, 5.0], dtype=np.float32),
+             tile_radius=np.float32(15.0))
+    pl = {'tile_center': [101.0, 199.0, 5.0], 'tile_radius': 15.0,
+          'classes': {'0': 'driving'},
+          'polylines': [{'class_id': 0, 'class': 'driving', 'type': 'straight',
+                         'points': [[95.0, 195.0, 0.0], [105.0, 205.0, 0.0]]}]}
+    with open(os.path.join(DS, 'reference_lines',
+                            f'{nm}_reference_lines.json'), 'w') as f:
+        json.dump(pl, f)
+    manifest['tiles'].append({'name': nm, 'n_points': n,
+                               'center': [101.0, 199.0, 5.0]})
+with open(os.path.join(DS, 'manifest.json'), 'w') as f:
+    json.dump(manifest, f)
+
+V.STATE.update({
+    'data_root': DATA, 'max_points': 150000, 'work_dir': None,
+    'results_cache': {}, 'gt_cache': {}, 'shape_cache': {}, 'frame_cache': {},
+    'frame': 'auto', 'gt_json': None, 'deep': {},
+    'scan_grid': (0.1, 0.1, 0.4), 'scan_workers': 2, 'scan_stride': 1,
+    'pc_range_z': (-72.0, 96.0), 'num_pts_per_vec': 20,
+    'cache_dir': tempfile.mkdtemp(prefix='viewer_cache_'),
+    'tags_file': None,
+})
+ds = V.discover_datasets(DATA)
+V.STATE['datasets'] = ds
+tiles, groups = V.build_index(ds)
+V.STATE['tiles'], V.STATE['groups'] = tiles, groups
+V.STATE['tiles_by_uid'] = {t['_uid']: t for t in tiles}
+V.STATE['lane_types'] = V.merged_lookup(ds, 'lane_type_lookup')
+V.STATE['class_lookup'] = V.merged_lookup(ds, 'class_lookup')
+V.STATE['class_choices'] = V.class_choices(ds)
+V.STATE['class_summary'] = V.class_summary(ds)
+V.STATE['class_ids'] = {v: int(k) for k, v in V.STATE['class_lookup'].items()}
+UID = tiles[0]['_uid']
+print(f'fixture: {len(tiles)} tiles, uid={UID}\n')
+
+app = V.app.test_client()
+
+# ---------------------------------------------------------- projection maths
+ck('VIEWS has top + four sides', V.VIEWS == ('top', 'front', 'back', 'left', 'right'))
+pt = np.array([[3.0, 5.0, 7.0]])
+ck('top = (x, y)', V.project_view(pt, 'top').tolist() == [[3.0, 5.0]])
+ck('front = (x, z)', V.project_view(pt, 'front').tolist() == [[3.0, 7.0]])
+ck('back mirrors x', V.project_view(pt, 'back').tolist() == [[-3.0, 7.0]])
+ck('right = (y, z)', V.project_view(pt, 'right').tolist() == [[5.0, 7.0]])
+ck('left mirrors y', V.project_view(pt, 'left').tolist() == [[-5.0, 7.0]])
+ck('front/back are mirror images',
+   V.project_view(pt, 'front')[0, 0] == -V.project_view(pt, 'back')[0, 0])
+try:
+    V.project_view(np.zeros((2, 2)), 'front')
+    ck('2D input to a side view raises', False)
+except ValueError as e:
+    ck('2D input to a side view raises', 'side view' in str(e))
+ck('2D input still fine for top',
+   V.project_view(np.array([[1.0, 2.0]]), 'top').tolist() == [[1.0, 2.0]])
+
+# ------------------------------------------------------------- browse page
+r = app.get('/')
+ck('browse 200', r.status_code == 200, r.status_code)
+g = parse(r.data.decode())
+ck('page title unchanged', g.title.strip() == 'CARLA dataset viewer', g.title)
+ck('a View angle select exists', 'view' in g.selects, list(g.selects))
+ck('view options are the five views',
+   [v for v, _ in g.selects.get('view', [])] == list(V.VIEWS),
+   g.selects.get('view'))
+ck('top-down is the DEFAULT selection',
+   [v for v, s in g.selects.get('view', []) if s] == ['top'],
+   g.selects.get('view'))
+mode_vals = [v for v, _ in g.selects.get('mode', [])]
+ck('mode select still offers the five representations',
+   mode_vals == ['rgb', 'label', 'points', 'density', 'intensity'], mode_vals)
+ck('no representation option is named top-down any more',
+   'top-down' not in r.data.decode().split('<div class="gallery">')[0].lower()
+   or 'View angle' in r.data.decode(),
+   'checked in form region')
+
+# the img URLs the page actually emitted must carry the view
+ck('tile imgs carry view=top by default',
+   all('view=top' in s for s in g.imgs), g.imgs[:1])
+
+r2 = app.get('/?view=right&mode=density')
+g2 = parse(r2.data.decode())
+ck('view=right survives into the img URLs',
+   all('view=right' in s for s in g2.imgs), g2.imgs[:1])
+ck('view=right is the selected option',
+   [v for v, s in g2.selects.get('view', []) if s] == ['right'])
+ck('bad view falls back to top',
+   [v for v, s in parse(app.get('/?view=sideways').data.decode())
+    .selects.get('view', []) if s] == ['top'])
+
+# ------------------------------------------------------------ rendered PNGs
+pngs = {}
+for view in V.VIEWS:
+    rr = app.get(f'/tile.png?name={TILES[0]}&ds=test&view={view}&mode=points')
+    ck(f'/tile.png view={view} renders', rr.status_code == 200
+       and rr.data[:4] == b'\x89PNG', rr.status_code)
+    pngs[view] = rr.data
+ck('every view renders a DIFFERENT image', len(set(pngs.values())) == 5,
+   f'{len(set(pngs.values()))} distinct')
+top_default = app.get(f'/tile.png?name={TILES[0]}&ds=test&mode=points').data
+ck('omitting view == top-down (byte-identical)', top_default == pngs['top'])
+for mode in ('rgb', 'label', 'density', 'intensity'):
+    rr = app.get(f'/tile.png?name={TILES[0]}&ds=test&view=front&mode={mode}')
+    ck(f'side view composes with mode={mode}',
+       rr.status_code == 200 and rr.data[:4] == b'\x89PNG', rr.status_code)
+rr = app.get(f'/tile.png?name={TILES[0]}&ds=test&view=front&polylines=1')
+ck('side view draws polylines (needs 3D GT)',
+   rr.status_code == 200 and rr.data[:4] == b'\x89PNG', rr.status_code)
+
+# ------------------------------------------------- prediction plane (side view)
+# The fixture's reference lines sit at world z == 0 while `offset[2]` is 5,
+# so the GT lands at stored z == -5 and a naive "-origin[2]" would agree by
+# luck. Shift the polyline z to mimic a TERRAIN export (like ../carla_test,
+# 147..376 m) and the two answers separate: only reading the stored GT z
+# keeps predictions on the road.
+blk = V.load_block(TILES[0], 'test')
+origin, shift, _c = V.tile_frame(blk, 'offset')
+xyz = blk['features'][:, :3]
+ck('pred plane follows the GT z, not -origin[2]',
+   abs(V._pred_plane_z(TILES[0], origin, 'test', xyz) - (-5.0)) < 1e-6,
+   V._pred_plane_z(TILES[0], origin, 'test', xyz))
+
+_rl = os.path.join(DS, 'reference_lines', f'{TILES[0]}_reference_lines.json')
+_orig = json.load(open(_rl))
+_terrain = json.loads(json.dumps(_orig))
+for _p in _terrain['polylines']:
+    _p['points'] = [[x, y, 300.0] for x, y, _z in _p['points']]
+with open(_rl, 'w') as f:
+    json.dump(_terrain, f)
+ck('terrain GT z is followed (295 = 300 - offset 5)',
+   abs(V._pred_plane_z(TILES[0], origin, 'test', xyz) - 295.0) < 1e-6,
+   V._pred_plane_z(TILES[0], origin, 'test', xyz))
+with open(_rl, 'w') as f:
+    json.dump(_orig, f)
+
+_gtless = os.path.join(DS, 'reference_lines', f'{TILES[1]}_reference_lines.json')
+os.rename(_gtless, _gtless + '.bak')
+ck('no GT -> falls back to the cloud median, not 0 or -origin[2]',
+   abs(V._pred_plane_z(TILES[1], origin, 'test', xyz)
+       - float(np.median(xyz[:, 2]))) < 1e-6)
+os.rename(_gtless + '.bak', _gtless)
+
+# ------------------------------------------------------------------- tags
+tag_file = os.path.join(DS, V.TAGS_FILENAME)
+ck('no tag file before tagging', not os.path.exists(tag_file))
+ck('vocabulary starts with the corrupted default',
+   V.tag_vocabulary() == ['corrupted'], V.tag_vocabulary())
+
+inputs = [i for i in g.inputs if i.get('class') == 'tagbox']
+ck('a corrupted checkbox is emitted per tile',
+   len(inputs) == len(tiles) and all(i.get('data-tag') == 'corrupted'
+                                      for i in inputs), len(inputs))
+ck('corrupted starts unticked', all('checked' not in i for i in inputs))
+ck('a new-tag box is emitted per tile',
+   len([i for i in g.inputs if i.get('class') == 'tagnew']) == len(tiles))
+
+r = app.post('/tag', json={'uid': UID, 'tag': 'corrupted', 'on': 1})
+d = r.get_json()
+ck('POST /tag ok', r.status_code == 200 and d['ok'], d)
+ck('tile now carries the tag', d['tags'] == ['corrupted'], d['tags'])
+ck('tag file written into the DATASET dir', os.path.exists(tag_file))
+blob = json.load(open(tag_file))
+ck('file records the assignment',
+   blob['tiles'][TILES[0]] == ['corrupted'], blob)
+ck('file records the vocabulary', 'corrupted' in blob['tags'], blob['tags'])
+
+r = app.post('/tag', json={'uid': UID, 'tag': 'blurry-lidar', 'on': 1})
+d = r.get_json()
+ck('creating a new tag works', d['ok'] and set(d['tags']) ==
+   {'corrupted', 'blurry-lidar'}, d)
+ck('new tag joins the vocabulary', 'blurry-lidar' in d['vocab'], d['vocab'])
+
+g3 = parse(app.get('/').data.decode())
+boxes = [i for i in g3.inputs if i.get('class') == 'tagbox']
+ck('both tags now have a box on every tile',
+   len(boxes) == 2 * len(tiles), len(boxes))
+mine = [i for i in boxes if i.get('data-uid') == UID]
+ck('the tagged tile shows both ticked',
+   sum('checked' in i for i in mine) == 2, mine)
+other = [i for i in boxes if i.get('data-uid') != UID]
+ck('the untagged tile shows none ticked',
+   sum('checked' in i for i in other) == 0, other)
+
+r = app.post('/tag', json={'uid': UID, 'tag': 'corrupted', 'on': 0})
+d = r.get_json()
+ck('untagging works', d['ok'] and d['tags'] == ['blurry-lidar'], d)
+blob = json.load(open(tag_file))
+ck('vocabulary SURVIVES untagging the last user',
+   'corrupted' in blob['tags'], blob['tags'])
+
+app.post('/tag', json={'uid': UID, 'tag': 'blurry-lidar', 'on': 0})
+blob = json.load(open(tag_file))
+ck('a tile with no tags is dropped from tiles{}',
+   TILES[0] not in blob.get('tiles', {}), blob.get('tiles'))
+
+# validation / errors
+ck('unknown tile 404s',
+   app.post('/tag', json={'uid': 'test/nope', 'tag': 'x'}).status_code == 404)
+ck('path traversal in uid is rejected',
+   app.post('/tag', json={'uid': '../../etc/passwd', 'tag': 'x'}
+             ).status_code == 404)
+ck('empty tag 400s',
+   app.post('/tag', json={'uid': UID, 'tag': '  '}).status_code == 400)
+ck('over-long tag 400s',
+   app.post('/tag', json={'uid': UID, 'tag': 'x' * 65}).status_code == 400)
+
+# hand-edited file: a tag only present on a tile still reaches the vocabulary
+with open(tag_file, 'w') as f:
+    json.dump({'version': 1, 'tags': [], 'tiles': {TILES[1]: ['hand-added']}}, f)
+ck('a hand-added tag is offered in the UI',
+   'hand-added' in V.tag_vocabulary(), V.tag_vocabulary())
+ck('and shows as ticked on its tile',
+   'hand-added' in V.tile_tags(tiles[1]['_uid']), V.tile_tags(tiles[1]['_uid']))
+
+# corrupt file: reported, not fatal
+with open(tag_file, 'w') as f:
+    f.write('{not json')
+store = V.load_tags('test')
+ck('corrupt tag file reports an error instead of raising',
+   bool(store.get('error')), store.get('error'))
+rr = app.get('/')
+ck('page still renders with a corrupt tag file', rr.status_code == 200)
+ck('and says so', 'tag file:' in rr.data.decode())
+ck('writing refuses while the file is unreadable',
+   app.post('/tag', json={'uid': UID, 'tag': 'x'}).status_code == 500)
+os.unlink(tag_file)
+
+# read-only dataset dir -> a clear error, not a traceback.
+# Skipped as root, which bypasses directory permission bits entirely: the
+# write would succeed and the test would assert nothing. Run this file as a
+# normal user (it passes on the host) to exercise it.
+if os.geteuid() == 0:
+    print('SKIP read-only dataset dir check (running as root; verified on host)')
+else:
+    os.chmod(DS, 0o555)
+    try:
+        r = app.post('/tag', json={'uid': UID, 'tag': 'corrupted', 'on': 1})
+        d = r.get_json()
+        ck('read-only dataset dir gives a 500 with the --tags-file hint',
+           r.status_code == 500 and not d['ok'] and '--tags-file' in d['error'],
+           d.get('error', '')[:120])
+    finally:
+        os.chmod(DS, 0o755)
+    if os.path.exists(tag_file):
+        os.unlink(tag_file)
+
+# --tags-file override
+alt = os.path.join(tempfile.mkdtemp(prefix='viewer_tagsalt_'), 'tags.json')
+V.STATE['tags_file'] = alt
+r = app.post('/tag', json={'uid': UID, 'tag': 'corrupted', 'on': 1})
+ck('--tags-file override is honoured',
+   r.status_code == 200 and os.path.exists(alt)
+   and not os.path.exists(tag_file), alt)
+V.STATE['tags_file'] = None
+
+# --------------------------------------------------------- other tabs intact
+for tab, want in (('stats', 'CARLA dataset viewer'),
+                  ('results', 'CARLA dataset viewer')):
+    rr = app.get(f'/?tab={tab}')
+    ck(f'tab={tab} still renders', rr.status_code == 200, rr.status_code)
+    ck(f'tab={tab} is not the browse page',
+       'View angle' not in rr.data.decode()
+       or tab == 'browse', tab)
+
+shutil.rmtree(DATA, ignore_errors=True)
+print()
+print('ALL PASS' if not fails else 'FAILURES:\n  ' + '\n  '.join(fails))
+sys.exit(1 if fails else 0)
