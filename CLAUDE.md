@@ -1487,6 +1487,53 @@ gives `top`, so every existing URL behaves exactly as before. The only
 cosmetic change to the top view is x/y axis labels, which the side views
 need.
 
+**Defaults changed 2026-08-24**: `--frame` now defaults to **`tile_center`**
+(was `auto`) and the 3D tab's polyline thickness to **0.27 m** (was 0.30).
+`auto` resolves to `offset` when no GT file is selected, so it was showing the
+wrong frame by default on a machine whose configs all train recentred;
+`tile_center` is what every current config trains in. `auto` is still there
+and still reads the frame back from a selected GT pkl. The thickness now
+lives in one constant, `LINE_WIDTH_DEFAULT`, instead of being hardcoded as
+0.30/0.15 in three places (the web form, the launcher and the re-exec'd
+child).
+
+### Is the side view's z the frame the dataloader uses?
+
+Yes — and it was off by up to 0.206 m until this was checked.
+
+The z **scale** was never in question: both are metres, the axes are
+`aspect='equal'`, so 1 m of height is 1 m of width on screen. The **origin**
+is the part that had to be verified, and the viewer disagreed with the
+dataloader:
+
+* the converter reads the **manifest's** `center`, which `../carla_test`
+  states as 2D `[x, y]`. Under GeMap's z rule a 2D centre keeps the block's
+  own z, so `lidar_recenter_shift` has an **exactly zero** z component —
+  confirmed on all 3795 samples — and `LoadCarlaPointsFromFile(recenter=True)`
+  never moves a point vertically. Only xy is recentred (|shift| up to 116 m
+  in x, 64 m in y).
+* the viewer read the **`.npz`'s** `tile_center`, which on this export is 3D
+  and carries its own z, differing from `offset[2]`. So it applied a small
+  vertical shift the model never sees.
+
+`tile_frame()` now prefers the manifest's centre (falling back to the block's
+for callers that pass no `name`/`ds`). After the fix, the viewer's shift equals
+the pkl's `lidar_recenter_shift` **exactly, on all three axes, max diff 0**
+over 40 tiles. So the side view's z is now literally the model's input z.
+
+Two things the side view still does **not** show, both deliberate:
+
+* **the `z_max` cut and the `lidar_point_cloud_range` z clipping**. The
+  loader drops `z > z_max` (96) before recentring, and the voxelizer drops
+  anything outside z ∈ [−72, 96]. Measured over 40 `../carla_test` tiles /
+  4.6M points: **0 points** fall foul of either, so on this export the side
+  view happens to show exactly what the model receives. That is a property of
+  the data, not a guarantee — the town03 overpass tiles in the older 25 m set
+  reach z = −97 (see Open items) and would be clipped.
+* **the pc_range box itself.** The vertical axis is scaled to the tile's own
+  data, not to the config's z range, so the view says nothing about how much
+  headroom the range leaves.
+
 Three things had to change underneath:
 
 * **`style_axes()` now takes explicit `(lo, hi)` limits per axis** instead of
@@ -1551,10 +1598,13 @@ about its elevation. Verified on a real tile: every predicted vertex lands
 inside both the cloud's z range and the GT's, spanning the GT's 0.228 m range
 exactly.
 
-**Verified**: 76 python assertions (projection maths including the
+**Verified**: 91 python assertions (projection maths including the
 front/back and left/right mirror pairs; prediction height interpolated along
 a ramp rather than stepped, clamped past a segment's end, taken from the
-nearer of two GT lines, and surviving a zero-length segment; the emitted
+nearer of two GT lines, and surviving a zero-length segment; the new
+defaults reaching the CLI, the browse page's frame select, the tile img URLs
+and the 3D thickness field; the tile_center shift having exactly zero z and
+the manifest centre beating the .npz's; the emitted
 page's selects and
 img URLs; all five views rendering and being pairwise distinct; `top`
 byte-identical to omitting the parameter; every representation composing with

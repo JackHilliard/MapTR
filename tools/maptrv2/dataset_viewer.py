@@ -893,6 +893,12 @@ VIEW_LABELS = {
 # highest returns are not clipped by the axis line itself.
 VIEW_Z_PAD = 1.0
 
+# 3D tab: polyline tube DIAMETER in metres (the UI control and the geometry's
+# radius are related by 2x -- see the line_width handler). Named here so the
+# web form, the /view3d launcher and the re-exec'd child process cannot drift
+# apart; they used to hardcode 0.30 and 0.15 in three places.
+LINE_WIDTH_DEFAULT = 0.27
+
 
 def project_view(xyz, view):
     """Project (N, 3) world points onto one view's 2D screen plane.
@@ -1242,7 +1248,8 @@ def _hex_rgb(h):
 def build_o3d_scene(name, ds, frame='offset', color='rgb',
                      max_points=400000, classes=None, results_path=None,
                      score_thresh=0.0, top_n=None, show_gt=True,
-                     show_pred=True, line_radius=0.15, line_lift=0.5):
+                     show_pred=True, line_radius=LINE_WIDTH_DEFAULT / 2.0,
+                     line_lift=0.5):
     """Everything the 3D window draws, as plain numpy. No open3d here.
 
     Returns None if the tile cannot be loaded, else a dict of
@@ -1255,7 +1262,7 @@ def build_o3d_scene(name, ds, frame='offset', color='rgb',
         feat = np.asarray(block['features'])
         labels = (np.asarray(block['labels']).astype(np.int64).ravel()
                   if 'labels' in block else None)
-        origin, shift, _center = tile_frame(block, frame)
+        origin, shift, _center = tile_frame(block, frame, name, ds)
         radius = (float(block['tile_radius']) if 'tile_radius' in block
                   else 12.5)
     finally:
@@ -1651,7 +1658,18 @@ def style_axes(ax, xlim, ylim, grid=True):
         ax.hlines(ticks_along(ylim, step), xlim[0], xlim[1], **style)
 
 
-def tile_frame(block, frame):
+def manifest_center(name, ds):
+    """The tile's centre as the MANIFEST states it, or None.
+
+    This is the source the converter reads, and it is not always the same
+    shape as the block's own `tile_center` -- see tile_frame().
+    """
+    t = tile_by_uid(f'{ds}/{name}') if ds else None
+    c = (t or {}).get('center')
+    return np.asarray(c, dtype=np.float64).ravel() if c is not None else None
+
+
+def tile_frame(block, frame, name=None, ds=None):
     """(origin, shift, center) for one block in the chosen frame.
 
     * origin -- the 3-vector everything is expressed relative to. Under
@@ -1664,10 +1682,24 @@ def tile_frame(block, frame):
 
     Shared by the 2D renderer and the 3D scene builder so the two can never
     disagree about where a tile is. See FRAMES.
+
+    **The MANIFEST's centre wins over the block's own `tile_center`** when
+    `name`/`ds` are given, because the manifest is what the converter reads,
+    and on `../carla_test` the two are not the same shape: the manifest
+    states `center` as 2D `[x, y]` while the `.npz` carries a 3D
+    `tile_center` with its own z. Under GeMap's z rule (see
+    tile_center_origin) a 2D centre keeps the block's z, giving a shift with
+    **exactly zero** z component -- which is what the pkl's
+    `lidar_recenter_shift` records and therefore what the model is trained
+    on. Reading the 3D `tile_center` instead applied a small z shift the
+    dataloader never applies: measured at up to 0.206 m over 40 tiles, so
+    every side view was drawn a few centimetres off the frame the model sees.
+    xy is unaffected -- both sources agree there.
     """
     block_offset = np.asarray(block['offset'], dtype=np.float64)
-    tile_center = (np.asarray(block['tile_center'], dtype=np.float64)
-                    if 'tile_center' in block else None)
+    tile_center = manifest_center(name, ds)
+    if tile_center is None and 'tile_center' in block:
+        tile_center = np.asarray(block['tile_center'], dtype=np.float64)
     origin = (tile_center_origin(tile_center, block_offset)
               if frame == 'tile_center' else block_offset)
     shift = (block_offset - origin).astype(np.float32)
@@ -1759,7 +1791,7 @@ def _render_tile(name, mode, show_polylines,
     # by a mean of ~2.4m, which is what the old converter got wrong.
     if view not in VIEW_PROJ:
         view = 'top'
-    origin, shift, center = tile_frame(block, frame)
+    origin, shift, center = tile_frame(block, frame, name, ds)
     # `shift` is exactly zero in the 'offset' frame, and these arrays run to
     # 5M points, so skip the copy rather than adding zero to all of them.
     # All three columns are carried now, not just xy: a side view reads z,
@@ -2474,7 +2506,7 @@ def view3d_page():
     # Diameter in the UI (what you actually see), radius in the geometry.
     line_width = max(0.02, min(3.0,
                                 _safe_float(request.args.get('line_width'),
-                                             0.30)))
+                                             LINE_WIDTH_DEFAULT)))
     line_lift = max(0.0, min(20.0,
                               _safe_float(request.args.get('line_lift'), 0.5)))
     results = request.args.get('results') or ''
@@ -6340,12 +6372,15 @@ def parse_args():
                          '(or under val/<work-dir>, where the training eval '
                          'hook writes them)')
     p.add_argument(
-        '--frame', default='auto', choices=('auto',) + FRAMES,
+        '--frame', default='tile_center', choices=('auto',) + FRAMES,
         help="which origin tiles, GT and predictions are drawn relative to. "
-             "'auto' (default) reads it back from the selected GT pkl, which "
-             "is what makes a GeMap run -- converted with --gt-frame "
-             "tile_center -- line up without being told. Overridable per "
-             "page.")
+             "Default 'tile_center': the tile centred on 0, which is what "
+             "every current config trains in (LoadCarlaPointsFromFile "
+             "recenter=True). 'auto' instead reads the frame back from the "
+             "selected GT pkl, which is what makes a GeMap run -- converted "
+             "with --gt-frame tile_center -- line up without being told; it "
+             "falls back to 'offset' when no GT is selected, which is why it "
+             "is no longer the default. Overridable per page.")
     p.add_argument(
         '--o3d-spec', default=None,
         help=argparse.SUPPRESS)   # internal: set by the 3D tab's launcher
@@ -6491,7 +6526,7 @@ def main():
             top_n=spec.get('top_n'),
             show_gt=spec.get('show_gt', True),
             show_pred=spec.get('show_pred', True),
-            line_radius=spec.get('line_radius', 0.15),
+            line_radius=spec.get('line_radius', LINE_WIDTH_DEFAULT / 2.0),
             line_lift=spec.get('line_lift', 0.5))
         if scene is None:
             raise SystemExit(f'could not load tile {spec["ds"]}/{spec["name"]}')

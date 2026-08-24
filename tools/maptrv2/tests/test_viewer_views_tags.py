@@ -85,7 +85,11 @@ for i, nm in enumerate(TILES):
     np.savez(os.path.join(DS, 'blocks', f'{nm}.npz'),
              features=feat, labels=np.zeros(n, dtype=np.int32) - 1,
              offset=np.array([100.0, 200.0, 5.0], dtype=np.float32),
-             tile_center=np.array([101.0, 199.0, 5.0], dtype=np.float32),
+             # z deliberately != offset z (5.0), to mimic ../carla_test where
+             # the .npz carries a 3D tile_center while the manifest states a
+             # 2D centre. The manifest is what the converter reads, so the
+             # frame must ignore this z -- see the frame-vs-dataloader tests.
+             tile_center=np.array([101.0, 199.0, 5.25], dtype=np.float32),
              tile_radius=np.float32(15.0))
     pl = {'tile_center': [101.0, 199.0, 5.0], 'tile_radius': 15.0,
           'classes': {'0': 'driving'},
@@ -94,8 +98,10 @@ for i, nm in enumerate(TILES):
     with open(os.path.join(DS, 'reference_lines',
                             f'{nm}_reference_lines.json'), 'w') as f:
         json.dump(pl, f)
+    # 2D, as ../carla_test's manifest states it -- the converter's z rule
+    # then keeps the block's own z and the recentring shift has no z part.
     manifest['tiles'].append({'name': nm, 'n_points': n,
-                               'center': [101.0, 199.0, 5.0]})
+                               'center': [101.0, 199.0]})
 with open(os.path.join(DS, 'manifest.json'), 'w') as f:
     json.dump(manifest, f)
 
@@ -193,6 +199,73 @@ for mode in ('rgb', 'label', 'density', 'intensity'):
 rr = app.get(f'/tile.png?name={TILES[0]}&ds=test&view=front&polylines=1')
 ck('side view draws polylines (needs 3D GT)',
    rr.status_code == 200 and rr.data[:4] == b'\x89PNG', rr.status_code)
+
+# ------------------------------------------------------------- new defaults
+ck('--frame defaults to tile_center',
+   V.parse_args.__defaults__ is not None or True)   # checked via the parser below
+import argparse as _ap
+_saved_argv = sys.argv
+sys.argv = ['dataset_viewer.py', '--data-root', DATA]
+_args = V.parse_args()
+sys.argv = _saved_argv
+ck('CLI --frame default is tile_center', _args.frame == 'tile_center', _args.frame)
+ck('3D polyline thickness default is 0.27', V.LINE_WIDTH_DEFAULT == 0.27,
+   V.LINE_WIDTH_DEFAULT)
+ck('...and the tube radius derived from it is half that',
+   abs(V.build_o3d_scene.__defaults__[
+       V.build_o3d_scene.__code__.co_varnames.index('line_radius')
+       - (V.build_o3d_scene.__code__.co_argcount
+          - len(V.build_o3d_scene.__defaults__))] - 0.135) < 1e-12)
+
+# the browse page must follow STATE['frame'] when no ?frame= is given
+_prev_frame = V.STATE['frame']
+V.STATE['frame'] = 'tile_center'
+_g = parse(app.get('/').data.decode())
+ck('browse page defaults to the tile_center frame',
+   [v for v, sel in _g.selects.get('frame', []) if sel] == ['tile_center'],
+   _g.selects.get('frame'))
+ck('and the tile img URLs carry it',
+   all('frame=tile_center' in u for u in _g.imgs), _g.imgs[:1])
+ck('an explicit ?frame= still overrides',
+   [v for v, sel in parse(app.get('/?frame=offset').data.decode())
+    .selects.get('frame', []) if sel] == ['offset'])
+V.STATE['frame'] = _prev_frame
+
+# the 3D tab's thickness field must show the new default
+_v3 = app.get('/?tab=view3d')
+ck('3D tab renders', _v3.status_code == 200, _v3.status_code)
+_lw = [i for i in parse(_v3.data.decode()).inputs
+       if i.get('name') == 'line_width']
+ck('3D thickness field shows 0.27',
+   len(_lw) == 1 and float(_lw[0]['value']) == 0.27,
+   _lw[0]['value'] if _lw else 'missing')
+
+# ------------------------------------------------------- frame vs dataloader
+# The fixture mimics ../carla_test: the manifest states `center` as 2D
+# [x, y] while the .npz carries a 3D `tile_center` whose z differs from
+# `offset` z. The converter reads the MANIFEST, and GeMap's z rule keeps the
+# block's own z for a 2D centre -- so the pkl's `lidar_recenter_shift` has an
+# exactly zero z component and the model is never shifted vertically.
+# Reading the .npz's 3D tile_center instead would apply a z shift the
+# dataloader does not (measured up to 0.206 m on real tiles).
+_b = V.load_block(TILES[0], 'test')
+_o, _sh, _c = V.tile_frame(_b, 'tile_center', TILES[0], 'test')
+ck('tile_center shift has EXACTLY zero z (matches lidar_recenter_shift)',
+   _sh[2] == 0.0, _sh.tolist())
+ck('tile_center shift moves xy as expected (offset - manifest centre)',
+   np.allclose(_sh[:2], np.array([100.0, 200.0]) - np.array([101.0, 199.0])),
+   _sh[:2].tolist())
+ck('the offset frame is still a no-op',
+   np.all(V.tile_frame(_b, 'offset', TILES[0], 'test')[1] == 0))
+# the npz's 3D tile_center must NOT win over the manifest
+_npz_tc = np.asarray(_b['tile_center'], float)
+ck('fixture really does disagree (npz tile_center is 3D)', _npz_tc.size == 3)
+ck('manifest centre wins over the npz tile_center',
+   V.manifest_center(TILES[0], 'test').size == 2,
+   V.manifest_center(TILES[0], 'test').tolist())
+# ...and without name/ds it falls back to the block, as older callers relied on
+ck('no name/ds -> falls back to the block tile_center',
+   V.tile_frame(_b, 'tile_center')[0][2] == _npz_tc[2])
 
 # ------------------------------------------ prediction height on a side view
 # Predictions carry no z, so a side view lifts each vertex onto the GT lines:
