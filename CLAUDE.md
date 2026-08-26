@@ -912,6 +912,55 @@ epoch warming up. On the 4103-tile CARLA train set at batch 22 that's
 `warmup_iters ≈ 110` to match the upstream fraction. General form:
 `warmup_iters ≈ 0.6 × 4103/samples_per_gpu`.
 
+### The LR is derivable from the batch: `..._nocolour_lr.py` (2026-08-25)
+
+`maptrv2_carla_r50_24ep_lidar_30m_HM_tilecenter_nocolour_lr.py` is a thin
+overlay on the `_nocolour` HM config that computes `optimizer.lr` and
+`lr_config.warmup_iters` from `samples_per_gpu x num_gpus` instead of
+hardcoding them. It changes **exactly those two numbers** — `model`,
+all four pipelines, `ann_file`, `map_ann_file`, `total_epochs`, `fp16` and
+`grad_clip` are byte-identical to the parent, so the GT is unchanged and
+**checkpoints ARE comparable** with the parent's (unlike the frame and
+colour overlays).
+
+Why it exists: the HM chain's `lr=1e-4` mirrors the Pointcept source and has
+an **unstated reference batch**, which is the dangerous kind — an LR only
+means something paired with the batch it was tuned at. The repo's own anchor
+is stated (6e-4 at effective batch 32; see the section above), so that is
+what this scales from, `sqrt` by default. At `samples_per_gpu=4` on one GPU
+it resolves to **2.121e-4** (parent 1e-4) and `warmup_iters` **569** (parent
+500).
+
+Three things worth knowing before using it:
+
+- **`num_gpus` is stated in the config and cannot be derived.** mmcv never
+  records how many GPUs a run will use. Do **not** reach for
+  `tools/train.py --autoscale-lr` instead: it multiplies by
+  `len(gpu_ids)/8` (`train.py:161`), silently dividing the LR by 8 on a
+  single GPU.
+- **`n_train_tiles` is a stand-in.** `warmup_iters` needs the split's tile
+  count, which is a property of the pkl and mmcv never opens one. It is set
+  to `../carla_test`'s 3795 because the `30m_tc` train pkl the parent names
+  **does not exist yet** — update it when that split is generated.
+- **It does not settle whether 6e-4@32 transfers to the HM objective.** The
+  loss is `PolylineGeomLoss` mode `emd`, not the baseline's `PtsL1Loss`, and
+  a different loss surface can want a different step size regardless of
+  batch. The config picks the defensible default and makes the assumption
+  legible; it is not a measurement.
+
+`samples_per_gpu` is set on `data` from the same variable the LR is derived
+from, so editing one line moves both and they cannot drift apart.
+`--cfg-options optimizer.lr=...` still wins over the derivation (verified),
+since `tools/train.py:108` merges after `_base_` resolution.
+
+**Verified**: 27 assertions through `Config.fromfile` — the derived values,
+`lr` being a genuine `float` (mmcv's `DictAction` uses `literal_eval`, so
+`3e-4` and `0.0003` both parse; a string would reach AdamW and fail
+confusingly), no `paramwise_cfg` anywhere in this LiDAR chain so the value
+reaches every parameter group, `model`/pipelines/ann_files/`evaluation`
+identical to the parent, `--cfg-options` still overriding, and
+`lr_rule='linear'` reachable and giving a different answer.
+
 ## Resuming with an extended `total_epochs` shocks the LR schedule
 
 Confirmed in the installed mmcv source (`lr_updater.py`):
