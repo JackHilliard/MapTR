@@ -486,8 +486,11 @@ class LoadCarlaPointsFromFile(object):
             ``'LIDAR'``, ``'DEPTH'``, ``'CAMERA'``. Defaults to ``'LIDAR'``.
         load_dim (int): Number of columns produced before selection
             (``x, y, z, strength``). Defaults to 4.
-        use_dim (int | list[int]): Which of those columns to keep. Defaults to
-            4 (all of them).
+        use_dim (int | list[int]): Which of those columns to keep. Defaults
+            to 3 (xyz only -- the project's colour-free convention; CARLA's
+            RGB is a rendering property, not a LiDAR return). Whatever this
+            is set to must match the model's ``SparseEncoder.in_channels``.
+            Pass 4 to keep the strength channel too.
         z_max (float | None): Drop points with ``z`` greater than this value
             (mirrors the Pointcept ``z <= 15.0`` filter). Set to ``None`` to
             disable. Defaults to 15.0.
@@ -498,19 +501,21 @@ class LoadCarlaPointsFromFile(object):
             relative to the block's own ``offset``; with
             ``--gt-frame tile_center`` the annotations are relative to the
             tile centre instead, and the two frames differ by 1-2m on the
-            25m export and up to ~17m on the 60m one -- enough to misplace
+            25m export and up to ~117m on newer ones -- enough to misplace
             every polyline against chamfer thresholds of 0.5/1.0/1.5m.
-            A missing/zero shift is a no-op, so this is safe to leave on;
-            it only errors if a pkl predating the field is used with a
-            ``tile_center`` config. Defaults to False.
+            A zero shift (an offset-frame pkl from the current converter)
+            is a no-op, so this is safe to leave on; it only errors if a
+            pkl predating the field is used. Defaults to True -- the
+            tile_center frame is the project-wide convention and the
+            converter's default ``--gt-frame``.
     """
 
     def __init__(self,
                  coord_type='LIDAR',
                  load_dim=4,
-                 use_dim=4,
+                 use_dim=3,
                  z_max=15.0,
-                 recenter=False):
+                 recenter=True):
         if isinstance(use_dim, int):
             use_dim = list(range(use_dim))
         assert max(use_dim) < load_dim, \

@@ -274,10 +274,13 @@ class CustomCarlaLocalMapDataset(Custom3DDataset):
             # Frame bookkeeping. `annotation_origin` is whatever the converter
             # subtracted from the world-frame polylines; `lidar_recenter_shift`
             # is what LoadCarlaPointsFromFile(recenter=True) must add to the
-            # stored points to reach that same frame (all-zero, hence inert,
-            # for the default `offset` frame). Absent from pkls generated
-            # before --gt-frame existed; the loader raises a clear error if it
-            # is asked to recentre without one.
+            # stored points to reach that same frame -- the `tile_center`
+            # frame is the converter's default and the project convention
+            # (all-zero, hence inert, under an `offset`-frame pkl). Absent
+            # from pkls generated before --gt-frame existed; the loader
+            # raises a clear error if asked to recentre without one. The
+            # 'offset' fallback below describes those old pkls, which never
+            # recorded a frame.
             annotation_origin=info.get('annotation_origin'),
             gt_frame=info.get('gt_frame', 'offset'),
             lidar_recenter_shift=info.get('lidar_recenter_shift'),

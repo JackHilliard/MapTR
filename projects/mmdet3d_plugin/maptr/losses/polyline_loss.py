@@ -61,7 +61,7 @@ export both exist. Two consequences, handled in two different places:
    absolute quantity (`cwot_eps`) mean a different number of metres.
    Handled **in the config**, by deriving `loss_weight` and `cwot_eps`
    from a `tile_size` variable rather than hardcoding them; see
-   `maptrv2_carla_r50_24ep_lidar_HM.py`.
+   `maptrv2_carla_r50_24ep_lidar_30m_HM.py`.
 
    Mind the homogeneity degrees when doing that, because they are not all
    the same: `exact_emd_loss` and every `pgf_*` term are degree 1, but

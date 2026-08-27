@@ -1,4 +1,4 @@
-"""Colour-free 30m tile-centred HM (polyline geometry) config with the query
+"""30m HM (polyline geometry) config with the query
 budget restored to the non-HM baseline's: num_vec_one2one=50 (parent: 25).
 
 The parent's cut to 25 mirrored the Pointcept config and was never tuned.
@@ -11,7 +11,7 @@ Three values are coupled to it and must move together:
     its own 25.
 """
 
-_base_ = ['./maptrv2_carla_r50_24ep_lidar_30m_HM_tilecenter_nocolour.py']
+_base_ = ['./maptrv2_carla_r50_24ep_lidar_30m_HM.py']
 
 num_vec_one2one = 50
 num_vec_one2many = num_vec_one2one * 6

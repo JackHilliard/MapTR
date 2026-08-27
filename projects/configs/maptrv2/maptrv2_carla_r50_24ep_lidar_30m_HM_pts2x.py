@@ -1,4 +1,4 @@
-"""Colour-free 30m tile-centred HM (polyline geometry) config with the EMD
+"""30m HM (polyline geometry) config with the EMD
 point loss weight doubled: base 2.0 -> 4.0 before tile scaling.
 
 4.0 is the value the HM base's own Pointcept-comparison note derives for
@@ -12,7 +12,7 @@ The matching-cost weight is untouched: in cost_mode='emd' it is inert
 (median-normalised inside PolylineGeomCost), per the HM base's comment.
 """
 
-_base_ = ['./maptrv2_carla_r50_24ep_lidar_30m_HM_tilecenter_nocolour.py']
+_base_ = ['./maptrv2_carla_r50_24ep_lidar_30m_HM.py']
 
 ref_tile_size = 25.0
 tile_size = 30.0

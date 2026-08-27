@@ -1,11 +1,10 @@
-"""Two-class (driving / curb) variant of the 30m tile-centred CARLA config.
+"""Two-class (driving / curb) variant of the 30m CARLA LiDAR config.
 
-Stands to `maptrv2_carla_r50_24ep_lidar_30m_tilecenter.py` as that file
-stands to the plain 30m one: a thin overlay changing exactly one axis. Here
-that axis is the map TAXONOMY. Everything else -- tile size, the
-tile-centred frame, `sparse_shape`, `bev_h_`/`bev_w_`, the coder/assigner
-ranges, the pipelines (actor augmentation included) and the schedule --
-stays bound in the parent chain and is deliberately not restated.
+A thin overlay on `maptrv2_carla_r50_24ep_lidar_30m.py` changing exactly one
+axis: the map TAXONOMY. Everything else -- tile size, the tile_center frame,
+the colour-free loaders, `sparse_shape`, `bev_h_`/`bev_w_`, the
+coder/assigner ranges, the pipelines (actor augmentation included) and the
+schedule -- stays bound in the parent and is deliberately not restated.
 
 --- What changes ---
 
@@ -34,12 +33,9 @@ That requires four things to agree, and they are all set below:
 Note the classes are NOT a subset relabelling of the old `divider` set: with
 `--map-classes` only the two NAMED export classes are kept, and anything else
 the export carries is dropped rather than merged. `../carla_test` publishes
-exactly these two, so nothing is lost there; on the Town10HD grid export,
-which also has `road_edge`, `lane_divider`, `center_divider`,
-`sidewalk_edge`, `median` and `crosswalk`, it keeps 299 + 135 of 1251
-polylines. To fold road edges into curbs, say `curb=curb,road_edge` in the
-converter flag and regenerate; nothing in this file changes, since the
-grouping lives in the pkl.
+exactly these two, so nothing is lost there. To fold road edges into curbs,
+say `curb=curb,road_edge` in the converter flag and regenerate; nothing in
+this file changes, since the grouping lives in the pkl.
 
 `aux_seg` is left at `seg_classes=1` on purpose. That is the BEV auxiliary
 segmentation head, whose channel count is independent of `num_classes`
@@ -52,22 +48,22 @@ would be, but the seg head's weights change shape -- not comparable).
 --- Generating the pkl ---
 
 The class taxonomy is a property of the DATA, so this pkl is shared with
-`maptrv2_carla_r50_24ep_lidar_30m_HM_tilecenter_2cls.py`, exactly as the
-single-class tile-centre pkl is shared with its HM sibling::
+`maptrv2_carla_r50_24ep_lidar_30m_HM_2cls.py`, exactly as the single-class
+pkl is shared with its HM sibling::
 
     python tools/maptrv2/custom_carla_map_converter.py \\
         --data-root ../carla_test --split test \\
-        --gt-frame tile_center \\
         --map-classes driving curb \\
         --out-dir data/carla/ --out-tag 30m_tc_2cls
 
-`driving` and `curb` are that export's OWN class names, so the bare-name
-shorthand applies; on an export that spells them differently, name the
-mapping (`--map-classes driving=driving_centerline curb=curb`). Note it also
-ships two polyline directories -- an unclassified `reference_lines/` and a
-classified `reference_curb_driving_lines/` -- and the converter switches to
-the classified one because `--map-classes` needs a taxonomy, printing the
-`[ref]` line that says so. Pass `--reference-dir` to override.
+(`--gt-frame tile_center` is the converter's default.) `driving` and `curb`
+are that export's OWN class names, so the bare-name shorthand applies; on an
+export that spells them differently, name the mapping
+(`--map-classes driving=driving_centerline curb=curb`). Note it also ships
+several polyline directories -- an unclassified `reference_lines/` and
+classified siblings -- and the converter picks the one whose taxonomy covers
+the requested classes, printing the `[ref]` line that says so. Pass
+`--reference-dir` to override.
 
 **There is no train split yet.** `../carla_test` is test-only, so
 `ann_file_train` below names a pkl that does not exist; convert one the same
@@ -82,14 +78,13 @@ the `offset` frame drops 75 tiles outright and leaves 1282 of the rest under
 
 `--out-tag` is what makes `--out-dir data/carla/` safe: the output filename
 is otherwise a function of `--split` alone, so a second dataset written
-there would overwrite `carla_map_infos_test.pkl` -- the existing 25m
-offset-frame single-class file -- with no warning at all. The tag names the
-three things that differ from it (tile size, frame, taxonomy).
+there would overwrite an existing pkl with no warning. The tag names what
+differs from the plain 25m file (tile size, frame, taxonomy).
 
 Do NOT pass `--lidar-point-cloud-range`: the converter derives xy from the
 manifest's own `tile_radius`/`tile_side` and prints what it resolved, which
-must equal the parent chain's `lidar_point_cloud_range` (+/-15 in xy)
-or the dataset warns at load.
+must equal the parent's `lidar_point_cloud_range` (+/-15 in xy) or the
+dataset warns at load.
 
 Check the converter's `[class]` lines before training: it prints an instance
 count per map class and shouts if one is empty. A class-free export (the
@@ -100,16 +95,15 @@ Checkpoints are not comparable with single-class ones -- the classification
 head has a different output width and the GT is a different set of lines.
 """
 
-_base_ = ['./maptrv2_carla_r50_24ep_lidar_30m_tilecenter.py']
+_base_ = ['./maptrv2_carla_r50_24ep_lidar_30m.py']
 
 # Label order. Everything below, and the converter's --map-classes flag,
 # must list them identically.
 map_classes = ['driving', 'curb']
 num_map_classes = len(map_classes)
 
-# [2cls] Stored alongside the other CARLA pkls rather than in a per-variant
-# subdirectory, so the tag in the filename is the only thing keeping them
-# apart -- see the --out-tag note in the docstring.
+# [2cls] Stored alongside the other CARLA pkls, kept apart by the tag in the
+# filename -- see the --out-tag note in the docstring.
 data_root = 'data/carla/'
 ann_file_train = data_root + 'carla_map_infos_train_30m_tc_2cls.pkl'
 ann_file_val = data_root + 'carla_map_infos_test_30m_tc_2cls.pkl'

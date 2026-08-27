@@ -197,15 +197,19 @@ def parse_args():
     parser.add_argument(
         '--gt-frame',
         type=str,
-        default='offset',
+        default='tile_center',
         choices=['offset', 'tile_center'],
         help="origin every tile's polylines AND point cloud are expressed "
-        "relative to. 'offset' (default) is the block's own `offset` array, "
-        'the frame the raw `features` are already stored in. `tile_center` '
-        "reproduces GeMap's convention: the tile's nominal geometric centre, "
-        'which requires the loader to shift the points by `offset - '
-        'tile_center` at load time (LoadCarlaPointsFromFile(recenter=True), '
-        'wired via the pkl\'s per-sample `lidar_recenter_shift`)')
+        "relative to. 'tile_center' (default, the project-wide convention "
+        "and GeMap's) is the tile's nominal geometric centre, which "
+        'requires the loader to shift the points by `offset - tile_center` '
+        'at load time (LoadCarlaPointsFromFile(recenter=True), wired via '
+        "the pkl's per-sample `lidar_recenter_shift`) -- every current "
+        "training config sets that. 'offset' is the block's own `offset` "
+        'array, the frame the raw `features` are already stored in; it '
+        'crops tiles against the origin-centred lidar_point_cloud_range '
+        '(|offset - tile_center| reaches 117 m on some exports), so use it '
+        'only to reproduce old offset-frame runs')
     parser.add_argument(
         '--no-lidar-check',
         action='store_true',
