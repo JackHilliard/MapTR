@@ -18,10 +18,14 @@ restates the train pipeline in full with the paste step in place.
 --- What the augmentation needs on disk ---
 
 * `actor_catalogue` below: the `catalogue.json` written by
-  `point2vector_data/carla_actor_scan.py` (on this machine:
-  `/gel/usr/johil9/Documents/carla/carla_assets/catalogue.json`,
-  213 assets -- 115 vehicles + 98 pedestrians). On the cluster, override at
-  launch rather than editing the file::
+  `point2vector_data/carla_actor_scan.py`. The path follows the dataset
+  convention -- relative to the repo root, `data/carla_assets/` beside
+  `data/carla/` -- so it resolves the same way on the cluster and locally.
+  Put (or symlink) the WHOLE scan directory there, not just the json: the
+  catalogue references its `vehicles/*.npz` / `pedestrians/*.npz` relative
+  to itself. On this machine the scan lives at
+  `/gel/usr/johil9/Documents/carla/carla_assets/` (213 assets -- 115
+  vehicles + 98 pedestrians). To point somewhere else at launch::
 
       --cfg-options data.train.pipeline.1.catalogue=/path/to/catalogue.json
 
@@ -65,8 +69,9 @@ lidar_point_cloud_range = [-15.0, -15.0, -72.0, 15.0, 15.0, 96.0]
 lidar_voxel_size = [0.1, 0.1, 0.4]
 map_classes = ['divider']
 
-# The scanned actor catalogue -- see the docstring for the cluster override.
-actor_catalogue = '/gel/usr/johil9/Documents/carla/carla_assets/catalogue.json'
+# The scanned actor catalogue, following the dataset path convention
+# (relative to the repo root, beside data/carla/) -- see the docstring.
+actor_catalogue = 'data/carla_assets/catalogue.json'
 
 train_pipeline = [
     dict(
