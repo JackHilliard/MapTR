@@ -77,7 +77,7 @@ train_pipeline = [
     dict(
         type='LoadCarlaPointsFromFile',
         coord_type='LIDAR',
-        load_dim=4,
+        load_dim=3,
         # xyz only + tile_center frame, matching the parent exactly.
         use_dim=3,
         z_max=96.0,

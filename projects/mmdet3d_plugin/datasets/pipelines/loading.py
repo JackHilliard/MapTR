@@ -477,20 +477,24 @@ class LoadCarlaPointsFromFile(object):
 
     Ported from the Pointcept ``CarlaSegDataset``. Each ``.npz`` block stores a
     ``features`` array of shape ``(N, 6)`` (xyz + rgb) and a ``labels`` array.
-    Here we only build the LiDAR point cloud: xyz coordinates plus a scalar
-    "strength" derived from the RGB channels (ITU-R BT.709 luma), matching the
-    original ``strength = rgb @ [0.2126, 0.7152, 0.0722]`` formula.
+    Here we only build the LiDAR point cloud: xyz coordinates, plus -- only
+    when a selected column asks for it -- a scalar "strength" derived from
+    the RGB channels (ITU-R BT.709 luma), matching the original
+    ``strength = rgb @ [0.2126, 0.7152, 0.0722]`` formula. Under the
+    default colour-free ``use_dim=3`` the strength column is never built at
+    all, not built and discarded.
 
     Args:
         coord_type (str): Coordinate frame of the points. One of
             ``'LIDAR'``, ``'DEPTH'``, ``'CAMERA'``. Defaults to ``'LIDAR'``.
-        load_dim (int): Number of columns produced before selection
-            (``x, y, z, strength``). Defaults to 4.
+        load_dim (int): Number of columns available for selection
+            (``x, y, z[, strength]``). Defaults to 3, matching the default
+            ``use_dim``; pass ``load_dim=4, use_dim=4`` together to keep the
+            strength channel.
         use_dim (int | list[int]): Which of those columns to keep. Defaults
             to 3 (xyz only -- the project's colour-free convention; CARLA's
             RGB is a rendering property, not a LiDAR return). Whatever this
             is set to must match the model's ``SparseEncoder.in_channels``.
-            Pass 4 to keep the strength channel too.
         z_max (float | None): Drop points with ``z`` greater than this value
             (mirrors the Pointcept ``z <= 15.0`` filter). Set to ``None`` to
             disable. Defaults to 15.0.
@@ -512,7 +516,7 @@ class LoadCarlaPointsFromFile(object):
 
     def __init__(self,
                  coord_type='LIDAR',
-                 load_dim=4,
+                 load_dim=3,
                  use_dim=3,
                  z_max=15.0,
                  recenter=True):
@@ -524,6 +528,12 @@ class LoadCarlaPointsFromFile(object):
         self.coord_type = coord_type
         self.load_dim = load_dim
         self.use_dim = use_dim
+        # Whether any selected column needs the strength channel. When not
+        # (the colour-free convention, use_dim=3), the BT.709 matmul over
+        # the full point cloud -- up to 5M points/tile -- is skipped
+        # entirely rather than computed and then discarded by the use_dim
+        # selection, and every downstream copy is a column narrower.
+        self._need_strength = max(self.use_dim) >= 3
         self.z_max = z_max
         self.recenter = recenter
         # ITU-R BT.709 luma weights, as in the original Pointcept dataset.
@@ -535,9 +545,12 @@ class LoadCarlaPointsFromFile(object):
         block = np.load(pts_filename)
         features = block['features']
         coord = features[:, 0:3].astype(np.float32)
-        strength = (features[:, 3:6].astype(np.float32)
-                    @ self._rgb2strength).reshape([-1, 1])
-        points = np.concatenate([coord, strength], axis=1)
+        if self._need_strength:
+            strength = (features[:, 3:6].astype(np.float32)
+                        @ self._rgb2strength).reshape([-1, 1])
+            points = np.concatenate([coord, strength], axis=1)
+        else:
+            points = coord
         if self.z_max is not None:
             points = points[points[:, 2] <= self.z_max]
         return points

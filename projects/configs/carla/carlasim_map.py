@@ -43,12 +43,12 @@ map_ann_file = data_root + 'carla_map_gt_tc.json'
 point_cloud_range = [-12.5, -12.5, -2.0, 12.5, 12.5, 24.0]
 map_classes = ['divider']
 
-# The loader builds [x, y, z, strength] (strength = BT.709 luma of the
-# stored RGB) and use_dim=3 then keeps xyz only -- the colour-free
-# convention: CARLA's RGB is a rendering property, not a LiDAR return, and
-# a model leaning on it may not transfer. load_dim stays 4 because the
-# strength column is built before selection.
-load_dim = 4
+# xyz only -- the colour-free convention: CARLA's RGB is a rendering
+# property, not a LiDAR return, and a model leaning on it may not transfer.
+# With load_dim=3 the loader never builds the BT.709 strength column at all
+# (it used to build it and then discard it via use_dim); pass
+# load_dim=4, use_dim=4 together to keep the channel.
+load_dim = 3
 use_dim = 3
 # Some tiles (confirmed: 6 in the full remote train set, all town03) contain
 # LiDAR returns spanning 100+ meters in z within a single 25m x 25m tile --
