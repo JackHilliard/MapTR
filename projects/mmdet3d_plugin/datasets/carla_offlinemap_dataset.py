@@ -82,6 +82,7 @@ class CustomCarlaLocalMapDataset(Custom3DDataset):
                  eval_nproc=8,
                  min_lidar_points=1,
                  lidar_pc_range=None,
+                 raw_data_root=None,
                  classes=None,
                  modality=None,
                  box_type_3d='LiDAR',
@@ -109,6 +110,13 @@ class CustomCarlaLocalMapDataset(Custom3DDataset):
         self.eval_nproc = eval_nproc
         self.min_lidar_points = min_lidar_points
         self.lidar_pc_range = lidar_pc_range
+        # Join base for the pkl's relative lidar_path entries. Resolution
+        # order (see get_data_info): this explicit value if set, else the
+        # absolute data_root the converter recorded in the pkl, else
+        # data_root. Old pkls stored absolute lidar_paths, on which the join
+        # is a no-op, so every combination keeps loading.
+        self.raw_data_root = raw_data_root
+        self._pkl_data_root = None  # set by load_annotations
         # Counts consecutive samples skipped by the runtime empty-tile guard
         # in prepare_train_data -- see the comment there.
         self._consecutive_empty_skips = 0
@@ -134,6 +142,12 @@ class CustomCarlaLocalMapDataset(Custom3DDataset):
 
     def load_annotations(self, ann_file):
         data = mmcv.load(ann_file, file_format='pkl')
+        # Only trust the recorded data_root when it exists here: pkls
+        # converted on another machine (or inside a container) record that
+        # machine's path, and older converters recorded relative ones.
+        pkl_root = data.get('data_root')
+        self._pkl_data_root = pkl_root if (
+            pkl_root and os.path.isdir(pkl_root)) else None
         samples = sorted(data['samples'], key=lambda e: e['sample_idx'])
         self._check_map_classes(samples, data.get('map_classes'))
         return self._filter_empty_lidar_tiles(samples,
@@ -259,8 +273,16 @@ class CustomCarlaLocalMapDataset(Custom3DDataset):
 
     def get_data_info(self, index):
         info = self.data_infos[index]
+        # lidar_path is stored relative to the converter's --data-root
+        # (since 2026-08-28), so one pkl works across containers, mounts and
+        # the sibling repos. Base: explicit raw_data_root, else the absolute
+        # data_root recorded in the pkl, else data_root. os.path.join is a
+        # no-op on the absolute paths older pkls stored, so any base is
+        # harmless for those.
+        pts_base = (self.raw_data_root or self._pkl_data_root
+                    or self.data_root or '')
         return dict(
-            pts_filename=info['lidar_path'],
+            pts_filename=os.path.join(pts_base, info['lidar_path']),
             sample_idx=info['sample_idx'],
             timestamp=info.get('timestamp', index),
             # Static tiles have no ego motion / temporal chain; these are
