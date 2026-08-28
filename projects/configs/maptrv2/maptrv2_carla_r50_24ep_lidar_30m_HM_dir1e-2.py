@@ -1,5 +1,5 @@
-"""Colour-free 30m tile-centred HM (polyline geometry) config with a
-non-zero direction loss: loss_dir weight 0.1 (parent: 0.0, mirroring
+"""30m HM (polyline geometry) config with a
+non-zero direction loss: loss_dir weight 0.01 (parent: 0.0, mirroring
 Pointcept, where the term is dead code).
 
 Part of a sweep {0.005, 0.01, 0.1, 0.5}. The EMD point loss is
@@ -12,10 +12,10 @@ the chamfer eval's order-sensitive resampling currently flatters the
 zigzag by ~0.04 mAP, so part of a genuine fix will not show in the score.
 """
 
-_base_ = ['./maptrv2_carla_r50_24ep_lidar_30m_HM_tilecenter_nocolour.py']
+_base_ = ['./maptrv2_carla_r50_24ep_lidar_30m_HM.py']
 
 model = dict(
     pts_bbox_head=dict(
-        loss_dir=dict(type='PtsDirCosLoss', loss_weight=0.1),
+        loss_dir=dict(type='PtsDirCosLoss', loss_weight=0.01),
     ),
 )

@@ -11,6 +11,13 @@ _base_ = [
 # output instead of camera features (LSSTransform), which MapTRv2
 # otherwise always requires.
 #
+# Project-wide conventions (2026-08-27, see CLAUDE.md): the GT frame is
+# `tile_center` (pkl converted with the converter's default --gt-frame,
+# loader recenter=True) and the point cloud is COLOUR-FREE (use_dim=3 on
+# the loader, in_channels=3 on the SparseEncoder -- the two must move
+# together). The former offset-frame / colour-carrying variants are gone;
+# checkpoints trained under them are not comparable with this config.
+#
 plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'
 
@@ -89,7 +96,13 @@ model = dict(
             max_voxels=[90000, 120000]),
         backbone=dict(
             type='SparseEncoder',
-            in_channels=4,  # CARLA points are xyz + strength (not nuScenes' xyz+intensity+ring=5)
+            # xyz only -- the colour-free convention. Must match the
+            # loaders' use_dim=3: set one without the other and the first
+            # sparse conv sees a 3-channel input against a 4-channel
+            # weight (or vice versa) and dies at the first iteration.
+            # sparse_shape and lidar_bev_proj.in_channels do NOT depend on
+            # this width -- verified with a dummy extract_lidar_feat().
+            in_channels=3,
             # (x, y, z) order -- confirmed against the working nuScenes
             # fusion config's sparse_shape=[300,600,41] for a 30x60x8m
             # range at the same voxel resolution. z re-measured for the
@@ -289,9 +302,14 @@ train_pipeline = [
     dict(
         type='LoadCarlaPointsFromFile',
         coord_type='LIDAR',
-        load_dim=4,
-        use_dim=4,
-        z_max=96.0),
+        load_dim=3,
+        # xyz only (colour-free convention) -- must match the model's
+        # SparseEncoder in_channels=3 above.
+        use_dim=3,
+        z_max=96.0,
+        # tile_center frame -- the pkl (converter default) records the
+        # per-sample `lidar_recenter_shift` this applies.
+        recenter=True),
     dict(
         type='GridSamplePoints',
         grid_size=lidar_voxel_size,
@@ -313,11 +331,12 @@ test_pipeline = [
     dict(
         type='LoadCarlaPointsFromFile',
         coord_type='LIDAR',
-        load_dim=4,
-        use_dim=4,
+        load_dim=3,
+        use_dim=3,
         # Kept in sync with carlasim_map.py's own z_max and this file's
         # lidar_point_cloud_range z upper bound -- see the comments there.
-        z_max=96.0),
+        z_max=96.0,
+        recenter=True),
     dict(
         type='GridSamplePoints',
         grid_size=lidar_voxel_size,

@@ -1,10 +1,10 @@
-"""Colour-free 30m tile-centred HM (polyline geometry) config combining the
+"""30m HM (polyline geometry) config combining the
 two rebalancing ablations: classification weight 2.0 (see `_cls2`) and the
 EMD point loss weight doubled to 4.0 x tile_scale (see `_pts2x`). Comments
 and caveats live in those two single-variable siblings.
 """
 
-_base_ = ['./maptrv2_carla_r50_24ep_lidar_30m_HM_tilecenter_nocolour.py']
+_base_ = ['./maptrv2_carla_r50_24ep_lidar_30m_HM.py']
 
 ref_tile_size = 25.0
 tile_size = 30.0

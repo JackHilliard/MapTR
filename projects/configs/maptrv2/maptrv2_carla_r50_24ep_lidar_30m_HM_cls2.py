@@ -1,4 +1,4 @@
-"""Colour-free 30m tile-centred HM (polyline geometry) config with the
+"""30m HM (polyline geometry) config with the
 classification weight restored to the non-HM baseline's 2.0 (parent: 1.0,
 mirroring Pointcept's loss_ce_weight).
 
@@ -8,7 +8,7 @@ shifts the MATCHING balance -- geometry:class goes from 1:1 to 1:2, since
 the EMD cost is median-normalised to ~1.0.
 """
 
-_base_ = ['./maptrv2_carla_r50_24ep_lidar_30m_HM_tilecenter_nocolour.py']
+_base_ = ['./maptrv2_carla_r50_24ep_lidar_30m_HM.py']
 
 model = dict(
     pts_bbox_head=dict(

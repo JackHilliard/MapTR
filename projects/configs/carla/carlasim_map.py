@@ -9,9 +9,12 @@ _base_ = [
 # tools/maptrv2/custom_carla_map_converter.py, instead of `CarlaSegDataset`'s
 # raw (GT-free) directory scan.
 #
-# Generate the pkl first:
+# Generate the pkl first (the converter defaults to the tile_center GT
+# frame, matching the recenter=True loaders below; the `_tc` tag keeps the
+# file apart from any older offset-frame pkl):
 #   python tools/maptrv2/custom_carla_map_converter.py \
-#       --data-root /path/to/carla --out-dir data/carla/ --split test
+#       --data-root /path/to/carla --out-dir data/carla/ --split test \
+#       --out-tag tc
 #
 plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'
@@ -24,10 +27,15 @@ data_root = 'data/carla/'
 # the same caveat). For the full remote-cluster dataset, re-run the
 # converter with --data-root pointed at the full dataset and update these
 # to real train/val pkls -- no code changes needed.
-ann_file_train = data_root + 'carla_map_infos_train.pkl'
-ann_file_val = data_root + 'carla_map_infos_test.pkl'
-ann_file_test = data_root + 'carla_map_infos_test.pkl'
-map_ann_file = data_root + 'carla_map_gt.json'
+# `_tc` = tile_center GT frame, the project-wide convention (see CLAUDE.md's
+# 2026-08-27 section): polylines AND points are expressed relative to the
+# tile's nominal centre, not the block's `offset` (the cloud centroid). The
+# two differ by 1-2 m on this 25 m export and by up to 117 m on newer ones,
+# which crops tiles against the origin-centred lidar_point_cloud_range.
+ann_file_train = data_root + 'carla_map_infos_train_tc.pkl'
+ann_file_val = data_root + 'carla_map_infos_test_tc.pkl'
+ann_file_test = data_root + 'carla_map_infos_test_tc.pkl'
+map_ann_file = data_root + 'carla_map_gt_tc.json'
 
 # Matches the real 25m x 25m square CARLA tile (tile_radius=12.5); z-range
 # is generous since map GT (divider polylines) is XY-only for code_size=2
@@ -35,9 +43,13 @@ map_ann_file = data_root + 'carla_map_gt.json'
 point_cloud_range = [-12.5, -12.5, -2.0, 12.5, 12.5, 24.0]
 map_classes = ['divider']
 
-# LiDAR points are [x, y, z, strength].
-load_dim = 4
-use_dim = 4
+# xyz only -- the colour-free convention: CARLA's RGB is a rendering
+# property, not a LiDAR return, and a model leaning on it may not transfer.
+# With load_dim=3 the loader never builds the BT.709 strength column at all
+# (it used to build it and then discard it via use_dim); pass
+# load_dim=4, use_dim=4 together to keep the channel.
+load_dim = 3
+use_dim = 3
 # Some tiles (confirmed: 6 in the full remote train set, all town03) contain
 # LiDAR returns spanning 100+ meters in z within a single 25m x 25m tile --
 # almost certainly a highway overpass/multi-level structure, not a flat
@@ -59,7 +71,13 @@ train_pipeline = [
         coord_type='LIDAR',
         load_dim=load_dim,
         use_dim=use_dim,
-        z_max=z_max),
+        z_max=z_max,
+        # Shift the stored points (always written in the `offset` frame)
+        # into the tile_center frame the GT is expressed in, via the pkl's
+        # per-sample `lidar_recenter_shift`. Must stay paired with the
+        # `_tc` ann files above -- one without the other puts GT metres
+        # away from its own point cloud.
+        recenter=True),
     dict(
         type='DefaultFormatBundle3D',
         with_gt=False,
@@ -78,7 +96,8 @@ test_pipeline = [
         coord_type='LIDAR',
         load_dim=load_dim,
         use_dim=use_dim,
-        z_max=z_max),
+        z_max=z_max,
+        recenter=True),
     dict(
         type='MultiScaleFlipAug3D',
         img_scale=(1, 1),

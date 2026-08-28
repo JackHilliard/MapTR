@@ -24,6 +24,62 @@ don't renumber them.
   is 4103 tiles / 5 towns; a 30-tile 60 m grid export lives at
   `/gel/usr/johil9/Documents/carla/Town10HD/grid_tiles`.
 
+## Config tree tidied: tile_center + no-colour ARE the convention (2026-08-27)
+
+The `_tilecenter` / `_nocolour` overlay layers were folded into the base
+configs and the obsolete variants deleted, because the tile-centre frame and
+colour-free points were the only versions actually used. **Sections below
+this one predate the rename and use the old file names** — map them through
+this table:
+
+| old (deleted) | now |
+|---|---|
+| `maptrv2_carla_r50_24ep_lidar_tilecenter.py` | `maptrv2_carla_r50_24ep_lidar.py` (also colour-free now) |
+| `..._30m_tilecenter_nocolour.py` | `..._30m.py` |
+| `..._30m_tilecenter_2cls_nocolour.py` | `..._30m_2cls.py` |
+| `..._30m_tilecenter_3cls_nocolour.py` | `..._30m_3cls.py` |
+| `..._30m_HM_tilecenter_nocolour.py` | `..._30m_HM.py` |
+| `..._30m_HM_tilecenter_2cls_nocolour.py` | `..._30m_HM_2cls.py` |
+| `..._30m_HM_tilecenter_3cls_nocolour.py` | `..._30m_HM_3cls.py` |
+| `..._30m_HM_tilecenter_nocolour_<X>.py` (50q, LR3e-4, LR6e-4, cls2, pts2x, cls2_pts2x, dir*) | `..._30m_HM_<X>.py` |
+
+Deleted without replacement (offset-frame / colour-carrying / 25m-HM, none
+in use): `..._30m_tilecenter.py`, `..._30m_tilecenter_2cls.py`,
+`..._30m_HM_tilecenter.py`, `..._30m_HM_tilecenter_2cls.py`,
+`maptrv2_carla_r50_24ep_lidar_HM.py`, `..._HM_pgfcost.py`. Their content
+(incl. the HM benchmarking notes) lives in git history.
+
+What "the convention" means, wired in three places:
+
+- **Configs**: every config has `recenter=True` + `use_dim=3` on the loaders
+  (train, test AND `evaluation.pipeline`) and `SparseEncoder(in_channels=3)`.
+  Ann files keep their existing tagged names (`_30m_tc`, `_30m_tc_2cls`, …),
+  so no data files move; the 25m configs (root + `carlasim_map.py`) now use a
+  `_tc` tag (`carla_map_infos_<split>_tc.pkl`) instead of the old
+  `data/carla/tile_center/` subdirectory — that pkl was never generated
+  locally, so nothing is orphaned. The 30m base also fixes the stale
+  `data.*.data_root='data/carla_30m/'` (inert — pts paths come from the pkl).
+- **Converter**: `--gt-frame` now defaults to `tile_center` (`offset` remains
+  available to reproduce old runs).
+- **Loader**: `LoadCarlaPointsFromFile` defaults flipped to `use_dim=3`,
+  `recenter=True` (configs still state both explicitly).
+  `carlasim_lidar.py` (raw `CarlaSegDataset` browsing, no pkl hence no
+  shift) pins `recenter=False` explicitly.
+
+**Verified** through `Config.fromfile` in the container: all 16 surviving
+30m configs resolve **identically** to their old `_tilecenter_nocolour`
+equivalents (only inert diffs: `DefaultFormatBundle3D.class_names`, read
+only under `with_gt and with_label`, both False; and the corrected
+`data_root`), and the 25m root differs from the old `_tilecenter` baseline
+only in the deliberate use_dim/in_channels/ann-path changes. Harness:
+`compare_cfgs.py` + baseline dumps in the session scratchpad.
+
+Checkpoint compatibility is unchanged in substance: current checkpoints
+were trained under `_tilecenter_nocolour` configs, which are exactly what
+the surviving names now resolve to. Only the 25m root changed meaning
+(offset+colour → tile_center+no-colour) — 25m offset-frame checkpoints, if
+any still matter, are not loadable-comparable under it.
+
 ## The CARLA LiDAR-only pipeline (works end-to-end)
 
 - `tools/maptrv2/custom_carla_map_converter.py` — `reference_lines/*.json`
@@ -2128,8 +2184,9 @@ lexicographically smallest — purely so reruns reproduce.
   **It will not show up as an AP gain** — chamfer is order-sensitive in the
   wrong direction — so it needs judging by rendering and downstream use.
 - **`carlasim_map.py`'s `ann_file_train` is stale.** It points at
-  `data/carla/carla_map_infos_train.pkl`, which has never been generated
-  locally (the converter has only run with `--split test`), so training
+  `data/carla/carla_map_infos_train_tc.pkl` (retagged in the 2026-08-27
+  tidy-up; previously the untagged offset-frame name), which has never been
+  generated locally (the converter has only run with `--split test`), so training
   against this config as-is fails with a missing-file error. **Do not
   silently revert — check with the user first**; it may reflect intent to
   wire up a real train split. `ann_file_val`/`ann_file_test` are fine.

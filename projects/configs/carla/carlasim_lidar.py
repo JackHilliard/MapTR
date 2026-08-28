@@ -35,6 +35,10 @@ data_root = '/home-local/johil9.nobkp/Documents/Code/carla/'
 load_dim = 4
 use_dim = 4
 z_max = 15.0
+# CarlaSegDataset's raw directory scan carries no pkl, hence no per-sample
+# `lidar_recenter_shift` -- recenter must stay False here (the loader's
+# default is True, matching the map configs' tile_center convention).
+recenter = False
 
 input_modality = dict(use_lidar=True, use_camera=False)
 
@@ -47,7 +51,8 @@ train_pipeline = [
         coord_type='LIDAR',
         load_dim=load_dim,
         use_dim=use_dim,
-        z_max=z_max),
+        z_max=z_max,
+        recenter=recenter),
     dict(
         type='DefaultFormatBundle3D',
         class_names=class_names,
@@ -62,7 +67,8 @@ test_pipeline = [
         coord_type='LIDAR',
         load_dim=load_dim,
         use_dim=use_dim,
-        z_max=z_max),
+        z_max=z_max,
+        recenter=recenter),
     dict(
         type='DefaultFormatBundle3D',
         class_names=class_names,

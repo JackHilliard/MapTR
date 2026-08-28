@@ -7,20 +7,20 @@ _base_ = [
 # projects/mmdet3d_plugin/maptr/losses/polyline_loss.py for what was and
 # wasn't carried over.
 #
-# [30m] Sibling of maptrv2_carla_r50_24ep_lidar_HM.py, which targets the
-# 25m x 25m export. It relates to that file exactly as
-# maptrv2_carla_r50_24ep_lidar_30m.py relates to its own 25m base: the two
-# are byte-identical apart from the lines marked "[30m]", so a diff between
-# them shows only what tile size costs.
+# [30m] Formerly a byte-identical sibling of a 25m HM config (deleted in
+# the 2026-08-27 tidy-up; see git history), differing only in the lines
+# marked "[30m]" -- `_base_` above and `point_cloud_range` below. That is
+# the whole point of the tile-size parameterisation: every geometry
+# constant the loss and the matching cost need is derived from
+# `point_cloud_range`, so resizing the tile is a one-line edit on this
+# side. Contrast the base 30m config, which needed seven overrides plus
+# two empirically re-measured LiDAR shapes -- those are real geometry and
+# cannot be derived, which is why this file inherits from it rather than
+# re-deriving them.
 #
-# There are exactly TWO such lines here -- `_base_` above and
-# `point_cloud_range` below. That is the whole point of the tile-size
-# parameterisation: every geometry constant the loss and the matching cost
-# need is derived from `point_cloud_range`, so resizing the tile is a
-# one-line edit on this side. Contrast the base 30m config, which needed
-# seven overrides plus two empirically re-measured LiDAR shapes -- those are
-# real geometry and cannot be derived, which is why this file inherits from
-# it rather than re-deriving them.
+# The GT frame (tile_center) and the colour-free loaders are inherited from
+# the 30m base, ann files and evaluation pipeline included -- this file
+# changes the loss and matching only.
 #
 # This inherits the entire lidar-only config and overrides exactly two
 # things: the point-regression loss (`loss_pts`) and the assigner's
@@ -330,11 +330,12 @@ model = dict(
 
 # --- data / optimiser settings from the Pointcept config --------------------
 # batch_size=4 (total), num_worker=8.
-# fixed_ptsnum_per_line MUST be repeated per split: mmcv evaluates each config
-# file in isolation, so the base's `data.train.fixed_ptsnum_per_line` is
-# already bound to the base's 20 and does NOT track the module-level
-# `fixed_ptsnum_per_gt_line = 40` set above. Leaving it would feed the head
-# 20-point GT while it expects 40 -- a shape mismatch in loss_single.
+# fixed_ptsnum_per_line is repeated per split as a guard: mmcv evaluates
+# each config file in isolation, so the base's `data.train.
+# fixed_ptsnum_per_line` is bound to the base's own value and would NOT
+# track this file's `fixed_ptsnum_per_gt_line` if the two ever diverged --
+# the head would then get GT with the wrong point count, a shape mismatch
+# in loss_single. (Both are currently 20, so today this is a no-op.)
 data = dict(
     samples_per_gpu=4,
     workers_per_gpu=8,
