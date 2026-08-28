@@ -302,7 +302,7 @@ train_pipeline = [
     dict(
         type='LoadCarlaPointsFromFile',
         coord_type='LIDAR',
-        load_dim=4,
+        load_dim=3,
         # xyz only (colour-free convention) -- must match the model's
         # SparseEncoder in_channels=3 above.
         use_dim=3,
@@ -331,7 +331,7 @@ test_pipeline = [
     dict(
         type='LoadCarlaPointsFromFile',
         coord_type='LIDAR',
-        load_dim=4,
+        load_dim=3,
         use_dim=3,
         # Kept in sync with carlasim_map.py's own z_max and this file's
         # lidar_point_cloud_range z upper bound -- see the comments there.

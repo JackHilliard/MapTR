@@ -688,10 +688,19 @@ def convert_carla_tiles(data_root,
         prog_bar.update()
         name = tile['name']
 
-        lidar_path = os.path.abspath(
+        # Stored RELATIVE to --data-root (changed 2026-08-28; was absolute)
+        # so one pkl is valid across containers, mounts and machines, and
+        # can be shared with the sibling GeMap/PMT/mapdiffusion repos, whose
+        # converters already store relative paths. The dataset joins it
+        # against its `raw_data_root` (or, failing that, the absolute
+        # `data_root` recorded in this pkl) at load time; absolute paths in
+        # old pkls still load because os.path.join is a no-op on them.
+        abs_lidar_path = os.path.abspath(
             os.path.join(tile_dir, 'blocks', f'{name}.npz'))
-        if not os.path.isfile(lidar_path):
-            raise FileNotFoundError(lidar_path)
+        if not os.path.isfile(abs_lidar_path):
+            raise FileNotFoundError(abs_lidar_path)
+        lidar_path = os.path.relpath(abs_lidar_path,
+                                     os.path.abspath(data_root))
 
         # The polylines below are in WORLD coordinates and must be shifted
         # into the same frame as the LiDAR points the model actually sees.
@@ -713,7 +722,7 @@ def convert_carla_tiles(data_root,
         # count_points_in_range() call below does read the full `features`
         # array when --no-lidar-check is off; that is the expensive part of
         # this loop, ~14ms for a 110K-point tile.)
-        with np.load(lidar_path) as block:
+        with np.load(abs_lidar_path) as block:
             block_offset = np.asarray(block['offset'], dtype=np.float32)
 
         # --gt-frame tile_center reproduces GeMap's convention: everything --
@@ -738,7 +747,7 @@ def convert_carla_tiles(data_root,
             # square range against a cloud displaced from it, which is exactly
             # the coverage problem this frame choice is meant to remove.
             n_raw, n_in_range = count_points_in_range(
-                lidar_path, pc_range, z_max, shift=shift)
+                abs_lidar_path, pc_range, z_max, shift=shift)
             if n_in_range < min_lidar_points:
                 # This tile would voxelize to zero (or near-zero) voxels and
                 # crash extract_lidar_feat mid-run. Drop it before its
@@ -975,7 +984,12 @@ def main():
         dict(
             samples=samples,
             split=args.split,
-            data_root=args.data_root,
+            # Absolute on purpose: each sample's lidar_path is stored
+            # relative to it, and this is the join-base fallback the dataset
+            # uses when the config sets no raw_data_root. A config-side
+            # raw_data_root overrides it for machines where the export lives
+            # elsewhere.
+            data_root=os.path.abspath(args.data_root),
             # The tile geometry these samples were built from, so a later
             # reader can tell a 25m export from a 60m one without reopening
             # the source manifest.
