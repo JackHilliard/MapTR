@@ -403,7 +403,11 @@ def convert_carla_tiles(data_root,
         # recorded per sample below and applied by
         # LoadCarlaPointsFromFile(recenter=True).
         if gt_frame == 'tile_center':
-            origin = np.asarray(tile['center'], dtype=np.float32)[:3]
+            c = np.asarray(tile['center'], dtype=np.float32).reshape(-1)
+            # our manifest stores a 2-D (xy) tile centre; keep z from the block
+            # offset so the tile_center reframing is xy-only (shift_z = 0).
+            origin = c[:3] if c.shape[0] >= 3 else np.array(
+                [c[0], c[1], block_offset[2]], dtype=np.float32)
         else:
             origin = block_offset
         shift = (block_offset - origin).astype(np.float32)
