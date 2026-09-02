@@ -384,6 +384,15 @@ model = dict(
             # |d| terms, this sums P L2 norms, so parity needs sqrt(C).
             loss_weight=7.07,
             emdv2_pointwise_reduction='sum',
+            # THE REMAINING ASYMMETRY vs L1. Rigid ordered-L1 implicitly
+            # forces even arc-length spacing, because the GT is resampled
+            # uniformly and index i must match index i. A monotone
+            # many-to-many plan has no such constraint, so predicted points
+            # may bunch ('stutter') onto part of the curve. emdv2 reached
+            # parity with L1 but not past it (AP@0.5 deltas oscillate about
+            # 0, last-3 mean -0.001 through ep18); this restores that
+            # regularisation explicitly as relative std of step length.
+            emdv2_spacing_w=0.05,
             pc_range=[-15.0, -15.0, -30.0, 15.0, 15.0, 20.0]),
         loss_dir=dict(type='PtsDirCosLoss', loss_weight=0.005),
         loss_seg=dict(type='SimpleLoss', pos_weight=4.0, loss_weight=1.0),
