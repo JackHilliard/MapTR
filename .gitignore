@@ -145,3 +145,8 @@ dmypy.json
 .pyre/
 
 cluster.sh
+logs/
+tb/
+data30/
+work_dirs/
+tools/carla50m/figs/
