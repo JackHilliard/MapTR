@@ -8,6 +8,8 @@ from .av2_offlinemap_dataset import CustomAV2OfflineLocalMapDataset
 from .carlasim_segment import CarlaSegDataset
 from .carla_offlinemap_dataset import CustomCarlaLocalMapDataset
 from .carla50m_crop_dataset import CustomCarla50mCropDataset, LoadCarla50mCrop
+from .carla_neighbourhood_dataset import (CustomCarlaNeighbourhoodDataset,
+                                          LoadCarlaNeighbourhoodPoints)
 __all__ = [
     'CustomNuScenesDataset','CustomNuScenesLocalMapDataset', 'CarlaSegDataset',
     'CustomCarlaLocalMapDataset', 'CustomCarla50mCropDataset', 'LoadCarla50mCrop'

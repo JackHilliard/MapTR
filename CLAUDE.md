@@ -2258,6 +2258,192 @@ through the DTW path, GT json written, per-class AP plus the
 `data/carla50m/` (the cluster used `/data_carla50`); nothing above is an
 accuracy result.
 
+## Multi-tile inference feasibility: 3x3 neighbourhoods, stitching, bigger BEV (2026-09-16)
+
+Branch `worktree-carla-multitile` (from `maptrv2` @ `36135ae`). Three
+ideas were on the table for getting past one-tile-at-a-time inference:
+(1) infer every tile, then amend each from its neighbours' polylines, "3x3
+grid treated like video frames"; (2) just smooth the lines across tiles;
+(3) change the network so it can take a larger tile. All three were built
+far enough to measure, on EMDv2 + two classes (driving / curb) and with no
+crop augmentation. What exists, and what each measurement says:
+
+### Facts about the data that decide the design
+
+* **Tiles overlap but do not tile the plane.** `../carla_test` has
+  `tile_side` 30 and `overlap` 0.2: centres sit on a **24 m stride** (nearest
+  neighbour is 24.0 m for 95% of tiles), so adjacent tiles share a 6 m
+  strip. But the export keeps only tiles carrying GT, so a tile has on
+  average **2.7 footprint-overlapping neighbours**, 106 of 3795 have none,
+  and only **3** have the full 8. A "3x3 grid" is therefore an irregular
+  neighbourhood, and any method must cope with a mostly empty box.
+* **GT pieces carry an OpenDRIVE `road_id`** (`reference_*/*.json`,
+  e.g. `20209_0_-2`), and the two tiles' clipped copies of one road share
+  it. Cross-tile GT joins are exact, not heuristic -- except that every
+  curb has the literal id `curb`, so curbs are joined by geometry alone
+  (5 cm tolerance, and only across different tiles). The per-tile copies
+  agree to **3.9 cm** at worst, not bit-for-bit.
+* **The LiDAR path has no temporal hook.** `MapTRPerceptionTransformer.
+  get_bev_features` returns the sparse encoder's BEV straight away on
+  `modality='lidar'`; `prev_bev`, the BEVFormer temporal self-attention and
+  the can-bus shift are only ever reached on the camera path. "Tiles as
+  video frames" via `video_test_mode` is therefore not available without a
+  model change -- and BEVFormer's alignment assumes ego motion small
+  against the range, whereas a neighbouring tile is a 24 m shift in a 30 m
+  range. The BEV-level equivalent of concatenating frames is simply a
+  bigger BEV, which is (3) below.
+
+### `map_utils/polyline_stitch.py` -- one merge, two regimes
+
+Pure numpy (no torch / shapely), so it runs both in the container (the
+dataset stitches GT with it) and on the host (the tool merges predictions
+with it; `stitch_results.py` loads it by file path because
+`projects.mmdet3d_plugin` needs torch). `merge_pieces` greedily seeds a
+master from the longest piece and absorbs any piece that **overlaps or
+abuts it within `tol` and joins at an extremity** -- a piece that shares
+the locus and then leaves it partway (a fork) or jumps sideways off the end
+is refused, judged in the piece's own median vertex spacing so sparse GT
+(vertices ~10 m apart) still joins while a dense prediction leaving the
+line a metre early does not. Pieces from the same `source` never merge, so
+two instances the export or the model emitted for one tile stay two.
+`consensus=True` blends the overlap zone: master vertices move toward
+their projection on the joining piece, weighted by confidence. A bounding-
+box prefilter keeps it linear-ish: the whole export's 13,277 GT pieces
+merge into 4,020 lines in 5.6 s, 190k predictions in 315 s.
+`clip_polyline_to_box` moved here from `carla50m_crop_dataset.py` (same
+Pointcept-tiler code, now importable without torch; the crop dataset
+imports it from here). Tests: `tools/maptrv2/tests/test_polyline_stitch.py`
+(synthetic both regimes; `--real <export>/test` re-merges the whole GT and
+checks every merged vertex lies on a source piece).
+
+### (3) `CustomCarlaNeighbourhoodDataset` + `..._3x3_2cls_EMDV2.py`
+
+Each sample is a tile plus every tile whose footprint overlaps it: the
+neighbours' clouds are shifted into the centre frame by
+`lidar_offset_j - annotation_origin_i` and concatenated
+(`LoadCarlaNeighbourhoodPoints`, box-cut to +-R), and the GT is the
+`road_id`-stitched union of the tiles' jsons, shifted and clipped to
++-R = 39 (30/2 + 24). The pkl is the existing `30m_tc_2cls` one; the jsons
+are found through its `tile_geometry`; it refuses an offset-frame pkl. The
+model is the unchanged LiDAR MapTRv2 with every tile-size knob grown from
+30 m to 78 m: range +-39, `bev_h_` 312 (0.25 m cells, 6.76x the tokens),
+`sparse_shape` 781, `max_voxels` x6.76, coder/assigner/loss ranges, and
+`loss_pts.loss_weight` scaled 7.07 -> 18.38 because the loss sees
+range-normalised coordinates (a stated choice; the base L1 was never
+rescaled 25 -> 30). Queries stay at 50: stitched GT per sample is mean 5.6,
+max 33 (single tiles 3.5). Its baseline is the new single-tile
+`..._30m_2cls_EMDV2.py` (the `_2cls` config with the `emdv2` loss swap).
+
+**One network change was needed, and it is the finding for (3).** The
+LiDAR path bicubic-interpolates the sparse encoder's **3200-channel** map to
+`(bev_h, bev_w)` *before* projecting it to 256 channels. At 312x312 that
+intermediate is 1.25 GB per sample (184 MB at 120x120) and the forward
+OOMs exactly there on the 8 GB card. `MapTRPerceptionTransformer(
+lidar_proj_before_interp=True)` projects at the encoder's native 98x98
+first and interpolates the 256-channel result -- 12.5x smaller. It is a
+different model (conv and interpolation do not commute), so it is opt-in;
+the 30 m configs keep the original order and stay checkpoint-compatible.
+With it, the busiest neighbourhood (8 neighbours, 732k points) runs a full
+no-grad `forward_test` at **1.3 GB** peak (`extract_lidar_feat` 1.2 GB,
+output `(1, 3200, 98, 98)` -- `lidar_bev_proj.in_channels` unchanged at
+3200, per gotcha #4, measured). For a 50-query decoder the deformable
+cross-attention does not care about the token count; the seg head and the
+positional embedding do.
+
+**Verified**: 51 assertions in the container (both configs resolve with
+every range/size knob at 39/312/781, the loss and cost as intended,
+`evaluation` repointed at the neighbourhood pipeline, own `map_ann_file`;
+dataset builds on the real pkl in 31 s with the neighbour histogram above;
+stitched GT sits inside the box and **0.10 m median** from the merged cloud;
+train-mode sample yields labels {0, 1} and a 312x312 seg mask; the forward
+above). **Not run: a training step**, the local GPU being occupied (same
+situation as the 3-class smoke test). Budget for the H100.
+
+**Read the eval right.** `evaluation` in the 3x3 config scores the stitched
+neighbourhood GT, so a line in an overlap strip is scored once per
+neighbourhood it lies in -- a different metric from the single-tile one.
+For the A/B against the baseline, `tools/test.py --format-only` and then
+`stitch_results.py <results> --gt <2cls pkl> --clip-to-tile 15 --eval`,
+which cuts every prediction back to its centre +-15 box and scores it on
+the per-tile pkl.
+
+### (1) + (2) `tools/maptrv2/stitch_results.py` -- consensus and smoothing, measured
+
+Host-side. Lifts a run's per-tile predictions into the world frame (pkl
+`annotation_origin`), merges copies of one line from different tiles
+(`--merge-tol` 1.0 m, same class), optionally blends the overlap
+(`--consensus`) and Chaikin-smooths (`--smooth N`), then re-cuts each
+world line into tiles and writes an ordinary `carlamap_results.json`;
+`--eval` scores input and output with `dataset_viewer`'s numpy eval (the
+one verified bit-exact against `eval_map`). `--extend members` (default)
+gives a line back only to the tiles whose predictions went into it, so
+per-tile counts stay at the head's 50 and the delta isolates geometry;
+`--extend all` also writes it into every other tile it crosses.
+
+On the converged 2-class colour-free run
+(`work_dirs/maptrv2-carla_dataset_30m_dense_aligned-noCOL_2cls_V1/
+Fri_Aug_21_10_17_14_2026`, 3795 tiles, 189,750 predictions -> 136,729
+world lines, **33,147 joined across tiles**):
+
+| variant (`--extend members` unless stated) | mAP | delta | joined lines |
+|---|---|---|---|
+| original per-tile predictions | 0.7035 | | |
+| control: `--merge-tol 0` (re-clip + resample only) | 0.7034 | -0.0002 | 0 |
+| merge, every prediction | 0.6618 | **-0.042** | 33,147 |
+| `--consensus`, every prediction | 0.6661 | -0.037 | 33,060 |
+| `--consensus --smooth 1`, every prediction | 0.6745 | -0.029 | |
+| `--consensus --extend all`, every prediction | 0.5460 | **-0.158** | |
+| merge, `--score-thresh 0.3` | 0.7009 | -0.003 | 2,491 |
+| `--consensus --score-thresh 0.3` | 0.7022 | -0.001 | 2,476 |
+| `--consensus --smooth 1 --score-thresh 0.3` | 0.7026 | -0.001 | |
+
+(Per class the picture is the same: driving 0.681 / curb 0.727 before,
+0.680 / 0.725 after the best variant.) Three readings:
+
+* **The pipeline itself is an identity** (control), so the deltas are the
+  stitching, not the bookkeeping.
+* **Letting every prediction merge is harmful, and the reason is the
+  head's fixed 50 instances per tile.** Only ~7% of them are real lines
+  (14,839 of 189,750 score above 0.3, against 13,277 GT lines), and the
+  junk from a neighbouring tile joins onto, and extends, a good line --
+  33k joins against ~2.5k genuine ones. `--extend all` is worse still
+  because every unjoined stub is duplicated into the neighbour's overlap
+  strip as a fresh false positive (337k vectors from 190k).
+* **With junk frozen out (`--score-thresh 0.3`) cross-tile consensus is
+  neutral on chamfer AP: -0.001.** A third of the confident lines do get
+  joined across tiles, and blending or smoothing them neither helps nor
+  hurts the score. So on a converged single-tile model the overlap-strip
+  disagreement between neighbours is not where the AP is being lost -- or
+  chamfer at 0.5/1.0/1.5 m cannot see it. What stitching does deliver is
+  continuity (one line per road across a town instead of one per tile),
+  which this metric does not measure and downstream use does.
+
+This is the cheapest possible version of "amend each tile from its
+neighbours", and it was meant as the go/no-go for a learned one (a
+neighbour-prior raster concatenated before `lidar_bev_proj`, trained with
+GT-derived priors under dropout, is the natural design; the hook is the
+same `get_bev_features` branch). On this evidence it is a no-go **as an
+accuracy lever**: the overlap zone carries no signal the single-tile model
+is missing. It remains the right tool for producing town-scale continuous
+lines. The chamfer eval is order- and sampling-sensitive (2026-08-23
+section), so read the deltas alongside a render, not instead of one.
+Run outputs and logs: `/gel/usr/johil9/.claude/jobs/04001f5b/tmp/stitch/`.
+
+### Still open
+
+* Train `..._30m_2cls_EMDV2.py` and `..._3x3_2cls_EMDV2.py` on the same
+  tiles on the H100, then clip the latter to +-15 and compare. Measure the
+  3x3 training step's memory first; `samples_per_gpu` will be far below
+  the 30 m config's.
+* `../carla_test` is test-only; both configs' `ann_file_train` name a pkl
+  that does not exist. Convert a train split first.
+* A neighbourhood is a bigger *box*, mostly empty: the model must learn
+  "no points -> no lines" over ~80% of it. Whether that costs accuracy on
+  the centre tile is exactly what the A/B answers.
+* Crop/rotation augmentation on neighbourhoods was deliberately left out.
+  Doing it is a `_rand_pose`-style rotation of the assembled box, the same
+  code path the 50 m crop dataset uses; nothing structural blocks it.
+
 ## Open items / next steps
 
 - **`lidar_point_cloud_range`'s z lower bound is too high.** 98 tiles have

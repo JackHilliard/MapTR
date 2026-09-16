@@ -9,7 +9,7 @@ HERE, per __getitem__, exactly as in ``Pointcept/data/tile_dataset_50m.py``:
      corners. Leftover slack (25 - 21.21 = 3.79 m) is the max centre shift.
   2. additive Gaussian noise on the point coordinates
   3. GT polylines rotated and clipped to the SAME 30 m box, via the tiler's own
-     ``clip_polyline_to_box`` (vendored below) so crop GT is built identically
+     ``clip_polyline_to_box`` (map_utils/polyline_stitch.py) so crop GT is built identically
      to how the tiler builds tile GT.
 
 FRAMES (verified against the npz/json on disk, not assumed):
@@ -53,77 +53,11 @@ from .carla50m_metrics import precision_and_chamfer
 from .carla_offlinemap_dataset import CustomCarlaLocalMapDataset
 
 
-# ---------------------------------------------------------------------------
-# Vendored from Pointcept/data/grid_tile_export.py so the crop GT is clipped by
-# EXACTLY the tiler's logic (boundary vertex placed on the edge, runs of <2
-# vertices dropped). Copied verbatim rather than imported: the tiler lives in
-# the Pointcept tree, which is not on PYTHONPATH inside the MapTR container.
-# ---------------------------------------------------------------------------
-def _clip_segment_to_box(p0, p1, box):
-    """Liang-Barsky. Returns (q0, q1, t0, t1) clipped to box, or None."""
-    xmin, ymin, xmax, ymax = box
-    x0, y0 = float(p0[0]), float(p0[1])
-    x1, y1 = float(p1[0]), float(p1[1])
-    dx, dy = x1 - x0, y1 - y0
-    t0, t1 = 0.0, 1.0
-    for p, q in ((-dx, x0 - xmin), (dx, xmax - x0), (-dy, y0 - ymin),
-                 (dy, ymax - y0)):
-        if abs(p) < 1e-12:
-            if q < 0:
-                return None
-        else:
-            r = q / p
-            if p < 0:
-                if r > t1:
-                    return None
-                if r > t0:
-                    t0 = r
-            else:
-                if r < t0:
-                    return None
-                if r < t1:
-                    t1 = r
-    q0 = p0 + t0 * (p1 - p0)
-    q1 = p0 + t1 * (p1 - p0)
-    return q0, q1, t0, t1
-
-
-def clip_polyline_to_box(points: np.ndarray, curved: np.ndarray,
-                         box) -> List[dict]:
-    """Clip a polyline to a square -> continuous sub-polylines reaching the edge."""
-    out: List[dict] = []
-    cur_pts: List[np.ndarray] = []
-    cur_cur: List[bool] = []
-
-    def flush():
-        if len(cur_pts) >= 2:
-            out.append({
-                'points': np.asarray(cur_pts, dtype=np.float32),
-                'curved': np.asarray(cur_cur, dtype=bool)
-            })
-        cur_pts.clear()
-        cur_cur.clear()
-
-    for i in range(len(points) - 1):
-        res = _clip_segment_to_box(points[i], points[i + 1], box)
-        if res is None:
-            flush()
-            continue
-        q0, q1, t0, t1 = res
-        c_i = bool(curved[i])
-        if not cur_pts:
-            cur_pts.append(q0)
-            cur_cur.append(c_i)
-        elif np.linalg.norm(cur_pts[-1] - q0) > 1e-4:
-            flush()
-            cur_pts.append(q0)
-            cur_cur.append(c_i)
-        cur_pts.append(q1)
-        cur_cur.append(bool(curved[i + 1]) if t1 >= 1.0 - 1e-9 else c_i)
-        if t1 < 1.0 - 1e-9:
-            flush()
-    flush()
-    return out
+# clip_polyline_to_box was vendored here from Pointcept/data/grid_tile_export.py
+# so the crop GT is clipped by EXACTLY the tiler's logic; it now lives in
+# map_utils/polyline_stitch.py (same code, importable without torch) because
+# the neighbourhood dataset and the host-side stitch tool need it too.
+from .map_utils.polyline_stitch import _clip_segment_to_box, clip_polyline_to_box  # noqa: F401,E501
 
 
 @DATASETS.register_module()

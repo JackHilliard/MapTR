@@ -64,9 +64,21 @@ class MapTRPerceptionTransformer(BaseModule):
                  rotate_center=[100, 100],
                  modality='vision',
                  feat_down_sample_indice=-1,
+                 lidar_proj_before_interp=False,
                  **kwargs):
         super(MapTRPerceptionTransformer, self).__init__(**kwargs)
         self.modality = modality
+        # LiDAR path only. False (the original order): bicubic-interpolate
+        # the SparseEncoder's C*D-channel map (3200 channels on the CARLA
+        # configs) up to (bev_h, bev_w) and THEN project it to embed_dims.
+        # That intermediate is 3200 x bev_h x bev_w floats per sample --
+        # 184 MB at 120x120, 1.25 GB at 312x312 (the 78 m neighbourhood
+        # config), held for backward. True: project at the encoder's own
+        # resolution first (38x38 / 98x98), then interpolate the 256-channel
+        # result, 12.5x smaller. Not numerically identical (conv and
+        # interpolation do not commute), so it is a different model, not a
+        # drop-in for an existing checkpoint; kept opt-in for that reason.
+        self.lidar_proj_before_interp = lidar_proj_before_interp
         if modality == 'fusion':
             self.fuser = build_fuser(fuser) #TODO
         elif modality == 'lidar':
@@ -264,9 +276,14 @@ class MapTRPerceptionTransformer(BaseModule):
         if self.modality == 'lidar':
             assert lidar_feat is not None
             bev_embed = lidar_feat.permute(0, 1, 3, 2).contiguous()  # B C H W
-            bev_embed = nn.functional.interpolate(
-                bev_embed, size=(bev_h, bev_w), mode='bicubic', align_corners=False)
-            bev_embed = self.lidar_bev_proj([bev_embed])
+            if self.lidar_proj_before_interp:
+                bev_embed = self.lidar_bev_proj([bev_embed])
+                bev_embed = nn.functional.interpolate(
+                    bev_embed, size=(bev_h, bev_w), mode='bicubic', align_corners=False)
+            else:
+                bev_embed = nn.functional.interpolate(
+                    bev_embed, size=(bev_h, bev_w), mode='bicubic', align_corners=False)
+                bev_embed = self.lidar_bev_proj([bev_embed])
             bev_embed = bev_embed.flatten(2).permute(0, 2, 1).contiguous()
             depth = None
             ret_dict = dict(bev=bev_embed, depth=depth)
