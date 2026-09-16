@@ -2155,6 +2155,109 @@ without `--force`. Traversal direction is arbitrary upstream (nothing in the
 EMD loss fixes one), so it is pinned deterministically — first endpoint
 lexicographically smallest — purely so reruns reproduce.
 
+## 50 m rotated-crop benchmark and the `emdv2` loss (ported 2026-09-16)
+
+Ported from branch `worktree-carla50m-emdv2-tuned`, which had forked from the
+pre-tidy tree (`465f123`) and re-solved the tile-centre frame and the point
+width its own way. Only the payload came across, rewritten onto the current
+conventions; the flattened 450-line config dumps, the `/MapTR2`-hardcoded
+one-off scripts under `tools/carla50m/` and the root-level
+`eval_polyline_ap.py` did not.
+
+**What it is.** `CustomCarla50mCropDataset` + `LoadCarla50mCrop`
+(`datasets/carla50m_crop_dataset.py`) read a **50 m** export (`tile_radius`
+25) straight from its `<split>/manifest.json` -- no converter pkl -- and cut
+a **30 m** crop per `__getitem__`: uniform yaw about the tile centre, centre
+shift up to 3.79 m (the slack a rotated 30 m square leaves inside 50 m, so
+crops are always fully populated), sigma = 0.02 m point noise, GT rotated and
+clipped to the same box with the tiler's own `clip_polyline_to_box`. The
+model is therefore the unchanged 30 m one: every 50 m config is a thin
+overlay on `maptrv2_carla_r50_24ep_lidar_30m.py`.
+
+Three things the port changed relative to the branch, all deliberate:
+
+- **Colour-free input.** The branch trained on 4-channel points
+  (`in_channels=4`); `LoadCarla50mCrop` now defaults to `load_dim=3,
+  use_dim=3` and the configs inherit `in_channels=3`. Its checkpoints do not
+  load here, and **its numbers below were measured with colour** -- re-run
+  before quoting them against new runs.
+- **No frame hack.** The crop centre is the origin by construction, so
+  there is no `lidar_recenter_shift` / `recenter=True` in these pipelines;
+  the loader reframes the world-frame `points` itself. `evaluation` is
+  restated in the base 50 m config to re-point it at that pipeline.
+- **Real class names.** The branch mapped `driving`/`curb` onto
+  `['divider', 'boundary']` positionally and overrode `CLASS2LABEL` by hand,
+  because the AV2 base's hardcoded taxonomy would put `boundary` at label 2.
+  `VectorizedCarlaLocalMap` already builds labels from `map_classes`, so the
+  configs now say `map_classes = ['driving', 'curb']` and the dataset's
+  `gt_classes` (export names, positional) defaults to the same list.
+
+Unlike the pkl `_2cls` configs, `aux_seg.seg_classes` is **2** here (per-class
+BEV mask, on both the model and `data.train` side) -- that is what the
+benchmark ran with. `samples_per_gpu=16` is pinned: every reported run used
+it on an 80 GB H100 and 22 OOMs on 50 m crops.
+
+**Eval crops are frozen by `crop_seed`, not centred.** `_format_gt()` caches
+the GT once, so the val crop must be identical every run -- but a *centred*
+30 m crop leaves 24.4% of test tiles with no GT (the manifest was filtered
+for a *reachable* non-empty crop); seeded aiming drops that to 0.4%. No yaw
+at eval. `tools/carla50m/verify_crop_dataset.py <config>` checks the
+invariants (GT vertices on LiDAR returns, full quadrant occupancy, uniform
+yaw, frozen val / fresh train).
+
+**`emdv2`** (`polyline_loss.py`, mode on both `PolylineGeomLoss` and
+`PolylineGeomCost`) is an order-preserving, many-to-many monotone (DTW) plan.
+Plain `emd` lost to `PtsL1Loss` on the 30 m data (AP@0.5 0.318 vs 0.637) for
+two measured reasons: `PtsL1Loss` sums P*C = 40 terms per pair where the geom
+loss returned one mean (58.9x weaker gradient -- fixed by
+`emdv2_pointwise_reduction='sum'`, weight 5.0 * sqrt(2) = 7.07), and a free
+assignment is permutation-invariant with `loss_dir` zeroed (the zigzag of the
+2026-08-23 section). A monotone *bijection* on equal-length sequences is the
+identity, i.e. exactly L1, hence many-to-many. The matching cost stays
+`OrderedPtsL1Cost` in these configs: it is already order-sensitive, and the
+batched DTW cost (kept, `batched_monotone_ot_cost`) ran 2.4x slower.
+`emdv2_spacing_w` adds L1's implicit even-spacing regulariser back; 0.05
+stayed at parity on 30 m and is off.
+
+Results (branch, colour input, 30 epochs, identical data/schedule/seed,
+2170-tile held-out test):
+
+| config | mAP | driving | curb |
+|---|---|---|---|
+| `..._50m_crop` (ordered L1) | 83.2 | 79.2 | 87.2 |
+| `..._50m_crop_EMDV2` (lr 6e-4) | 85.3 | 78.7 | 91.8 |
+| `..._50m_crop_EMDV2_LR3e-4` | **88.4** | 82.3 | 94.4 |
+| `_LR3e-4_geom05x` / `_LR1.5e-4` / `_geom05x` / `_geom2x` | 86.3 / 85.5 / 84.4 / 76.3 | | |
+| `_LR1.2e-3` | diverged | | |
+
+On the 30 m pkl data the same loss swap (`..._30m_EMDV2.py`) is at **parity**
+with L1 (0.7474 vs 0.7485); the win is on the crops with a second class, and
+it is the curb class (matched chamfer 0.174 vs 0.243 m). Halving the lr lifts
+both classes; the geometry weight is neutral-to-harmful either way.
+
+**Dropped: the BEV-resolution ablations (R1 voxel 0.05 / R2 0.025, both at
+lr 3e-4).** They concluded "finer voxels do not help" (R2 led by +8 mAP at
+epoch 2 and trailed by 17 at epoch 10), but the as-run configs kept
+`GridSamplePoints` at `[0.1, 0.1, 0.4]` while voxelising at 0.05/0.025, so
+the input had already been decimated to one point per 0.1 m cell -- the
+finer grid saw the same occupancy pattern. The negative result is
+confounded; a clean rerun needs `grid_size` following `lidar_voxel_size`
+(and `sparse_shape` 601/1201, `max_voxels` [160000,200000]/[300000,375000],
+memory 56/69 GB at batch 16).
+
+**Verified** in the container on a synthetic 50 m export (real layout,
+6 train / 4 test tiles): 49 `Config.fromfile` assertions (loaders 3/3,
+`in_channels=3`, classes and `seg_classes` on both sides, `evaluation`
+repointed, each overlay differing from its parent in exactly its stated
+knob, model otherwise byte-identical to the 30 m base); the verification
+script (GT-to-LiDAR median 0.12 m, val frozen, train fresh); and a 2-epoch
+train+eval of `..._50m_crop_EMDV2_LR3e-4.py` at batch 2 (finite `loss_pts`
+through the DTW path, GT json written, per-class AP plus the
+`precision/recall/F1/chamfer` extras from `carla50m_metrics.py` logged).
+**No 50 m export exists on this machine** -- `data_root` defaults to
+`data/carla50m/` (the cluster used `/data_carla50`); nothing above is an
+accuracy result.
+
 ## Open items / next steps
 
 - **`lidar_point_cloud_range`'s z lower bound is too high.** 98 tiles have
