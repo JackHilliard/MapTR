@@ -11,6 +11,9 @@ for name,(lw,lr,why) in VARIANTS.items():
     cfg=Config.fromfile(SRC)
     cfg.model['pts_bbox_head']['loss_pts']['loss_weight']=lw
     cfg.optimizer['lr']=lr
+    # every reported run used 16; the inherited 22 OOMs on 50 m crops
+    # (68 GB of 81). Pin it so the config reproduces without cfg-options.
+    cfg.data['samples_per_gpu']=16
     hdr=(f"# EMDV2 ablation round 2 {name}: loss_pts={lw}, lr={lr}\n# {why}\n"
          f"# Round 1 @ep12: C(lr3e-4) .7840 > B(geom3.54) .6798 > base .6738 > "
          f"A(geom14.14) .5430 > D(lr1.2e-3) diverged\n")

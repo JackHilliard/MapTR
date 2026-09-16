@@ -60,7 +60,7 @@ test_pipeline = [
         ])
 ]
 data = dict(
-    samples_per_gpu=22,
+    samples_per_gpu=16,
     workers_per_gpu=6,
     train=dict(
         type='CustomCarla50mCropDataset',

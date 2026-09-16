@@ -25,6 +25,9 @@ le=cfg.model['lidar_encoder']
 le['voxelize']['voxel_size']=[V,V,0.4]
 le['voxelize']['max_voxels']=[MV,int(MV*1.25)]
 le['backbone']['sparse_shape']=[SS,SS,421]
+# every reported run used 16; the inherited 22 OOMs on 50 m crops
+# (68 GB of 81). Pin it so the config reproduces without cfg-options.
+cfg.data['samples_per_gpu']=16
 # top-level `voxel_size` is the HEAD's grid (0.15/20.0), not the voxelizer's;
 # leave it alone. `lidar_voxel_size` is the one that should track the change.
 cfg._cfg_dict['lidar_voxel_size']=[V,V,0.4]
