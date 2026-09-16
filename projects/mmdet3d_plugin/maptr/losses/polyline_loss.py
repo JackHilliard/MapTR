@@ -270,6 +270,151 @@ def exact_emd_loss(pred, gt):
 
 
 # ---------------------------------------------------------------------------
+# Order-preserving (monotone) OT primitive  --  mode 'emdv2'
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS.  Measured against MapTRv2's PtsL1Loss on identical CARLA
+# tile-centre data, plain 'emd' reaches AP@0.5 0.318 where L1 reaches 0.637.
+# Two defects cause that, and neither is intrinsic to optimal transport:
+#
+#   1. SCALE.  PtsL1Loss is @weighted_loss -> `loss.sum()/avg_factor`, i.e. it
+#      sums P*C=40 elementwise terms per matched pair.  PolylineGeomLoss
+#      returns ONE scalar per pair (mean over P of the L2 displacement) and
+#      divides by the same avg_factor.  Measured gradient ratio: L1 is 58.9x
+#      stronger at every error scale, so relative to an unchanged focal cls
+#      loss the EMD geometry signal is ~59x under-powered -- detection trains,
+#      localisation never sharpens.  `pointwise_reduction='sum'` restores the
+#      degree (mean-over-path * P), leaving loss_weight to do the rest.
+#
+#   2. ORDER.  A free Hungarian assignment is permutation-invariant, so a
+#      SCRAMBLED point order costs exactly nothing -- and the HM config sets
+#      loss_dir=0.0, removing the only ordering pressure.  The evaluator
+#      rebuilds each prediction as a shapely LineString *in stored order* and
+#      resamples 100 points along it, so a scrambled polyline becomes a zigzag
+#      with a huge chamfer.  That punishes the tight thresholds hardest, which
+#      is exactly the observed AP@0.5 collapse.
+#
+# A monotone coupling fixes (2) without giving up what OT is for.  Note a
+# monotone BIJECTION between two equal-length sequences is necessarily the
+# identity -- i.e. exactly L1's rigid index<->index map -- so this uses a DTW
+# style many-to-many monotone plan instead: order is enforced, but the curve
+# may still be reparameterised, which rigid L1 cannot do.  That is the part
+# expected to beat L1 rather than merely match it.
+
+
+def monotone_align(cost_np):
+    """Min-cost order-preserving (DTW) alignment path through ``cost_np``.
+
+    Returns ``(rows, cols)`` index arrays. Boundary-anchored: the path always
+    starts at (0,0) and ends at (P-1,Q-1), which prevents the degenerate
+    solution where the prediction collapses onto one end of the target.
+    """
+    P, Q = cost_np.shape
+    D = np.full((P + 1, Q + 1), np.inf, dtype=np.float64)
+    D[0, 0] = 0.0
+    ptr = np.zeros((P + 1, Q + 1), dtype=np.int8)
+    for i in range(1, P + 1):
+        ci = cost_np[i - 1]
+        for j in range(1, Q + 1):
+            d, b = D[i - 1, j - 1], 0
+            if D[i - 1, j] < d:
+                d, b = D[i - 1, j], 1
+            if D[i, j - 1] < d:
+                d, b = D[i, j - 1], 2
+            D[i, j] = ci[j - 1] + d
+            ptr[i, j] = b
+    i, j, rs, cs = P, Q, [], []
+    while i > 0 and j > 0:
+        rs.append(i - 1)
+        cs.append(j - 1)
+        b = ptr[i, j]
+        if b == 0:
+            i -= 1
+            j -= 1
+        elif b == 1:
+            i -= 1
+        else:
+            j -= 1
+    return np.asarray(rs[::-1]), np.asarray(cs[::-1])
+
+
+def uniform_spacing_loss(pred):
+    """Penalise non-uniform arc-length spacing (relative std of step lengths).
+
+    A monotone plan is many-to-many, so several predicted points may 'stutter'
+    onto one target point. Rigid L1 implicitly forbids that because the GT is
+    resampled uniformly; this restores the same regularisation explicitly.
+    """
+    if pred.shape[0] < 3:
+        return pred.sum() * 0.0
+    steps = torch.linalg.norm(pred[1:] - pred[:-1], dim=-1)
+    mean = steps.mean().clamp(min=1e-6)
+    return (steps.std() / mean)
+
+
+def monotone_ot_loss(pred, gt, pointwise_reduction='sum', spacing_w=0.0):
+    """Order-preserving OT displacement for one (pred, gt) polyline pair.
+
+    ``pointwise_reduction='sum'`` returns mean-along-path * P, i.e. degree P,
+    matching PtsL1Loss's sum over points (its extra factor C vs this term's
+    L2 norm is a constant ~sqrt(C), absorbed by loss_weight). 'mean' keeps the
+    legacy 'emd' scale. Stutter-invariant either way: normalising by path
+    length means a longer warping path cannot inflate or deflate the value.
+    """
+    if pred.numel() == 0 or gt.numel() == 0:
+        return pred.sum() * 0.0
+    cost = torch.cdist(pred, gt, p=2)
+    with torch.no_grad():
+        ri, ci = monotone_align(cost.detach().cpu().numpy())
+    ri_t = torch.as_tensor(ri, device=pred.device, dtype=torch.long)
+    ci_t = torch.as_tensor(ci, device=pred.device, dtype=torch.long)
+    val = cost[ri_t, ci_t].mean()
+    if pointwise_reduction == 'sum':
+        val = val * pred.shape[0]
+    if spacing_w > 0:
+        val = val + spacing_w * uniform_spacing_loss(pred) * (
+            pred.shape[0] if pointwise_reduction == 'sum' else 1.0)
+    return torch.nan_to_num(val, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def batched_monotone_ot_cost(pred, gt):
+    """DTW alignment cost for a batch of pairs, without backtracking.
+
+    ``pred``/``gt``: (B, P, C). Returns (B,) mean-along-path displacement.
+
+    The matching cost is evaluated for every (query x gt x order) triple, so
+    the pure-Python `monotone_align` used by the loss (a handful of pairs) is
+    far too slow here. This runs the same DP as an anti-diagonal-free rolling
+    wavefront: P*Q tiny ops vectorised over the whole batch, rather than
+    B*P*Q Python iterations. Value-only -- the assigner runs under no_grad, so
+    no path is needed.
+    """
+    d = torch.cdist(pred, gt, p=2)                     # (B, P, Q)
+    B, P, Q = d.shape
+    big = torch.finfo(d.dtype).max
+    D = d.new_full((B, P + 1, Q + 1), big)
+    L = d.new_zeros((B, P + 1, Q + 1))
+    D[:, 0, 0] = 0.0
+    # ANTI-DIAGONAL WAVEFRONT. Cells on i+j=k depend only on diagonals k-1 and
+    # k-2, so a whole diagonal is computed in one shot: P+Q-1 = 39 steps rather
+    # than the P*Q = 400 sequential ones a row-major sweep needs. This is
+    # launch-bound work (20x20 tensors), so the step count *is* the runtime --
+    # measured 14.2 s/iter row-major vs ~6 s/iter for the L1 baseline.
+    for k in range(2, P + Q + 1):
+        ii = torch.arange(max(1, k - Q), min(P, k - 1) + 1, device=d.device)
+        jj = k - ii
+        cd = torch.stack([D[:, ii - 1, jj - 1], D[:, ii - 1, jj],
+                          D[:, ii, jj - 1]], dim=-1)
+        cl = torch.stack([L[:, ii - 1, jj - 1], L[:, ii - 1, jj],
+                          L[:, ii, jj - 1]], dim=-1)
+        m, idx = cd.min(dim=-1)
+        D[:, ii, jj] = d[:, ii - 1, jj - 1] + m
+        L[:, ii, jj] = cl.gather(-1, idx.unsqueeze(-1)).squeeze(-1) + 1.0
+    # Normalise by the ACTUAL path length, matching monotone_ot_loss's
+    # mean-along-path, so cost and loss agree about what "close" means.
+    return D[:, P, Q] / L[:, P, Q].clamp(min=1.0)
+
+# ---------------------------------------------------------------------------
 # Tile-size handling -- see the "Tile size" section of the module docstring
 # ---------------------------------------------------------------------------
 
@@ -394,7 +539,7 @@ def _apply_axis_scale(pts, scale):
 # mmdet-registered wrappers
 # ---------------------------------------------------------------------------
 
-_MODES = ('cwot', 'pgf', 'emd')
+_MODES = ('cwot', 'pgf', 'emd', 'emdv2')
 
 
 @LOSSES.register_module()
@@ -439,6 +584,8 @@ class PolylineGeomLoss(nn.Module):
                  pgf_w1=1.0,
                  pgf_w2=0.5,
                  pgf_wc=0.5,
+                 emdv2_pointwise_reduction='sum',
+                 emdv2_spacing_w=0.0,
                  pc_range=None):
         super().__init__()
         if mode not in _MODES:
@@ -451,6 +598,8 @@ class PolylineGeomLoss(nn.Module):
                                  arc_marginals=cwot_arc_marginals,
                                  squared=cwot_squared)
         self.pgf_kwargs = dict(w0=pgf_w0, w1=pgf_w1, w2=pgf_w2, wc=pgf_wc)
+        self.emdv2_kwargs = dict(pointwise_reduction=emdv2_pointwise_reduction,
+                                  spacing_w=emdv2_spacing_w)
         self.pc_range = pc_range
         self.tile_size = (None if pc_range is None
                           else tile_size_from_pc_range(pc_range))
@@ -461,6 +610,8 @@ class PolylineGeomLoss(nn.Module):
             return curve_ot_loss(p, g, **self.cwot_kwargs)
         if self.mode == 'pgf':
             return pgf_loss(p, g, **self.pgf_kwargs)
+        if self.mode == 'emdv2':
+            return monotone_ot_loss(p, g, **self.emdv2_kwargs)
         return exact_emd_loss(p, g)
 
     def forward(self, pred, target, weight=None, avg_factor=None,
@@ -556,6 +707,8 @@ class PolylineGeomCost(object):
                  pgf_w1=1.0,
                  pgf_w2=0.5,
                  pgf_wc=0.5,
+                 emdv2_pointwise_reduction='sum',
+                 emdv2_spacing_w=0.0,
                  normalize_median=True,
                  max_cost_elems=64_000_000,
                  pc_range=None,
@@ -586,6 +739,7 @@ class PolylineGeomCost(object):
                                  arc_marginals=cwot_arc_marginals,
                                  squared=cwot_squared)
         self.pgf_kwargs = dict(w0=pgf_w0, w1=pgf_w1, w2=pgf_w2, wc=pgf_wc)
+        self.emdv2_pointwise_reduction = emdv2_pointwise_reduction
         # The source normalises cwot/emd costs by their median before adding
         # the class term, so the geometry term's scale doesn't swamp it.
         # Kept, since MapTR likewise sums cls/reg/iou/pts costs unweighted
@@ -658,7 +812,7 @@ class PolylineGeomCost(object):
         # not an approximation -- the collapsed slices are ones the active
         # mode provably cannot tell apart.
         pad_mask = gt_slice_padding_mask(gt_flat)
-        if self.dedup_gt_slices and self.mode in ('cwot', 'emd'):
+        if self.dedup_gt_slices and self.mode in ('cwot', 'emd', 'emdv2'):
             keep, inverse = gt_slice_groups(gt_flat,
                                             permutation_invariant=(
                                                 self.mode == 'emd'))
@@ -696,6 +850,25 @@ class PolylineGeomCost(object):
                         ri, ci = linear_sum_assignment(d_np[i, j])
                         cost_np[lo + i, j] = d_np[i, j][ri, ci].mean()
             cost = pts_pred.new_tensor(cost_np)
+        elif self.mode == 'emdv2':
+            # Order-preserving DTW, batched over (query x gt-slice).
+            elems_per_query = M_work * num_pts * num_pts
+            chunk = max(1, int(self.max_cost_elems // max(elems_per_query, 1)))
+            parts = []
+            for lo in range(0, Q, chunk):
+                hi = min(lo + chunk, Q)
+                q = hi - lo
+                pe = pts_pred[lo:hi, None].expand(
+                    q, M_work, num_pts, num_coords).reshape(-1, num_pts,
+                                                            num_coords)
+                ge = gt_work[None].expand(
+                    q, M_work, num_pts, num_coords).reshape(-1, num_pts,
+                                                            num_coords)
+                v = batched_monotone_ot_cost(pe, ge).view(q, M_work)
+                if self.emdv2_pointwise_reduction == 'sum':
+                    v = v * float(num_pts)
+                parts.append(v)
+            cost = torch.cat(parts, dim=0)
         else:  # cwot
             cost = pts_pred.new_zeros((Q, M_work))
             for i in range(Q):
@@ -703,7 +876,7 @@ class PolylineGeomCost(object):
                     cost[i, j] = curve_ot_loss(pts_pred[i], gt_work[j],
                                                 **self.cwot_kwargs)
 
-        if self.normalize_median and self.mode in ('cwot', 'emd'):
+        if self.normalize_median and self.mode in ('cwot', 'emd', 'emdv2'):
             # Normalise against REAL geometry only. The cost matrix is
             # ~89.5% padding columns here (gt_slice_padding_mask), and their
             # cost is a distance to the -10000 sentinel -- enormous. Taking
