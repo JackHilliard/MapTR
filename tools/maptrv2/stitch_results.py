@@ -132,6 +132,33 @@ def results_to_pieces(blob, origins, score_thresh=0.0):
     return pieces, tokens, skipped
 
 
+def suppress_duplicates(pieces, tol):
+    """Within-tile NMS: drop a prediction whose symmetric chamfer distance
+    to a higher-scoring kept prediction of the same tile and class is below
+    ``tol``. The head emits a fixed 25/50 instances per tile and a real line
+    often comes out two or three times at slightly different confidences;
+    stitching those across tiles would join each copy separately."""
+    by_tile = {}
+    for p in pieces:
+        by_tile.setdefault((p['source'], p['cls']), []).append(p)
+    keep = []
+    for group in by_tile.values():
+        group.sort(key=lambda p: -p['score'])
+        kept = []
+        for p in group:
+            dup = False
+            for q in kept:
+                d1, _, _ = ps.polyline_distance(p['points'], q['points'])
+                d2, _, _ = ps.polyline_distance(q['points'], p['points'])
+                if 0.5 * (d1.mean() + d2.mean()) < tol:
+                    dup = True
+                    break
+            if not dup:
+                kept.append(p)
+        keep.extend(kept)
+    return keep
+
+
 def stitch(pieces, tol, consensus, smooth_iters):
     live = [p for p in pieces if not p.get('frozen')]
     frozen = [p for p in pieces if p.get('frozen')]
@@ -279,6 +306,16 @@ def main(argv=None):
                     help='predictions below this confidence are passed '
                          'through untouched and never merged (default 0: '
                          'everything merges)')
+    ap.add_argument('--nms-tol', type=float, default=None, metavar='M',
+                    help='within-tile duplicate suppression: drop a '
+                         'prediction whose mean chamfer distance to a '
+                         'higher-scoring kept one is under M metres '
+                         '(applied to predictions above --score-thresh; '
+                         'the rest are frozen anyway)')
+    ap.add_argument('--drop-frozen', action='store_true',
+                    help='discard predictions below --score-thresh instead '
+                         'of passing them through (a "best polylines only" '
+                         'output; do not use for AP, which needs the tail)')
     ap.add_argument('--num-pts', type=int, default=20,
                     help='vertices per output polyline (the head\'s 20)')
     ap.add_argument('--clip-to-tile', type=float, default=None, metavar='R',
@@ -318,6 +355,16 @@ def main(argv=None):
         if skipped:
             print(f'[warn] {skipped} tiles in the results are not in the '
                   'pkl and were dropped')
+        if args.drop_frozen:
+            pieces = [p for p in pieces if not p.get('frozen')]
+        if args.nms_tol is not None:
+            live = suppress_duplicates(
+                [p for p in pieces if not p.get('frozen')], args.nms_tol)
+            n_before = sum(1 for p in pieces if not p.get('frozen'))
+            pieces = live + [p for p in pieces if p.get('frozen')]
+            print(f'[nms] {n_before} -> {len(live)} confident predictions '
+                  f'after within-tile duplicate suppression at '
+                  f'{args.nms_tol} m')
         merged = stitch(pieces, args.merge_tol, args.consensus, args.smooth)
         n_multi = sum(1 for m in merged if m['n_members'] > 1)
         n_frozen = sum(1 for p in pieces if p.get('frozen'))
