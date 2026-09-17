@@ -179,11 +179,13 @@ def parse_smooth(spec):
     return method, params
 
 
-def stitch(pieces, tol, consensus, smooth_spec):
+def stitch(pieces, tol, consensus, smooth_spec, bridge_gap=0.0,
+           bridge_angle=30.0):
     live = [p for p in pieces if not p.get('frozen')]
     frozen = [p for p in pieces if p.get('frozen')]
     merged = ps.merge_grouped(live, key=lambda p: p['cls'], tol=tol,
-                              consensus=consensus)
+                              consensus=consensus, bridge_gap=bridge_gap,
+                              bridge_angle=bridge_angle)
     method, params = parse_smooth(smooth_spec)
     if method != 'none':
         for m in merged:
@@ -319,6 +321,12 @@ def main(argv=None):
     ap.add_argument('--merge-tol', type=float, default=1.0,
                     help='m; two tiles\' copies of one line may differ by '
                          'this much and still be joined (default 1.0)')
+    ap.add_argument('--bridge-gap', type=float, default=0.0, metavar='M',
+                    help='also join two pieces whose ends face each other '
+                         'across a gap of up to M metres with agreeing '
+                         'headings (for crops that do not overlap; 0 = off)')
+    ap.add_argument('--bridge-angle', type=float, default=30.0,
+                    help='max heading disagreement for a bridge (degrees)')
     ap.add_argument('--consensus', action='store_true',
                     help='blend the overlap zone by confidence')
     ap.add_argument('--smooth', default='0', metavar='METHOD[:PARAMS]',
@@ -391,7 +399,8 @@ def main(argv=None):
             print(f'[nms] {n_before} -> {len(live)} confident predictions '
                   f'after within-tile duplicate suppression at '
                   f'{args.nms_tol} m')
-        merged = stitch(pieces, args.merge_tol, args.consensus, args.smooth)
+        merged = stitch(pieces, args.merge_tol, args.consensus, args.smooth,
+                        args.bridge_gap, args.bridge_angle)
         n_multi = sum(1 for m in merged if m['n_members'] > 1)
         n_frozen = sum(1 for p in pieces if p.get('frozen'))
         print(f'[stitch] {len(pieces)} predictions over {len(tokens)} tiles '
@@ -399,7 +408,7 @@ def main(argv=None):
               'untouched) '
               f'-> {len(merged)} world lines, {n_multi} of them joined '
               f'across tiles (tol {args.merge_tol} m, consensus='
-              f'{args.consensus}, smooth={args.smooth}) '
+              f'{args.consensus}, smooth={args.smooth}, bridge_gap={args.bridge_gap}) '
               f'({time.time() - t0:.1f}s)')
         per_token = reclip(merged, tokens, origins, radius, args.num_pts,
                            args.extend)

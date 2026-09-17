@@ -69,6 +69,21 @@ def synthetic():
     # clip
     sub = ps.clip_to_box([line(-40, 40, 81)], (-15, -15, 15, 15))
     assert len(sub) == 1 and abs(sub[0][0, 0] + 15) < 1e-6 and abs(sub[0][-1, 0] - 15) < 1e-6
+    # gap bridging: collinear pieces across a 6 m gap join only when asked
+    ga, gb = line(-15, -3, 13), line(3, 15, 13)
+    assert len(ps.merge_pieces([ps.Piece(points=ga), ps.Piece(points=gb)], tol=1.0)) == 2
+    m = ps.merge_pieces([ps.Piece(points=ga), ps.Piece(points=gb[::-1])], tol=1.0, bridge_gap=8.0)
+    assert len(m) == 1 and abs(ps.polyline_length(m[0]['points']) - 30) < 1e-6, m
+    # too wide a gap, a lateral offset, or a heading mismatch: refused
+    assert len(ps.merge_pieces([ps.Piece(points=ga), ps.Piece(points=gb)], tol=1.0, bridge_gap=5.0)) == 2
+    assert len(ps.merge_pieces([ps.Piece(points=ga), ps.Piece(points=line(3, 15, 13, y=3.0))], tol=1.0, bridge_gap=8.0)) == 2
+    turn = np.stack([np.full(13, 3.0) + np.linspace(0, 12, 13) * 0.3, np.linspace(0, 12, 13)], 1)
+    assert len(ps.merge_pieces([ps.Piece(points=ga), ps.Piece(points=turn)], tol=1.0, bridge_gap=8.0)) == 2
+    # a bridge across a gentle arc: pieces of one circle 4 m apart
+    ta = np.linspace(0, 0.5, 20); tb = np.linspace(0.7, 1.2, 20)
+    ca = np.stack([20 * np.cos(ta), 20 * np.sin(ta)], 1); cb = np.stack([20 * np.cos(tb), 20 * np.sin(tb)], 1)
+    m = ps.merge_pieces([ps.Piece(points=ca), ps.Piece(points=cb)], tol=1.0, bridge_gap=8.0)
+    assert len(m) == 1, m
     # smoothers: endpoints pinned, jitter reduced, arcs not collapsed
     rng = np.random.RandomState(1)
     th = np.linspace(0, np.pi / 2, 40)

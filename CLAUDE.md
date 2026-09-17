@@ -2444,6 +2444,44 @@ duplicate suppression is what turned the earlier -0.001 into +0.001.
 Renders per example and method: `stitched_best/compare_*.png` beside that
 run, from `stitched_best/render_compare.py`.
 
+**Non-90-degree corners and slight arcs (2026-09-17).** Chaining GT roads
+end-to-end through degree-2 joins (ids change at every curve) finds: one
+road with two 90-degree corners, one 256 m chain with two ~50-degree corners,
+and a handful of slight S-curves (5-6 degree bends). Renders in that run's
+`stitched_best/rgb_*.png`: slight arcs merge as well as straights (62 pieces
+-> 26 lines, 16 joined along a gently curving road); at a corner the merge
+succeeds when the model predicted the curve in at least one tile and fails
+where the per-tile pieces stop short of each other, which is a gap, not a
+disagreement.
+
+**The 50 m-crop run (`work_dirs/abl_C_lr05x`, test export
+`../carla_test_V2`, 2170 crops) needs a different route to the world frame
+and a different join.** There is no converter pkl: the eval crops are 30 m
+windows aimed off the 50 m tile centre by a seeded rule (every crop sits the
+full 10 m off-centre, `_draw_crop`). The crop poses were dumped by building
+`CustomCarla50mCropDataset` in the container (`tmpjob/dump_crop_pkl.py`) into
+a converter-shaped pkl (`annotation_origin` = tile centre + shift, z = tile
+centre elevation) that the host tools read unchanged; the tool's "before"
+mAP (0.8586) reproduces the run's logged value exactly, which is the check
+that the frames are right. The crops sit on a **37.5 m stride, so they do
+not overlap**: lines stop at crop edges with 7-27 m gaps between them, and
+the overlap merge has nothing to join on a straight road. Hence
+`--bridge-gap M` (`_try_bridge`): two pieces whose ends face each other
+within M metres are joined when the master's outward tangent, the gap
+direction and the piece's onward tangent agree within `--bridge-angle` (30
+degrees) and the lateral offset is within tolerance. Opt-in; the overlapping
+30 m export does not need it. On abl_C_lr05x with the standard recipe:
+
+| variant | joined | mAP | delta |
+|---|---|---|---|
+| original | | 0.8586 | |
+| consensus + chaikin | 1,328 | 0.8637 | +0.0050 |
+| + `--bridge-gap 15` | 1,929 | 0.8584 | -0.0002 |
+
+The bridged span lies in the gap between crops, which the per-crop eval
+never sees, so bridging cannot score; the +0.005 without it is the in-crop
+duplicate suppression and consensus. Renders: `abl_C_lr05x/Sat_Sep_12_01_31_58_2026/stitched_best/rgb_*_bridge.png`.
+
 This is the cheapest possible version of "amend each tile from its
 neighbours", and it was meant as the go/no-go for a learned one (a
 neighbour-prior raster concatenated before `lidar_bev_proj`, trained with

@@ -307,15 +307,75 @@ def _blend(master, piece, tol, w_master, w_piece):
     return master
 
 
-def _try_join(master, piece, tol, consensus, w_master, w_piece):
+def _end_dir(pts, at_end):
+    """Unit direction of the last (or, reversed, first) segment longer than
+    a few cm, so a duplicated end vertex does not give a zero vector."""
+    q = pts[:, :2] if at_end else pts[::-1, :2]
+    for k in range(len(q) - 1, 0, -1):
+        v = q[k] - q[k - 1]
+        n = np.linalg.norm(v)
+        if n > 0.05:
+            return v / n
+    return None
+
+
+def _try_bridge(master, piece, tol, gap, angle_deg):
+    """Join across a GAP: the piece neither overlaps nor touches the master
+    but one of its ends faces one of the master's ends within ``gap`` m,
+    the master's outward tangent, the gap direction and the piece's onward
+    tangent all agree within ``angle_deg``, and the piece's end sits within
+    ``tol`` (or 15% of the gap) of the master's end tangent line. Tiles
+    whose crops do not overlap (the 50 m export's 30 m crops on a 37.5 m
+    stride) leave every line cut at the crop edge with nothing to overlap;
+    this is the only way to reconnect them. Returns the joined line
+    (master first) or None."""
+    cos_lim = np.cos(np.radians(angle_deg))
+    best = None
+    for m_end in (True, False):
+        m_pt = master[-1, :2] if m_end else master[0, :2]
+        m_out = _end_dir(master, m_end)      # outward tangent at that end
+        if m_out is None:
+            continue
+        for forward in (True, False):        # which end of the piece faces us
+            q = piece if forward else piece[::-1]
+            p_in = _end_dir(q, False)        # points from q[1] toward q[0]
+            if p_in is None:
+                continue
+            p_in = -p_in                     # onward direction leaving q[0]
+            g = q[0, :2] - m_pt
+            dist = float(np.linalg.norm(g))
+            if dist < 1e-6 or dist > gap:
+                continue
+            g_dir = g / dist
+            if (m_out @ g_dir) < cos_lim or (m_out @ p_in) < cos_lim:
+                continue
+            lateral = abs(float(np.cross(m_out, g)))
+            if lateral > max(tol, 0.15 * dist):
+                continue
+            if best is None or dist < best[0]:
+                best = (dist, m_end, q)
+    if best is None:
+        return None
+    _, m_end, q = best
+    if m_end:
+        return np.concatenate([master, q], axis=0)
+    return np.concatenate([q[::-1], master], axis=0)
+
+
+def _try_join(master, piece, tol, consensus, w_master, w_piece,
+              bridge_gap=0.0, bridge_angle=30.0):
     """Join ``piece`` onto ``master`` if it is the same line.
 
     The piece may extend the master at its start, its end, both, or not at
     all (a duplicate, absorbed). Anything else -- a piece that leaves the
     master's locus in the middle -- is a different line and is refused.
+    With ``bridge_gap`` > 0 a piece that does not touch the master at all
+    may still be joined across a gap (see ``_try_bridge``).
     """
     o = _orient(piece, master, tol)
     if o is None:
+        if bridge_gap > 0:
+            return _try_bridge(master, piece, tol, bridge_gap, bridge_angle)
         return None
     piece, cov = o
     lead, trail, middle_ok = _runs(cov)
@@ -362,7 +422,8 @@ def _bbox(pts):
 
 
 def merge_pieces(pieces: Sequence[Piece], tol: float, consensus=False,
-                 min_len: float = 0.0) -> List[Piece]:
+                 min_len: float = 0.0, bridge_gap: float = 0.0,
+                 bridge_angle: float = 30.0) -> List[Piece]:
     """Merge fragments of the same line into one polyline each.
 
     ``pieces`` must already be one group (same class, and for GT the same
@@ -407,18 +468,20 @@ def merge_pieces(pieces: Sequence[Piece], tol: float, consensus=False,
         changed = True
         while changed and alive.any():
             changed = False
+            reach = tol + bridge_gap
             cand = np.flatnonzero(
-                alive & (boxes[:, 0] <= mbox[2] + tol)
-                & (boxes[:, 2] >= mbox[0] - tol)
-                & (boxes[:, 1] <= mbox[3] + tol)
-                & (boxes[:, 3] >= mbox[1] - tol))
+                alive & (boxes[:, 0] <= mbox[2] + reach)
+                & (boxes[:, 2] >= mbox[0] - reach)
+                & (boxes[:, 1] <= mbox[3] + reach)
+                & (boxes[:, 3] >= mbox[1] - reach))
             for j in cand:
                 piece = pieces[j]
                 src = piece.get('source')
                 if src is not None and src in sources:
                     continue
                 joined = _try_join(master, pts_list[j], tol, consensus,
-                                   score, float(piece.get('score', 1.0)))
+                                   score, float(piece.get('score', 1.0)),
+                                   bridge_gap, bridge_angle)
                 if joined is None:
                     continue
                 master = joined
@@ -442,14 +505,17 @@ def merge_pieces(pieces: Sequence[Piece], tol: float, consensus=False,
 
 def merge_grouped(pieces: Sequence[Piece],
                   key: Callable[[Piece], Hashable], tol: float,
-                  consensus=False, min_len: float = 0.0) -> List[Piece]:
+                  consensus=False, min_len: float = 0.0,
+                  bridge_gap: float = 0.0,
+                  bridge_angle: float = 30.0) -> List[Piece]:
     """``merge_pieces`` within each ``key`` group, concatenated."""
     groups: Dict[Hashable, List[Piece]] = {}
     for p in pieces:
         groups.setdefault(key(p), []).append(p)
     out: List[Piece] = []
     for k in groups:
-        out.extend(merge_pieces(groups[k], tol, consensus, min_len))
+        out.extend(merge_pieces(groups[k], tol, consensus, min_len,
+                                bridge_gap, bridge_angle))
     return out
 
 
