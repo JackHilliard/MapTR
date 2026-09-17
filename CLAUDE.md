@@ -2418,6 +2418,32 @@ world lines, **33,147 joined across tiles**):
   continuity (one line per road across a town instead of one per tile),
   which this metric does not measure and downstream use does.
 
+**Smoothers compared (2026-09-17).** `polyline_stitch.smooth()` offers
+`chaikin`, `savgol`, `spline` (discrete Whittaker), `gaussian`, `laplacian`
+(with a fidelity spring) and `dp` (Douglas-Peucker), all numpy, endpoints
+pinned; `stitch_results.py --smooth METHOD[:PARAMS]`. Same recipe as
+above plus `--nms-tol 1.0` (within-tile duplicate suppression), on the
+converged 2-class run:
+
+| smoother | mAP | delta |
+|---|---|---|
+| (original) | 0.7035 | |
+| none | 0.7042 | +0.0006 |
+| chaikin:1 | 0.7045 | +0.0010 |
+| savgol (w7, o3) | 0.7039 | +0.0004 |
+| spline (lam 4) | 0.7042 | +0.0007 |
+| gaussian (sigma 1.5) | 0.7044 | +0.0009 |
+| laplacian (20 it) | 0.7043 | +0.0008 |
+| dp (0.3 m) | 0.7024 | -0.0012 |
+
+All within +-0.001 of each other: the per-tile predictions are already
+smooth at 20 vertices per 15-30 m, so the smoother barely matters on
+chamfer AP, and DP is the only one that costs anything (it trades vertices
+for up to 0.3 m of chord error, which the 0.5 m threshold sees). The
+duplicate suppression is what turned the earlier -0.001 into +0.001.
+Renders per example and method: `stitched_best/compare_*.png` beside that
+run, from `stitched_best/render_compare.py`.
+
 This is the cheapest possible version of "amend each tile from its
 neighbours", and it was meant as the go/no-go for a learned one (a
 neighbour-prior raster concatenated before `lidar_bev_proj`, trained with
