@@ -69,6 +69,31 @@ def synthetic():
     # clip
     sub = ps.clip_to_box([line(-40, 40, 81)], (-15, -15, 15, 15))
     assert len(sub) == 1 and abs(sub[0][0, 0] + 15) < 1e-6 and abs(sub[0][-1, 0] - 15) < 1e-6
+    # smoothers: endpoints pinned, jitter reduced, arcs not collapsed
+    rng = np.random.RandomState(1)
+    th = np.linspace(0, np.pi / 2, 40)
+    arc = np.stack([20 * np.cos(th), 20 * np.sin(th)], 1)
+    noisy = arc + rng.normal(0, 0.15, arc.shape)
+    noisy[0], noisy[-1] = arc[0], arc[-1]
+    def rms_to_arc(p):
+        d, _, _ = ps.polyline_distance(p, ps.resample_polyline(arc, 400))
+        return float(np.sqrt((d ** 2).mean()))
+    base = rms_to_arc(noisy)
+    for name in ('chaikin', 'savgol', 'spline', 'gaussian', 'laplacian', 'dp'):
+        out = ps.smooth(noisy, name)
+        assert np.allclose(out[0], noisy[0]) and np.allclose(out[-1], noisy[-1]), name
+        err = rms_to_arc(out)
+        if name == 'dp':
+            # simplification, not denoising: it may not beat the noise, but
+            # it must stay within its own tolerance and drop vertices
+            assert err < 0.3 and len(out) < len(noisy), (name, err, len(out))
+        else:
+            assert err < base, (name, err, base)
+            assert err < 0.25, (name, err)   # no smoother may drag the arc inward by more than this
+    # dp keeps a genuine corner
+    corner = np.array([[0, 0], [5, 0], [10, 0], [10, 5], [10, 10.]])
+    assert len(ps.douglas_peucker(corner, 0.3)) == 3
+    assert ps.smooth(corner, 'none') is not None
     print('synthetic OK')
 
 

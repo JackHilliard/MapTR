@@ -41,7 +41,9 @@ import numpy as np
 
 __all__ = [
     'Piece', 'polyline_distance', 'polyline_length', 'resample_polyline',
-    'merge_pieces', 'merge_grouped', 'chaikin', 'clip_polyline_to_box',
+    'merge_pieces', 'merge_grouped', 'chaikin', 'savgol', 'smoothing_spline',
+    'gaussian_smooth', 'laplacian_smooth', 'douglas_peucker', 'smooth',
+    'SMOOTHERS', 'clip_polyline_to_box',
     'clip_to_box', 'shift_polylines',
 ]
 
@@ -449,3 +451,140 @@ def merge_grouped(pieces: Sequence[Piece],
     for k in groups:
         out.extend(merge_pieces(groups[k], tol, consensus, min_len))
     return out
+
+
+# ---------------------------------------------------------------------------
+# smoothing
+#
+# Every smoother here (except Chaikin, which subdivides, and Douglas-Peucker,
+# which only removes vertices) first resamples the line to evenly spaced
+# vertices -- kernel and penalty methods assume that -- and pins both
+# endpoints, so a stitched line never shrinks away from the tile edge it was
+# clipped at. All numpy: the host has no guarantee of scipy and this file
+# must import in both places.
+# ---------------------------------------------------------------------------
+def _even(pts, spacing):
+    pts = np.asarray(pts, dtype=np.float64)
+    n = max(3, int(round(polyline_length(pts) / spacing)) + 1)
+    return resample_polyline(pts, n)
+
+
+def _pin(out, pts):
+    out[0], out[-1] = pts[0], pts[-1]
+    return out
+
+
+def savgol(pts, window=7, order=3, spacing=0.5):
+    """Savitzky-Golay: least-squares local polynomial of ``order`` over a
+    sliding ``window`` (odd) of evenly spaced vertices. Removes jitter while
+    keeping curvature. Near the ends the window is shifted inward and the
+    polynomial evaluated at the vertex's own offset; endpoints pinned."""
+    pts = _even(pts, spacing)
+    n = len(pts)
+    window = min(window if window % 2 else window + 1, n if n % 2 else n - 1)
+    if window < order + 2:
+        return pts
+    h = window // 2
+    x = np.arange(-h, h + 1, dtype=np.float64)
+    pinv = np.linalg.pinv(np.vander(x, order + 1, increasing=True))
+    out = np.empty_like(pts)
+    for i in range(n):
+        lo, hi = max(0, i - h), min(n, i + h + 1)
+        if hi - lo < window:
+            lo, hi = (0, window) if i < h else (n - window, n)
+        t = np.array([i - lo - h], dtype=np.float64)
+        w = np.vander(t, order + 1, increasing=True)[0] @ pinv
+        out[i] = w @ pts[lo:hi]
+    return _pin(out, pts)
+
+
+def smoothing_spline(pts, lam=4.0, spacing=0.5):
+    """Discrete cubic smoothing spline (Whittaker smoother): minimise
+    ||z - p||^2 + lam * ||D2 z||^2 per coordinate over evenly spaced
+    vertices, with the endpoints held by a large data weight. ``lam`` in
+    vertex units^4: larger is smoother. Dense solve; lines here have tens of
+    vertices."""
+    pts = _even(pts, spacing)
+    n = len(pts)
+    if n < 4:
+        return pts
+    D = np.zeros((n - 2, n))
+    for i in range(n - 2):
+        D[i, i:i + 3] = (1.0, -2.0, 1.0)
+    W = np.ones(n)
+    W[0] = W[-1] = 1e6
+    A = np.diag(W) + lam * (D.T @ D)
+    z = np.linalg.solve(A, W[:, None] * pts)
+    return _pin(z, pts)
+
+
+def gaussian_smooth(pts, sigma=1.5, spacing=0.5):
+    """Gaussian kernel over the vertex index of an evenly spaced line
+    (``sigma`` in vertices), renormalised at the ends, endpoints pinned."""
+    pts = _even(pts, spacing)
+    n = len(pts)
+    r = int(np.ceil(3 * sigma))
+    k = np.exp(-0.5 * (np.arange(-r, r + 1) / sigma) ** 2)
+    out = np.empty_like(pts)
+    for i in range(n):
+        lo, hi = max(0, i - r), min(n, i + r + 1)
+        w = k[lo - i + r:hi - i + r]
+        out[i] = (w[:, None] * pts[lo:hi]).sum(0) / w.sum()
+    return _pin(out, pts)
+
+
+def laplacian_smooth(pts, iters=20, step=0.5, fidelity=0.2, spacing=0.5):
+    """Iterative Laplacian smoothing with a spring back to the original
+    vertex: z <- z + step * (L z) - fidelity * (z - p). The fidelity term
+    stops the inward drift that plain Laplacian (and Chaikin) shows on
+    arcs."""
+    p = _even(pts, spacing)
+    z = p.copy()
+    for _ in range(iters):
+        lap = np.zeros_like(z)
+        lap[1:-1] = 0.5 * (z[:-2] + z[2:]) - z[1:-1]
+        z = z + step * lap - fidelity * (z - p)
+        z[0], z[-1] = p[0], p[-1]
+    return z
+
+
+def douglas_peucker(pts, tol=0.3):
+    """Ramer-Douglas-Peucker simplification: drop vertices within ``tol`` of
+    the chord between kept ones. Removes jitter, keeps real corners sharp."""
+    pts = np.asarray(pts, dtype=np.float64)
+    if len(pts) < 3:
+        return pts
+    keep = np.zeros(len(pts), dtype=bool)
+    keep[0] = keep[-1] = True
+    stack = [(0, len(pts) - 1)]
+    while stack:
+        a, b = stack.pop()
+        if b - a < 2:
+            continue
+        d, _, _ = polyline_distance(pts[a + 1:b], pts[[a, b]])
+        k = int(np.argmax(d))
+        if d[k] > tol:
+            keep[a + 1 + k] = True
+            stack.append((a, a + 1 + k))
+            stack.append((a + 1 + k, b))
+    return pts[keep]
+
+
+SMOOTHERS = {
+    'none': lambda p, **kw: np.asarray(p, dtype=np.float64),
+    'chaikin': lambda p, iters=1, **kw: chaikin(p, iters),
+    'savgol': lambda p, window=7, order=3, **kw: savgol(p, window, order),
+    'spline': lambda p, lam=4.0, **kw: smoothing_spline(p, lam),
+    'gaussian': lambda p, sigma=1.5, **kw: gaussian_smooth(p, sigma),
+    'laplacian': lambda p, iters=20, step=0.5, fidelity=0.2, **kw:
+        laplacian_smooth(p, iters, step, fidelity),
+    'dp': lambda p, tol=0.3, **kw: douglas_peucker(p, tol),
+}
+
+
+def smooth(pts, method='chaikin', **params):
+    """Dispatch by name; see ``SMOOTHERS`` for the parameter each takes."""
+    if method not in SMOOTHERS:
+        raise ValueError(f'unknown smoother {method!r}; '
+                         f'one of {sorted(SMOOTHERS)}')
+    return SMOOTHERS[method](pts, **params)

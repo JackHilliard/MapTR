@@ -159,14 +159,35 @@ def suppress_duplicates(pieces, tol):
     return keep
 
 
-def stitch(pieces, tol, consensus, smooth_iters):
+def parse_smooth(spec):
+    """'chaikin', 'chaikin:2', 'savgol:window=9,order=3', 'spline:lam=8' ->
+    (method, params). A bare integer keeps the old meaning: Chaikin passes."""
+    if spec is None:
+        return 'none', {}
+    if isinstance(spec, int) or str(spec).isdigit():
+        n = int(spec)
+        return ('chaikin', dict(iters=n)) if n > 0 else ('none', {})
+    method, _, rest = str(spec).partition(':')
+    params = {}
+    for kv in filter(None, rest.split(',')):
+        k, _, v = kv.partition('=')
+        if not v:                       # positional single param
+            k, v = {'chaikin': 'iters', 'spline': 'lam', 'gaussian': 'sigma',
+                    'dp': 'tol', 'savgol': 'window',
+                    'laplacian': 'iters'}[method], k
+        params[k] = int(v) if v.lstrip('-').isdigit() else float(v)
+    return method, params
+
+
+def stitch(pieces, tol, consensus, smooth_spec):
     live = [p for p in pieces if not p.get('frozen')]
     frozen = [p for p in pieces if p.get('frozen')]
     merged = ps.merge_grouped(live, key=lambda p: p['cls'], tol=tol,
                               consensus=consensus)
-    if smooth_iters > 0:
+    method, params = parse_smooth(smooth_spec)
+    if method != 'none':
         for m in merged:
-            m['points'] = ps.chaikin(m['points'], smooth_iters)
+            m['points'] = ps.smooth(m['points'], method, **params)
     for p in frozen:
         q = ps.Piece(p)
         q['members'] = [p]
@@ -300,8 +321,13 @@ def main(argv=None):
                          'this much and still be joined (default 1.0)')
     ap.add_argument('--consensus', action='store_true',
                     help='blend the overlap zone by confidence')
-    ap.add_argument('--smooth', type=int, default=0, metavar='ITERS',
-                    help='Chaikin corner-cutting passes on every line')
+    ap.add_argument('--smooth', default='0', metavar='METHOD[:PARAMS]',
+                    help='smoother for every merged line: none, chaikin[:N], '
+                         'savgol[:window=7,order=3], spline[:lam=4], '
+                         'gaussian[:sigma=1.5], laplacian[:iters=20,step=0.5,'
+                         'fidelity=0.2], dp[:tol=0.3]. A bare integer is '
+                         'Chaikin passes (0 = none). See '
+                         'polyline_stitch.SMOOTHERS.')
     ap.add_argument('--score-thresh', type=float, default=0.0,
                     help='predictions below this confidence are passed '
                          'through untouched and never merged (default 0: '
