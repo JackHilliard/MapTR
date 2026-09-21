@@ -1,8 +1,8 @@
 """Merging, blending, smoothing and re-clipping of tile-clipped polylines.
 
-Pure numpy, no torch / mmdet / shapely -- deliberately, so the same code runs
-inside the training container (``CustomCarlaNeighbourhoodDataset`` stitches
-its GT with it) AND on the host (``tools/maptrv2/stitch_results.py`` merges
+Pure numpy, no torch / mmdet / shapely -- deliberately, so it imports both
+inside the training container (``carla50m_crop_dataset`` takes its clipper
+from here) AND on the host (``tools/maptrv2/stitch_results.py`` merges
 predictions with it, like ``dataset_viewer.py`` and ``reorder_results.py``
 run without the container). The host tool loads this file by path because
 ``projects.mmdet3d_plugin`` cannot be imported without torch.
@@ -21,10 +21,10 @@ joining them.
 ``merge_pieces`` is the one algorithm, used in two regimes:
 
 * **GT** (exact): pieces are clipped copies of one master polyline, so
-  their shared vertices coincide to float precision and a tile-edge vertex
-  lies exactly on the other piece's segment. Keyed by ``(class, road_id)``
-  with ``tol`` 5 cm, the join is exact -- no heuristics decide which lines
-  are the same, the export's own ids do.
+  their shared vertices coincide to ~4 cm and a tile-edge vertex lies on
+  the other piece's segment. Keyed by ``(class, road_id)`` with ``tol``
+  5 cm, the join is exact -- no heuristics decide which lines are the
+  same, the export's own ids do (used by the tests to check the merge).
 * **predictions** (fuzzy): keyed by class only, ``tol`` ~1 m, and never two
   pieces from the same tile (the model already decided those were distinct
   instances). With ``consensus=True`` the overlap zone is blended: the

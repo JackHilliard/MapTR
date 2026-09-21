@@ -18,10 +18,9 @@ Host-side (json + numpy, no torch / mmdet3d / container -- like
    model changes; this is the "amend each tile from its neighbours" idea in
    its cheapest form, and its AP delta is the go/no-go for a learned version.
 
-2. **``--clip-to-tile R``** for predictions made on neighbourhood samples
-   (``CustomCarlaNeighbourhoodDataset``, +-39 m boxes): clips each sample's
-   predictions to the centre tile's +-R box so they can be scored against
-   the per-tile pkl, like for like with a single-tile run. No merging.
+2. **``--clip-to-tile R``** for predictions made on a larger box than the
+   GT they are to be scored on (a 50 m tile run scored on 30 m GT, say):
+   clips each sample's predictions to the centre +-R box. No merging.
 
 ``--eval`` scores before and after with ``dataset_viewer``'s numpy chamfer
 eval, which is verified bit-exact against the container's ``eval_map``.
@@ -35,10 +34,10 @@ Examples::
         -o <run>/stitched/pts_bbox/carlamap_results.json \
         --consensus --smooth 1 --score-thresh 0.3 --eval
 
-    # neighbourhood predictions -> per-tile predictions
-    python3 tools/maptrv2/stitch_results.py <nbhd_run>/pts_bbox/carlamap_results.json \
+    # clip a larger-box run's predictions to +-15 m before scoring on 30 m GT
+    python3 tools/maptrv2/stitch_results.py <run>/pts_bbox/carlamap_results.json \
         --gt data/carla/carla_map_infos_test_30m_tc_2cls.pkl \
-        -o <nbhd_run>/tile15/pts_bbox/carlamap_results.json --clip-to-tile 15 --eval
+        -o <run>/tile15/pts_bbox/carlamap_results.json --clip-to-tile 15 --eval
 
 Measured on the converged 2-class run (CLAUDE.md, "Multi-tile inference
 feasibility"): with every prediction allowed to merge, mAP drops 0.04 --
@@ -243,7 +242,7 @@ def reclip(merged, tokens, origins, radius, num_pts, extend='members'):
 
 
 def clip_to_tile(blob, radius, num_pts):
-    """Neighbourhood predictions (centre-tile frame) -> centre +-radius."""
+    """Predictions in a sample's own frame -> clipped to +-radius."""
     box = (-radius, -radius, radius, radius)
     out = {}
     for entry in blob['results']:
