@@ -2503,6 +2503,25 @@ local copy (excluded via `centred_test/manifest_valid.json`). Post-processing
 on the centred run: consensus + Chaikin + 15 m bridging joins 814 lines, mAP
 +0.0003.
 
+**The same weights on WHOLE 50 m tiles (2026-09-21):** mAP **0.654**
+(divider 0.596 / boundary 0.711) -- far above the centred 30 m crops (0.125)
+and below the aimed ones (0.859). `work_dirs/abl_C_lr05x/tiles50_test/`,
+config `abl_C_lr05x_50m.py` there: every range +-15 -> +-25 at the same
+resolution (sparse_shape 501, bev 200, 0.25 m cells). **On the LiDAR path
+the network has no size-dependent learned tensor**: `bev_embedding` and
+the learned `positional_encoding` only feed `attn_bev_encode` (camera), and
+the decoder attends over normalised coordinates -- so no weight surgery is
+needed (the positional embedding was resized 120 -> 200 anyway,
+`surgery_posenc.py`, harmlessly; the `bev_embedding` size mismatch that
+`load_checkpoint` reports is inert). What does change is implicit: the
+decoder learned lane geometry as a fraction of a 30 m range and sees it at
+0.6x that scale here. The 50 m tiles overlap by 12.5 m on the 37.5 m
+stride, so the overlap merge works again (1,678 joins; 8,781 confident
+predictions of median length 50 m, i.e. lines run tile edge to tile edge).
+Merging costs -0.006 mAP here. Renders
+`tiles50_test/stitched_best/rgb_*_bridge.png`: the two-gentle-bend section
+that the 30 m crops cut apart is continuous end to end.
+
 This is the cheapest possible version of "amend each tile from its
 neighbours", and it was meant as the go/no-go for a learned one (a
 neighbour-prior raster concatenated before `lidar_bev_proj`, trained with
