@@ -305,8 +305,12 @@ class CustomCarla50mCropDataset(CustomCarlaLocalMapDataset):
                 best = (float(d[j]), q[j])
         if best is not None:
             p = best[1]
-            for th in (0.0,) + tuple(
-                    np.linspace(0, 2 * np.pi, 8, endpoint=False)[1:]):
+            # the fallback may only try yaws when rotation is enabled; with
+            # rotate=False a crop that has no GT centred stays centred rather
+            # than being quietly rotated to find some
+            yaws = (0.0,) + (tuple(np.linspace(0, 2 * np.pi, 8, endpoint=False)[1:])
+                             if self.rotate else ())
+            for th in yaws:
                 c, s_ = np.cos(th), np.sin(th)
                 R = np.array([[c, -s_], [s_, c]], dtype=np.float64)
                 v = (p - centre) @ R.T

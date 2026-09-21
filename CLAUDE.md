@@ -2482,6 +2482,27 @@ The bridged span lies in the gap between crops, which the per-crop eval
 never sees, so bridging cannot score; the +0.005 without it is the in-crop
 duplicate suppression and consensus. Renders: `abl_C_lr05x/Sat_Sep_12_01_31_58_2026/stitched_best/rgb_*_bridge.png`.
 
+**Centred (un-augmented) crops on the same weights (2026-09-21).** Rerunning
+`abl_C_lr05x`'s best checkpoint (`mAP_epoch_28`) on `../carla_test_V2` with
+rotation, translation and noise all off -- every 30 m crop centred on its
+50 m tile -- gives **mAP 0.125** against 0.859 for the seeded aimed crops
+(`work_dirs/abl_C_lr05x/centred_test/`). Not a frame error: the tool's
+before-mAP reproduces the log on the aimed run, every centred crop holds GT
+(2170/2170, so the old "24% empty when centred" figure does not apply to
+this export), the mean pred->GT offset is 0.3 m with no direction, and the
+straight-road render is correctly placed. It is the model: the per-crop
+diagnostic (`stitched_best/diag_centred_vs_aimed_crops.png`) shows the same
+tile slid 10 m along the road detecting all four lane lines in the aimed
+crop and one or two, at low confidence, in the centred one. Top-1 residual
+median 1.5 m vs 0.26 m. Cause unknown; the training crops are always aimed
+so a GT vertex lies within 9 m of the crop centre, which is the obvious
+suspect. Two things had to change to run it at all: `_draw_crop`'s
+no-GT fallback tried 7 yaws regardless of `rotate=False` (fixed: it now
+honours the flag), and `town12_chunk_11_tile_00066.npz` is truncated in the
+local copy (excluded via `centred_test/manifest_valid.json`). Post-processing
+on the centred run: consensus + Chaikin + 15 m bridging joins 814 lines, mAP
++0.0003.
+
 This is the cheapest possible version of "amend each tile from its
 neighbours", and it was meant as the go/no-go for a learned one (a
 neighbour-prior raster concatenated before `lidar_bev_proj`, trained with
