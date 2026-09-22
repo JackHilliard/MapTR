@@ -2436,6 +2436,13 @@ mAP. Renders `abl_C_lr05x/t12_test/stitched_best/rgb_*_bridge.png` (long
 straight, two gentle bends, slight S, and the U-shaped road with two
 90-degree corners -- all four continuous after merging).
 
+The ordered-L1 baseline `work_dirs/c50m_ORIG` (same pipeline, lr 6e-4,
+best epoch 28) on the same Town12 tiles: **mAP 0.803** (divider 0.751 /
+boundary 0.855) vs 0.853 for the EMDv2 run; merge -0.009. Its renders in
+`c50m_ORIG/t12_test/stitched_best/` (`rgb_*` before/after and `classes_*`
+per class) show wobblier driving lines and spurious curbs on roads whose GT
+has none.
+
 **Paris-CARLA-3D (`../Paris-CARLA-3D/Paris`, real Velodyne data, no map
 GT):** tiled with `paris_test_30m` (`tile_paris_30m.py` beside the run --
 the grid exporter's tile loop reused via its own PLY reader, minus the rule
