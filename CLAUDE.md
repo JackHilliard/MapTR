@@ -2455,6 +2455,20 @@ lines and curbs; along the narrow street it follows the road; it fails at
 junctions and invents arcs in sparse edge tiles. Partial transfer from
 CARLA to real data, no fine-tuning.
 
+**sf_30m (USGS 3DEP San Francisco airborne LiDAR + NAIP colour, 107 tiles,
+no map GT; wrapped into `../sf_30m_ds/test` with a generated manifest and
+empty reference jsons):** both models essentially fail. 52 (abl_C_lr05x) and
+72 (c50m_ORIG) of ~5,350 predictions clear 0.3 confidence, on a transect
+that is one tile wide and 8.7 km long with three ~500 m street runs; the
+top-confidence tiles are shoreline and rooftops. The 3DEP data is sparse
+(~90k points per 30 m tile vs ~300k for the CARLA export), airborne (no
+vertical curb faces, road markings barely resolved), and NAIP-coloured;
+none of that resembles the training data. Renders
+`abl_C_lr05x/sf_test/stitched_best/sf_top5_both_models.png` and
+`rgb_run{1,2,3}_bridge.png` in both runs' `sf_test/stitched_best/`
+(`render_rgb.py --swap` draws the north-south transect horizontally and
+bands on the tile's own ground when there is no GT).
+
 Outputs and scripts live beside each run in `stitched_best/` (merged jsons
 per variant, world-frame lines, the crop-pose pkl, renders, and the
 `render_rgb.py` / `render_compare.py` / `dump_crop_pkl*.py` used).
