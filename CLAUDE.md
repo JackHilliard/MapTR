@@ -2424,6 +2424,30 @@ check that the frames are right. Three inputs to the same weights:
   50 m), the 12.5 m overlaps make the overlap merge work again, and the
   two-gentle-bend section the 30 m crops cut apart is continuous end to end.
 
+**Re-tiled Town12 test region (`../t12_test_30m`, 2026-09-21):** 1994 tiles
+at 30 m / 22.5 m stride over 34 chunks, every centre within 20 m
+(Chebyshev) of a V2 Town12 test-tile centre -- so no train ground -- and
+covering 894 of the 919 V2 Town12 test tiles. Same weights, whole tile,
+centred: **mAP 0.853** (divider 0.786 / boundary 0.919), i.e. the aimed-crop
+score. So regular 30 m tiles are fine; the 0.125 collapse is specific to
+30 m crops cut centred from the 50 m blocks, cause still unknown. Merge
+(consensus + Chaikin + 15 m bridge, 7.5 m overlaps): 1,177 joins, -0.016
+mAP. Renders `abl_C_lr05x/t12_test/stitched_best/rgb_*_bridge.png` (long
+straight, two gentle bends, slight S, and the U-shaped road with two
+90-degree corners -- all four continuous after merging).
+
+**Paris-CARLA-3D (`../Paris-CARLA-3D/Paris`, real Velodyne data, no map
+GT):** tiled with `paris_test_30m` (`tile_paris_30m.py` beside the run --
+the grid exporter's tile loop reused via its own PLY reader, minus the rule
+that drops tiles without GT; `labels` = the dataset's semantic id) into 148
+tiles, 30 m / 22.5 m stride, six Soufflot sections in one frame. Same
+weights, centred tiles: only **193 of 7,386 predictions** clear 0.3
+confidence. Quality by eye (`paris_test/stitched_best/paris_random_tiles_
+seed*.png`, `paris_overview.png`): on the wide boulevard it traces lane
+lines and curbs; along the narrow street it follows the road; it fails at
+junctions and invents arcs in sparse edge tiles. Partial transfer from
+CARLA to real data, no fine-tuning.
+
 Outputs and scripts live beside each run in `stitched_best/` (merged jsons
 per variant, world-frame lines, the crop-pose pkl, renders, and the
 `render_rgb.py` / `render_compare.py` / `dump_crop_pkl*.py` used).
