@@ -282,6 +282,7 @@ import json
 import os
 import os.path as osp
 import pickle
+import re
 import subprocess
 import sys
 import tempfile
@@ -1004,6 +1005,9 @@ def pkl_gt_frame(path):
     falls back; that file is only ever written by an eval run, whose frame
     is the config's, not something recorded in the file.
     """
+    if path and osp.isdir(path):
+        # reference_lines/*.json, centred on the tile by load_gt_reference
+        return 'tile_center'
     if not path or not path.endswith('.pkl'):
         return None
     cached = STATE['frame_cache'].get(path)
@@ -1134,7 +1138,10 @@ def tile_metrics(uid, results_path=None, gt_path=None, score_thresh=0.0):
         out.append(('run', 'precision', _fmt(ev.get('precision'), '{:.3f}')))
         out.append(('run', 'median matched chamfer',
                      _fmt(ev.get('chamfer'), '{:.3f}', ' m')))
-        out.append(('run', f'predictions ≥ {score_thresh:g}',
+        out.append(('run', ('predictions'
+                            if not results_meta(results_path).get(
+                                'has_scores', True)
+                            else f'predictions ≥ {score_thresh:g}'),
                      _fmt(ev['n_pred_kept'])))
         out.append(('run', 'count error (pred − GT)',
                      _fmt(ev['count_error'], '{:+.0f}')))
@@ -1580,6 +1587,12 @@ def discover_results(work_dir):
         a container without that path bind-mounted, those results were
         discarded when the container exited.
 
+    A third source is the text-polyline LLM (Carla_PC_LLM's
+    scripts/evaluate.py), which writes `eval_<subset>[_step<N>].json` --
+    a different schema, dispatched on by load_results(). Its `run.json` /
+    `val_history.json` siblings are not prediction files and are not
+    picked up.
+
     Returns {label: path}, newest first.
     """
     found = {}
@@ -1589,7 +1602,8 @@ def discover_results(work_dir):
             continue
         for dirpath, _dirnames, filenames in os.walk(root):
             for fn in filenames:
-                if fn.endswith('.json') and 'result' in fn.lower():
+                if fn.endswith('.json') and ('result' in fn.lower()
+                                             or fn.lower().startswith('eval')):
                     p = osp.join(dirpath, fn)
                     label = osp.relpath(p, work_dir if root == work_dir
                                          else osp.dirname(work_dir))
@@ -1598,20 +1612,120 @@ def discover_results(work_dir):
                         key=lambda kv: osp.getmtime(kv[1]), reverse=True))
 
 
-def load_results(path):
-    """Parse a carlamap_results.json into {sample_token: [(pts, score, cls)]}.
+# ---- text-polyline (LLM) predictions ----------------------------------------
+#
+# Carla_PC_LLM's Qwen runs emit each tile's map as TEXT, one polyline per
+# line -- `driving: 246,499 499,391` -- with the vertices quantised onto an
+# integer grid over the tile: cell = floor((metres + extent) / res), clipped
+# to [0, 2*extent/res - 1]. Its `polylines.quantise()` defaults to
+# extent=25.0 (the 50 m export's half width) and res=0.1, i.e. a 500-cell
+# grid, and the model is trained against those constants REGARDLESS of the
+# tile size it is fed -- so the decoder here takes them from --text-grid,
+# not from the block. dequantise() puts a vertex at the cell CENTRE:
+#     metres = (cell + 0.5) * res - extent
+# so cell 0 is -24.95 m and cell 499 is +24.95 m, never exactly +-25.
+#
+# The frame is the tile's own centre (the LLM's load_tile subtracts
+# `tile_center` xy), i.e. this viewer's 'tile_center' frame. There are NO
+# confidences: every line the model chose to write is a prediction it is
+# equally sure of, so they all carry score 1.0 here and everything that
+# ranks by score (top_n, the score threshold, count_health) has to know
+# that -- see results_meta().
+TEXT_GRID_EXTENT = 25.0
+TEXT_GRID_RES = 0.1
+# Same regex as Carla_PC_LLM's polylines._LINE, so the viewer counts exactly
+# the lines the LLM's own eval counted as unparsable (a stray non-digit
+# anywhere in the line rejects the whole line).
+_TEXT_LINE = re.compile(r"^\s*(\w+)\s*:\s*((?:-?\d+\s*,\s*-?\d+\s*)+)$")
 
-    Predicted points are already in the model's tile-local BEV frame (the
-    same frame as the LiDAR points fed in, i.e. the block's `offset`
-    frame), so unlike the GT reference lines they need no origin
-    subtraction -- they're plotted as-is.
+
+def parse_pred_text(text, extent=TEXT_GRID_EXTENT, res=TEXT_GRID_RES,
+                    classes=None):
+    """One tile's LLM output -> ([(pts_xy_metres, cls_name)], n_bad, n_out).
+
+    Mirrors Carla_PC_LLM's `polylines.from_text()` line for line: a line is
+    bad if it does not match, names a class outside `classes` (when given),
+    or has fewer than two vertices. `none` and blank lines are skipped
+    silently, as there. `n_out` counts vertices whose cell lies outside the
+    grid (the model can emit any integer, -150 included); they are kept and
+    decoded like any other, but reported, because a vertex 40 m outside the
+    tile is a modelling fact worth seeing rather than silently clipping.
+    """
+    out, bad, n_out = [], 0, 0
+    n_cells = int(round(2 * extent / res))
+    for line in (text or '').strip().splitlines():
+        s = line.strip()
+        if not s or s == 'none':
+            continue
+        m = _TEXT_LINE.match(line)
+        if not m or (classes is not None and m.group(1) not in classes):
+            bad += 1
+            continue
+        q = np.array([[int(v) for v in pair.split(',')]
+                      for pair in m.group(2).split()], dtype=np.int64)
+        if len(q) < 2:
+            bad += 1
+            continue
+        n_out += int(((q < 0) | (q >= n_cells)).any(axis=1).sum())
+        pts = (q.astype(np.float32) + 0.5) * res - extent
+        out.append((pts, m.group(1)))
+    return out, bad, n_out
+
+
+def results_meta(path):
+    """What load_results() learned about a results file beyond the
+    polylines themselves: `kind` ('carlamap' or 'text'), `has_scores`, and
+    for the text kind the unparsable-line count, the grid it was decoded
+    with and the metrics block the LLM's own eval stored in the file."""
+    if path and path not in STATE.setdefault('results_meta', {}):
+        load_results(path)
+    return STATE.get('results_meta', {}).get(path) or {}
+
+
+def load_results(path):
+    """Parse a results file into {sample_token: [(pts, score, cls)]}.
+
+    Two schemas, told apart by their top-level key:
+
+      * `results` -- carlamap_results.json from tools/test.py. Predicted
+        points are already in the model's tile-local BEV frame (the same
+        frame as the LiDAR points fed in), so unlike the GT reference lines
+        they need no origin subtraction -- they're plotted as-is.
+      * `predictions` -- eval_<subset>.json from Carla_PC_LLM's
+        scripts/evaluate.py: `[{name, pred: "<text>"}]`, decoded by
+        parse_pred_text() into the tile_center frame with score 1.0.
+
+    The per-file facts that are not polylines (schema kind, whether scores
+    exist, unparsable lines, stored metrics) go to results_meta().
     """
     cached = STATE['results_cache'].get(path)
     if cached is not None:
         return cached
     with open(path) as f:
         blob = json.load(f)
+    meta = STATE.setdefault('results_meta', {})
     out = {}
+    if isinstance(blob, dict) and 'predictions' in blob \
+            and 'results' not in blob:
+        extent, res = STATE.get('text_grid') or (TEXT_GRID_EXTENT,
+                                                  TEXT_GRID_RES)
+        n_bad, n_out, bad_by_token = 0, 0, {}
+        for entry in blob.get('predictions', []):
+            token = entry.get('name')
+            vecs, bad, n_o = parse_pred_text(entry.get('pred', ''),
+                                             extent, res)
+            n_bad += bad
+            n_out += n_o
+            if bad:
+                bad_by_token[token] = bad
+            out[token] = [(pts, 1.0, cls) for pts, cls in vecs]
+        meta[path] = dict(kind='text', has_scores=False, n_bad=n_bad,
+                          n_out_of_grid=n_out, bad_by_token=bad_by_token,
+                          extent=float(extent), res=float(res),
+                          metrics=blob.get('metrics') or {})
+        STATE['results_cache'][path] = out
+        return out
+    meta[path] = dict(kind='carlamap', has_scores=True)
     for entry in blob.get('results', []):
         token = entry.get('sample_token')
         vecs = []
@@ -2074,18 +2188,21 @@ def _render_tile(name, mode, show_polylines,
         # indistinguishable from a model that only made a few predictions.
         cut = (f', top {top_n} of {top_n + n_trimmed} by score'
                if n_trimmed else '')
+        # score-less (text-polyline) predictions: "@ score>=x" would imply a
+        # threshold that never filtered anything
+        at = ('' if not results_meta(results_path).get('has_scores', True)
+              else f' @ score≥{score_thresh:g}')
         if not pred_drawn:
             overlay_handles.append(
                 Line2D([], [], color='#ffd60a', linewidth=2.0, linestyle='--',
-                        label=f'pred (0 @ score≥{score_thresh:g})'))
+                        label=f'pred (0{at})'))
         for (cid, cls), n in sorted(pred_drawn.items(),
                                      key=lambda kv: str(kv[0][1])):
             overlay_handles.append(
                 Line2D([], [],
                         color=class_color(cid, mode) if cid is not None else '#ffd60a',
                         linewidth=2.0, linestyle='--',
-                        label=f'pred {cls} ({n} @ score≥{score_thresh:g}'
-                              f'{cut})'))
+                        label=f'pred {cls} ({n}{at}{cut})'))
 
     if overlay_handles:
         # ax.legend() REPLACES any existing legend, so the label-mode class
@@ -4478,7 +4595,9 @@ def tpfp_from_matrix(matrix, scores, threshold):
     row_argmax = matrix.argmax(axis=1)
     matched = np.full(n_p, -1, dtype=int)
     covered = np.zeros(n_g, dtype=bool)
-    for i in np.argsort(-scores):
+    # stable: score-less (all-equal) predictions keep their file order
+    # rather than an order quicksort happens to pick
+    for i in np.argsort(-scores, kind='stable'):
         if row_max[i] >= thr and not covered[row_argmax[i]]:
             covered[row_argmax[i]] = True
             tp[i] = 1
@@ -4508,7 +4627,17 @@ def ap_from_tpfp(tp, fp, scores, num_gts):
         return None
     if len(tp) == 0:
         return 0.0
-    order = np.argsort(-np.asarray(scores))
+    scores = np.asarray(scores, dtype=np.float64)
+    if scores.size > 1 and float(scores.max() - scores.min()) == 0.0:
+        # No confidences at all (the text-polyline LLM: every line it
+        # writes is one it is equally sure of). Ranking tied detections
+        # would draw a PR staircase whose shape is whatever order the
+        # file happens to list them in; the honest curve is a single
+        # operating point, so AP = precision x recall there -- which is
+        # also exactly how Carla_PC_LLM's own evaluate.py defines it.
+        n_tp = float(np.sum(tp))
+        return float((n_tp / num_gts) * (n_tp / max(len(tp), 1)))
+    order = np.argsort(-scores, kind='stable')
     ctp = np.cumsum(np.asarray(tp)[order])
     cfp = np.cumsum(np.asarray(fp)[order])
     eps = np.finfo(np.float32).eps
@@ -4548,8 +4677,77 @@ def pkl_map_classes(blob, samples):
     return tuple(sorted(keys))
 
 
+def reference_gt_dirs():
+    """{abs path of <dataset>/reference_lines: dataset key} for every loaded
+    dataset that ships one. These double as eval-GT candidates -- see
+    load_gt_reference()."""
+    out = {}
+    for key, man in (STATE.get('datasets') or {}).items():
+        d = osp.join(man['dir'], 'reference_lines')
+        if osp.isdir(d):
+            out[osp.abspath(d)] = key
+    return out
+
+
+def load_gt_reference(path):
+    """Eval GT built from the export's own `reference_lines/*.json`, in the
+    tile_center frame -- no converter pkl needed.
+
+    This is precisely the GT Carla_PC_LLM's evaluate.py scores against
+    (`load_polylines(split, name, tile_center)`: the stored world-frame
+    points minus the tile centre, class taken from each polyline's own
+    `class` field), so a text-polyline run is scored here against the same
+    lines it was scored against there. It is also what the browse tab has
+    always DRAWN, so for this source the drawn GT and the scored GT are one
+    and the same by construction.
+
+    Labels follow gt_classes(): the dataset's class_lookup in id order, so
+    they line up with the predictions' class names the same way a pkl's
+    map_classes do. Tiles without a reference file are simply absent, like
+    a pkl that dropped them.
+    """
+    ds = reference_gt_dirs().get(osp.abspath(path))
+    if ds is None:
+        raise ValueError(f'{path} is not a reference_lines dir of a loaded '
+                         'dataset')
+    classes = gt_classes(path)
+    index = {name: i for i, name in enumerate(classes)}
+    out = {}
+    for t in STATE['tiles']:
+        if t['_ds'] != ds:
+            continue
+        name = t['name']
+        fp = osp.join(ds_dir(ds), 'reference_lines',
+                      f'{name}_reference_lines.json')
+        if not osp.isfile(fp):
+            continue
+        centre = manifest_center(name, ds)
+        if centre is None or centre.size < 2:
+            # a manifest without centres: the reference json states its
+            # own, which is the same number the .npz carries
+            with open(fp) as f:
+                centre = np.asarray(json.load(f).get('tile_center') or (),
+                                    dtype=np.float64).ravel()
+            if centre.size < 2:
+                continue
+        origin = np.zeros(3)
+        origin[:2] = centre[:2]
+        vecs = []
+        for pts, cid, cname in load_polylines(name, origin, ds, ndim=2):
+            label = index.get(cname, index.get(f'class {cid}', 0))
+            vecs.append((pts.astype(np.float64), int(label)))
+        # a tile whose file lists no usable line is still a scored tile
+        # with zero GT, exactly as a pkl sample with an empty annotation
+        out[name] = vecs
+    return out
+
+
 def gt_classes(path):
     """Map class names, in label order, for whichever GT file this is.
+
+    A reference_lines directory (see load_gt_reference) takes the dataset's
+    own class_lookup in id order, or the single unclassified fallback for
+    an export that predates the class field.
 
     A converter pkl states them (or implies them from its annotation keys);
     `carla_map_gt.json` does not -- it carries only integer `type`s, because
@@ -4561,7 +4759,13 @@ def gt_classes(path):
     cached = STATE.setdefault('gt_classes_cache', {}).get(path)
     if cached is not None:
         return cached
-    if path.endswith('.pkl'):
+    if osp.isdir(path):
+        ds = reference_gt_dirs().get(osp.abspath(path))
+        lookup = (STATE['datasets'][ds].get('class_lookup') or {}) if ds else {}
+        out = (tuple(lookup[k] for k in sorted(
+                   lookup, key=lambda s: int(s) if str(s).isdigit() else s))
+               if lookup else MAPCLASSES)
+    elif path.endswith('.pkl'):
         with open(path, 'rb') as f:
             blob = pickle.load(f)
         samples = blob.get('samples') or []
@@ -4594,7 +4798,8 @@ def load_gt(path):
     cached = STATE['gt_cache'].get(path)
     if cached is not None:
         return cached
-    out = (load_gt_pkl(path) if path.endswith('.pkl')
+    out = (load_gt_reference(path) if osp.isdir(path)
+           else load_gt_pkl(path) if path.endswith('.pkl')
            else load_gt_json(path))
     STATE['gt_cache'][path] = out
     return out
@@ -4675,6 +4880,9 @@ def discover_gt(work_dir=None):
     regenerated every time the converter runs.
 
     Searched: data/carla (where the configs' ann_file / map_ann_file point),
+    every loaded dataset's own `reference_lines/` directory (scored in the
+    tile_center frame, see load_gt_reference -- the only GT a run needs
+    when no converter pkl covers its tiles, e.g. a text-polyline LLM run),
     and anything named like a GT under the work-dir.
     """
     cands = []
@@ -4683,6 +4891,7 @@ def discover_gt(work_dir=None):
                       for fn in sorted(os.listdir('data/carla'))
                       if fn.startswith('carla_map_infos')
                       and fn.endswith('.pkl'))
+    cands.extend(sorted(reference_gt_dirs()))
     cands.append('data/carla/carla_map_gt.json')
     for root in filter(None, [work_dir, osp.join('val', work_dir or '_')]):
         if not osp.isdir(root):
@@ -4696,7 +4905,7 @@ def discover_gt(work_dir=None):
     seen, out = set(), []
     for c in cands:
         c = osp.abspath(c)
-        if c not in seen and osp.isfile(c):
+        if c not in seen and (osp.isfile(c) or c in reference_gt_dirs()):
             seen.add(c)
             out.append(c)
     return out
@@ -6003,8 +6212,84 @@ def results_summary_html(rows):
     note += frame_health()
     note += ap_health(rows)
     note += count_health(rows)
+    note += text_results_health()
     return (f'<table class="stats"><thead><tr>{head}</tr></thead>'
             f'<tbody><tr>{body}</tr></tbody></table>{note}')
+
+
+def text_results_health():
+    """For a text-polyline (LLM) results file: how it was decoded, what its
+    own eval recorded, and where this tab's numbers are expected to differ
+    from those.
+
+    The differences are stated because they are systematic, not noise:
+
+      * matching -- this tab is greedy by score with each prediction taking
+        its best GT (mirroring MapTR's tpfp), while Carla_PC_LLM's
+        evaluate.py solves a one-to-one Hungarian assignment. On tiles with
+        2-3 lines the two mostly agree, but they are not the same rule;
+      * chamfer sampling -- 100 points per line here versus one point every
+        0.25 m there, so a long line is sampled more finely there;
+      * AP -- both define it as precision x recall at the single operating
+        point (no confidences), and this tab's global AP pools per class
+        exactly as the file's `overall` does.
+
+    So the stored metrics are the reference for the RUN and this tab's are
+    the reference for THESE tiles; use the table to check they are in the
+    same place, not to expect equality.
+    """
+    meta = REval.get('results_meta') or {}
+    if meta.get('kind') != 'text':
+        return ''
+    bits = [
+        f'<div class="note" style="max-width:60em"><b>Text-polyline '
+        f'predictions</b> (Carla_PC_LLM <code>eval_*.json</code>): each '
+        f'vertex decoded from its integer cell as '
+        f'<code>(cell + 0.5) &times; {meta["res"]:g} &minus; '
+        f'{meta["extent"]:g}</code> m in the tile_center frame '
+        f'(<code>--text-grid</code>). No confidences: every line carries '
+        f'score 1.0, so <i>top n</i> defaults to all, the score threshold '
+        f'is inert, the polyline count is the model\'s own, and AP is '
+        f'precision &times; recall at that single operating point.']
+    if meta.get('n_bad'):
+        bits.append(f'<span style="color:{CRITICAL}">{meta["n_bad"]:,} '
+                    f'unparsable line(s) across '
+                    f'{len(meta.get("bad_by_token") or {}):,} tile(s) were '
+                    f'dropped, as the LLM\'s own eval drops them.</span>')
+    if meta.get('n_out_of_grid'):
+        bits.append(f'{meta["n_out_of_grid"]:,} vertex(es) lie outside the '
+                    f'{int(round(2 * meta["extent"] / meta["res"]))}-cell '
+                    f'grid and were decoded anyway (drawn where the model '
+                    f'put them).')
+    m = meta.get('metrics') or {}
+    if m:
+        rows = []
+        for cls, v in m.items():
+            if not isinstance(v, dict):
+                continue
+            cells = [cls]
+            for k in ('mAP', 'AP@0.5', 'AP@1.0', 'AP@1.5', 'iP@1.0',
+                      'iR@1.0', 'chamfer', 'F1@1.0', 'n_pred', 'n_gt'):
+                x = v.get(k)
+                cells.append('&mdash;' if x is None else
+                             (f'{x:,}' if isinstance(x, int) else f'{x:.4f}'))
+            rows.append('<tr>' + ''.join(f'<td>{c}</td>' for c in cells)
+                        + '</tr>')
+        head = ''.join(f'<th>{h}</th>' for h in (
+            'class', 'mAP', 'AP@0.5', 'AP@1.0', 'AP@1.5', 'iP@1.0',
+            'iR@1.0', 'chamfer (m)', 'F1@1.0 (pts)', 'n_pred', 'n_gt'))
+        scalars = ', '.join(f'{k}: {v}' for k, v in m.items()
+                            if not isinstance(v, dict))
+        bits.append(
+            f'<b>As recorded in the file by the LLM\'s own eval</b> '
+            f'({html.escape(scalars)}). Instance-level: Hungarian one-to-one '
+            f'chamfer matching, AP = precision &times; recall; point-level '
+            f'F1 samples every 0.25 m. Expect this tab\'s global AP to land '
+            f'near, not on, these &mdash; the matching rule differs (greedy '
+            f'here, as in MapTR\'s eval).'
+            f'<table class="stats" style="margin-top:.4em"><thead><tr>{head}'
+            f'</tr></thead><tbody>{"".join(rows)}</tbody></table>')
+    return '<br>'.join(bits) + '</div>'
 
 
 def class_health():
@@ -6107,7 +6392,14 @@ def ap_health(rows):
     if not perfect and not coarse:
         return ''
     bits = []
-    if perfect:
+    if perfect and not (REval.get('results_meta') or {}).get('has_scores',
+                                                              True):
+        bits.append(
+            f'<b>{len(perfect):,} tile(s) score AP 1.000</b>: with no '
+            f'confidences AP is precision &times; recall at one operating '
+            f'point, so 1.000 means every line the model wrote matched a GT '
+            f'line at all three thresholds and no GT line was missed')
+    elif perfect:
         gts = sorted(r['n_gt'] for r in perfect)
         bits.append(
             f'<b>{len(perfect):,} tile(s) score AP 1.000</b>, holding '
@@ -6154,6 +6446,11 @@ def count_health(rows):
     informative when it is not.
     """
     if not rows:
+        return ''
+    if not (REval.get('results_meta') or {}).get('has_scores', True):
+        # Score-less predictions (text-polyline LLM): the model emits as
+        # many lines as it believes in, so the count is informative AS IS
+        # and neither warning below applies. text_results_health() says so.
         return ''
     n_raw = np.array([r['n_pred'] for r in rows], dtype=np.float64)
     n_kept = np.array([r['n_pred_kept'] for r in rows], dtype=np.float64)
@@ -6263,9 +6560,13 @@ def results_page():
     # default because the model emits a fixed num_vec every time (50 here)
     # and drawing all of them buries the GT under a haystack of
     # near-zero-confidence guesses. See the top_n note in _render_tile.
-    top_n = request.args.get('top_n', 'gt')
+    # ...except for predictions with NO scores (text-polyline LLM): there
+    # the model wrote exactly the lines it believes in, "top n by score"
+    # would drop some of them at random, and the count IS the prediction.
+    scoreless = not results_meta(result_files[results]).get('has_scores', True)
+    top_n = request.args.get('top_n', 'all' if scoreless else 'gt')
     if top_n not in ('gt', 'all') and _safe_int(top_n) is None:
-        top_n = 'gt'
+        top_n = 'all' if scoreless else 'gt'
     # 'auto' resolves against the GT file selected above, so the tiles are
     # drawn in the same frame their GT was built in -- which is also the
     # frame the predictions must be in for the scores to mean anything.
@@ -6335,6 +6636,7 @@ def results_page():
     # and has no other way to see what the page chose.
     REval['frame'] = resolve_frame(frame_arg, gt)
     REval['gt_frame'] = pkl_gt_frame(gt)
+    REval['results_meta'] = results_meta(result_files[results])
 
     ranked = rank_rows(rows, sort_key)
     hidden = ''.join(
@@ -6631,6 +6933,17 @@ def parse_args():
                          'tile names are unique only within a dataset, so a '
                          'shared file merges tags between datasets that '
                          'reuse a name.')
+    p.add_argument('--text-grid', type=float, nargs=2,
+                    default=(TEXT_GRID_EXTENT, TEXT_GRID_RES),
+                    metavar=('EXTENT', 'RES'),
+                    help='how a text-polyline (Carla_PC_LLM eval_*.json) '
+                         'run\'s integer vertices are decoded to metres: '
+                         'cell = floor((m + EXTENT) / RES), so the grid is '
+                         '2*EXTENT/RES cells wide. Must match the '
+                         'quantise() constants the LLM was TRAINED with '
+                         '(its defaults: 25.0 0.1, a 500-cell grid), not '
+                         'the tile size, since the model never sees the '
+                         'latter')
     p.add_argument('--num-pts-per-vec', type=int, default=20,
                     help='the model\'s fixed polyline resampling length, '
                          'marked on the vertices-per-polyline chart')
@@ -6643,6 +6956,8 @@ def main():
     STATE['max_points'] = args.max_points
     STATE['work_dir'] = args.work_dir
     STATE['results_cache'] = {}
+    STATE['results_meta'] = {}
+    STATE['text_grid'] = tuple(args.text_grid)
     STATE['gt_cache'] = {}
     STATE['shape_cache'] = {}
     STATE['frame_cache'] = {}
