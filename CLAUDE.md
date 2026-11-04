@@ -1760,6 +1760,89 @@ same gap `shape_counts()` has; the fix is to thread the pkl's
 `tile_geometry.reference_dir` through, which is recorded for exactly this
 reason.
 
+### Text-polyline (Qwen LLM) results in the viewer (2026-09-30)
+
+`Carla_PC_LLM`'s runs (`../work_dirs/Qwen3.5-4B-carla_dataset_50m_dense_aligned_train_v005_c10_nocol-lora`)
+write `eval_<subset>[_step<N>].json`, not `carlamap_results.json`, and the
+viewer now reads both. Point `--work-dir` at the run and `--data-root` at
+the export it was scored on:
+
+```bash
+python3 tools/maptrv2/dataset_viewer.py --data-root ../carla_test_V2 \
+    --work-dir ../work_dirs/Qwen3.5-4B-carla_dataset_50m_dense_aligned_train_v005_c10_nocol-lora
+```
+
+**The schema**: `{metrics: {driving, curb, overall, n_tiles,
+unparsable_lines, ...}, predictions: [{name, pred: "<text>"}]}`, where
+`pred` is one polyline per line, `driving: 246,499 499,391`. The vertices
+are integer cells of a **500-cell grid over the tile** --
+`floor((m + 25) / 0.1)` clipped to 0..499, decoded back at the cell centre
+`(cell + 0.5) * 0.1 - 25` -- in the **`tile_center` frame** (the LLM's
+`load_tile` subtracts `tile_center` xy). Those two constants are
+`polylines.quantise()`'s defaults and are what the model was TRAINED with
+regardless of the tile it is fed, so they come from `--text-grid EXTENT RES`
+(default `25.0 0.1`), not from the block. There are **no confidences**.
+
+What the viewer does with it, all dispatched on the top-level key in
+`load_results()` (`predictions` vs `results`), with the per-file facts in
+`results_meta()`:
+
+- `discover_results()` also lists `eval*.json` (never `run.json` /
+  `val_history.json`); `parse_pred_text()` is the LLM's `from_text()` regex
+  line for line, so its unparsable count equals the file's own
+  `unparsable_lines` (1 on this run; the line holds a `恩` token).
+  Out-of-grid vertices (the model emitted `-150`) are decoded where the
+  model put them and counted, not clipped.
+- Every line carries **score 1.0**, and everything that ranks by score
+  knows it: the results tab's `top_n` defaults to **all** (not `gt` -- with
+  ties, "top n by score" would drop lines at random), the legend and caption
+  drop `@ score>=`, `count_health()`'s fixed-`num_vec` warning is suppressed
+  (the count IS the prediction here), and **`ap_from_tpfp()` returns
+  precision x recall at the single operating point when all scores tie** --
+  the definition `evaluate.py`'s `aggregate_instances` uses -- instead of a
+  PR staircase in file order. `tpfp_from_matrix` sorts stably for the same
+  reason. Scored (carlamap) files are untouched: 113/113 of the existing
+  viewer assertions still pass.
+- **GT can now come straight from the export's `reference_lines/*.json`**
+  (`load_gt_reference()`, offered by `discover_gt()` as the directory path,
+  frame `tile_center`, labels in `class_lookup` id order). That is exactly
+  the GT the LLM's eval scored against, and it is also what the browse tab
+  draws, so drawn GT == scored GT by construction. It is what makes a run
+  scoreable with no converter pkl: the only pkl covering these tiles
+  (`../work_dirs/abl_C_lr05x/tiles50_test/carla_test_V2_tiles50.pkl`, frame
+  `crop`) names its classes `divider`/`boundary`, so per-class matching
+  would have fallen back to pooling against it.
+- `text_results_health()` renders the file's stored `metrics` block on the
+  results page next to the viewer's own numbers, and says why they differ.
+
+**Where the two evals differ, by design**: the viewer matches greedily by
+score with each prediction taking its best GT (MapTR's `tpfp`), the LLM's
+eval solves a one-to-one Hungarian assignment; the viewer samples 100
+points per line, the LLM's every 0.25 m. Measured on this run over all 2170
+tiles: viewer global mAP **0.184** (AP 0.047 / 0.180 / 0.324) vs the file's
+**0.164** (0.045 / 0.164 / 0.284), same GT (10102) and prediction (10191)
+counts exactly. Read the file's numbers as the run's reference and the
+viewer's as the per-tile breakdown; they will not be equal.
+
+**`../carla_test_V2/test` is the 50 m export** (2170 tiles, all of the
+Qwen run's names; the `carla_dataset_50m_dense_aligned/test` in its
+`run.json` is the cluster's copy). Its manifest says `tile_side: 30.0`,
+which is **stale** -- the `.npz` `tile_radius` is 25.0 and the reference
+lines reach |xy| = 25.0. The renderer reads the block's radius so the tiles
+draw correctly; only the manifest-tier points/m² stat is off by (50/30)².
+Its `class_lookup` is `{0: driving, 1: curb}`, the names the predictions
+use, so per-class scoring engages.
+
+Verified: 51 assertions in `tools/maptrv2/tests/test_viewer_text_results.py`
+(decode at cells 0/250/499, `none`, the whole-line rejection rule,
+out-of-grid counting, `--text-grid`, discovery, schema detection,
+reference-dir GT and its frame/classes, tie AP = PxR against hand-computed
+per-tile and pooled values, page defaults, notes, img URLs parsed from the
+HTML, a real render, legend labels) plus the real-run check above and a
+visual check that the predictions land on the GT in the `tile_center`
+frame (and are displaced under `offset`, as any tile-centre-trained run's
+are).
+
 ## Transferable debugging lessons
 
 - **`&gt_frame=` in an HTML attribute parses as `>_frame=`.** Browsers
@@ -2257,6 +2340,55 @@ through the DTW path, GT json written, per-class AP plus the
 **No 50 m export exists on this machine** -- `data_root` defaults to
 `data/carla50m/` (the cluster used `/data_carla50`); nothing above is an
 accuracy result.
+
+## HRDX San Jose 50 m benchmark (2026-10-29)
+
+Real-LiDAR counterpart of the CARLA 50 m crop benchmark: the export
+`../san_jose_tiles_50m` (17723 tiles, `tile_radius` 25, world-frame points in
+a shared metric frame, taxonomy `{1: curb, 2: curb_parametric}`) with the
+split manifests in `../san_jose_splits_v1` (`v1/{train,val,test}.json` =
+12073 / 1312 / 1978 tiles, a leakage-free 750 m-block spatial split;
+`v1_smoke/{train_400,val_60}.json` for pipeline checks). Only four blocks are
+downloaded locally (all in `v1/train.json`, none in the smoke split), so
+`san_jose_splits_v1/local_blocks/{train,val,test}.json` is a loader-finalised
+4-tile set for local runs (`tools/sj_make_local_subset.py`, run in this
+container).
+
+- `CustomSanJose50mCropDataset` (`datasets/sanjose50m_crop_dataset.py`) is a
+  thin subclass of `CustomCarla50mCropDataset`: the export is FLAT (no
+  `<split>/` level, so `split=None` and `ann_file` is any split json),
+  `gt_classes` defaults to `('curb',)` (`curb_parametric` re-traces the same
+  curbs -- never train both), and the manifest's `finalize` block is checked
+  against `crop_seed`/`max_shift`/`gt_classes`. The splits were finalised with
+  THIS loader's `_draw_crop`/`_crop_polylines` (`sj_finalize_splits.py`):
+  every val/test tile has a non-empty, >= 1000-point crop at the frozen pose
+  `default_rng(0 + manifest index)`, `rotate=False, translate=True`
+  (max_shift 10 m); train tiles a non-empty crop for one of 4 seeds. Change
+  any of those and the guarantee is gone -- the dataset warns.
+- Configs: `maptrv2_sanjose_r50_24ep_lidar_50m_crop.py` (ordered L1),
+  `..._EMDV2_LR3e-4.py` (the CARLA-tuned recipe, untuned on San Jose) and a
+  `_smoke` overlay of each (v1_smoke). One class -> `aux_seg.seg_classes=1`,
+  `max_num` 50 stays legal. **val != test here**, so each has its own
+  `map_ann_file` (`data/carla/sanjose_map_gt_50m_crop_curb_{val,test}.json`);
+  delete them whenever tile set / crop kwargs / seed change. Data is read
+  from `data/san_jose_50m/` + `data/san_jose_splits_v1/`.
+- `val_60.json` is a prefix of `val.json`, so its frozen crops are the first
+  60 of the full split; `v1_smoke/val60_gt.json` is the GT json those crops
+  produce (MapTR `GTs` schema, 141 curb instances) -- diff a freshly written
+  `map_ann_file` against it to prove the crops reproduce.
+- Verified locally on the 4 tiles in `jhd0ck3r/maptrv2:latest`:
+  `verify_crop_dataset.py --ann-file-train/--ann-file-val` (new flags; GT
+  ALIGNED, 0 empty crops, val frozen, train fresh) and a 1-epoch train+eval
+  of the EMDV2_LR3e-4 smoke config (batch 2; GT json written, `curb_AP`
+  logged). AP is meaningless at that scale.
+- Cluster: `~/submit_scripts/run_maptrv2_sanjose.sh` (no converter step;
+  moves `data/carla50m` -> `data/san_jose_50m`, rsyncs the splits dir).
+- Siblings carry the same port: GeMap/PMT (`CustomSanJose50mCropDataset` /
+  `PMTSanJose50mCropDataset`), mapdiffusion (`SanJose50mCropDataset`, kept in
+  MANIFEST order because its CARLA class sorts by name, which would re-index
+  the frozen seeds) and SuperMapNet (`SanJose50mCropDataset` with an explicit
+  `data_root`; paths via `SANJOSE50M_ROOT` / `SANJOSE_SPLITS_DIR` /
+  `SANJOSE_SPLIT_FILES`).
 
 ## Open items / next steps
 
