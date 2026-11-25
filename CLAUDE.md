@@ -2518,3 +2518,30 @@ Here: `datasets/hrdx50m_dataset.py` (`CustomHrdx50mDataset(CustomSanJose50mCropD
 `projects/configs/maptrv2/maptrv2_hrdx_16ep_lidar_50m_tile.py` (+ `_smoke`). The resolved
 config equals `hrdx_ORIG_L1.py` except for paths; the dump is bit-identical to the reference.
 Submit script `run_maptrv2_hrdx.sh`.
+
+## CARLA 3-class whole-50 m-tile benchmark, "carla3cls" (2026-11-25)
+
+The point2vector_data CARLA tiles loaded exactly like the HRDX benchmark above, ported to all
+seven siblings (MapTR, GeMap, PseudoMapTrainer, mapdiffusion, maptracker, SuperMapNet,
+CurbNet); this repo holds the reference port. Same as HRDX value for value (whole tile, PTv3 aug
+and RNG order, frozen val/test, GT clip / < 2 m drop, GT cache check + atomic write, model,
+schedule) except:
+
+- data `data/carla_3cls_50m/<tiles_dir>/{blocks,reference_lines}` (tiles_dir e.g.
+  `Town12/sweep/tiles_50m`, from each split tile), splits `data/carla_splits_v1/{train,val,test,
+  test_towns}.json` (18,522 / 2,236 / 2,309 / 688; test_towns = Town01-05 held out whole),
+  smoke `smoke/{train200,val30,test30}.json`; sample key `<city>_<name>`
+- 3 classes `['centerline', 'curb_model', 'road_edge']` (num_classes = seg_classes = 3);
+  GT = `datasets/carla_chain_gt.py` (`chain_pieces`: same class + same `road_id` pieces joined at
+  the annotation's 0.1 m straight/arc gap; verbatim copy in every sibling)
+- strength = 0 (CARLA has no intensity; keeps the HRDX 4-channel model unchanged)
+
+Files: `datasets/carla3cls50m_dataset.py` (`CustomCarla3cls50mDataset(CustomHrdx50mDataset)`,
+`LoadCarla3cls50mTile`), configs `maptrv2_carla3cls_16ep_lidar_50m_tile.py` (+ `_smoke`). GT caches
+`{val,test}_gt_3cls.json`; test_towns: `--cfg-options data.test.ann_file=data/carla_splits_v1/
+test_towns.json data.test.map_ann_file=data/carla_splits_v1/test_towns_gt_3cls.json`.
+Proof: `~/submit_scripts/hrdx_checks/hrdx_dump_mmdet.py` handles the CARLA loader; every
+sibling's dump equals this repo's on the fixture splits `fix_train6` / `fix_val5`
+(`/home-local3/johil9.nobkp/carla_3cls_50m/local_splits/`, which `data/carla_splits_v1` links to
+locally). Cluster: `~/submit_scripts/run_maptrv2_carla3cls.sh` (H100 MIG 3g.40gb, 4 x 4
+accumulated) on `carla3cls_common.sh`; data `Datasets/carla_3cls_50m.tar.gz` + `carla_splits_v1/`.
